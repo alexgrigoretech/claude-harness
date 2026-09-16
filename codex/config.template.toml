@@ -1,0 +1,17 @@
+# Codex CLI config template. Copy to ~/.codex/config.toml (never copy auth.json).
+# install.py does not touch config.toml: trust entries and auth are per machine.
+# The default is gpt-6-astra with gpt-5.6-sol as the fallback where the
+# login lacks astra. Every exec and resume passes the model flag anyway; this file
+# is the safety net, not the source of truth. The machine file names the model.
+
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+approvals_reviewer = "auto_review"
+
+# Windows only:
+# [windows]
+# sandbox = "unelevated"
+
+# One trusted block per working folder, for example:
+# [projects."/Users/<you>/dev"]
+# trust_level = "trusted"

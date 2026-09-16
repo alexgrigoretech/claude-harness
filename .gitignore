@@ -1,0 +1,31 @@
+# Local files the installer reads but never publishes
+machines/*.local.json
+machines/*.local.md
+*.local.json
+
+# Exclusion term lists, hand-carried traffic and session output never enter a repository
+**/bundle-terms/
+**/bundle-terms*.txt
+**/*.bundle-terms.txt
+bundles/
+inbox/
+transcripts/
+data/
+/daily/
+evals/*
+!evals/README.md
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
+
+# Session files
+HANDOFF-*.md
+.scratch/
+pr-review-findings.json
+auto-trail.tsv

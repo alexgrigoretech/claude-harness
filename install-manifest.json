@@ -1,0 +1,4 @@
+{
+  "_comment": "Read by install.py. delete: home-relative paths removed on every machine if present (no backup). Empty since 2026-09-16: every deletion is machine-specific and lives under the delete key of machines/<name>.json, because this file travels in every bundle and a published bundle must never remove a stranger's files.",
+  "delete": []
+}

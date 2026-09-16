@@ -1,0 +1,12 @@
+Review the pull request body and diff below. Return a JSON array and nothing else.
+
+Each array item must have exactly these fields:
+{"file": "path", "line": 1, "severity": "high|medium|low", "claim": "one sentence", "evidence": "diff lines that demonstrate the claim", "confidence": 0.0}
+
+Use null for line only when no changed line identifies the problem. Find correctness problems first, including logic errors, unhandled cases, wrong assumptions, and security defects. Then find concrete opportunities to reuse existing code or materially simplify the change. Do not make style remarks. Do not report the size or truncation of the diff as a finding. Return an empty JSON array when there are no findings.
+
+Pull request body:
+{body}
+
+Diff:
+{diff}

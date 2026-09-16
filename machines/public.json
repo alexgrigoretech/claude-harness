@@ -1,0 +1,61 @@
+{
+  "name": "public",
+  "client": false,
+  "owns": [],
+  "os": "any",
+  "harvest": false,
+  "plan_tools": false,
+  "codex_first": false,
+  "publish": true,
+  "health": null,
+  "settings": {
+    "permissions_allow": [
+      "Bash(codex *)",
+      "PowerShell(codex *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch *)",
+      "Bash(git remote -v)",
+      "Bash(git worktree list)",
+      "PowerShell(git status *)",
+      "PowerShell(git diff *)",
+      "PowerShell(git log *)",
+      "PowerShell(git show *)",
+      "PowerShell(git branch *)",
+      "PowerShell(git remote -v)"
+    ],
+    "permissions_deny": [
+      "Read(//**/.env)",
+      "Read(//**/.env.*)",
+      "Read(//**/*.pem)",
+      "Read(//**/*.key)",
+      "Read(//**/*.pfx)",
+      "Read(//**/*.p12)",
+      "Read(//**/id_rsa)",
+      "Read(//**/id_ed25519)",
+      "Read(//**/secrets.py)",
+      "Read(~/.ssh/id_*)",
+      "Read(~/.aws/credentials)",
+      "Read(~/.codex/auth.json)",
+      "Read(~/.claude/.credentials.json)"
+    ],
+    "permissions_ask": [
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "PowerShell(git push *)",
+      "PowerShell(gh pr create *)"
+    ],
+    "env": {
+      "CLAUDE_CODE_SUBAGENT_MODEL": "opus"
+    },
+    "cleanupPeriodDays": 90,
+    "autoMode_environment": null,
+    "autoMode_allow": []
+  },
+  "remove_allow_rules": [],
+  "project_settings_moves": [],
+  "delete": [],
+  "_note": "The machine behind the public repository: anyone who clones it installs as this machine. Owns no domain list, so every list applies to its bundle; harvest false and plan_tools false keep the memory export and the plan register tooling out; codex_first false leaves the Codex-first guard off until /setup records that Codex is installed (the answer lands in the home machine.local.json, which install.py merges over this file); publish true adds the README, LICENSE, notices and .gitignore from publish/ at the bundle root and writes clone-style install steps. Identities and gh account live in the home machine.local.json, written by /setup."
+}
