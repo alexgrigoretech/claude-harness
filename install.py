@@ -794,7 +794,7 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
     if harvest:
         add(repo / "harvest.py", "harvest.py")
     if publish:
-        for filename in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore"):
+        for filename in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes"):
             source = repo / "publish" / filename
             if not source.is_file():
                 raise BundleRefusal(f"publish/{filename} is missing")

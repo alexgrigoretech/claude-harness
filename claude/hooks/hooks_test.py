@@ -3081,7 +3081,7 @@ class InstallerTests(unittest.TestCase):
                 result = self.run_bundle(copied, bundle)
                 self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
                 with zipfile.ZipFile(bundle) as archive:
-                    for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore"):
+                    for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes"):
                         if value:
                             self.assertEqual(archive.read(name), (copied / "publish" / name).read_bytes())
                         else:
@@ -3137,27 +3137,29 @@ class InstallerTests(unittest.TestCase):
                         ))
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
-    def test_bundle_publish_missing_license_is_refused(self):
-        copied = self.copy_repo_without_local_machine_files("bundle-publish-missing-repo")
-        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"publish": True}), encoding="utf-8")
-        (copied / "publish" / "LICENSE").unlink()
-        bundle = self.base / "bundle-publish-missing.zip"
-        result = self.run_bundle(copied, bundle)
-        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
-        self.assertEqual(result.stdout.splitlines()[-1], "bundle refused: publish/LICENSE is missing")
-        self.assertFalse(bundle.exists())
+    def test_bundle_publish_missing_file_is_refused(self):
+        for index, name in enumerate(("LICENSE", ".gitattributes")):
+            with self.subTest(name=name):
+                copied = self.copy_repo_without_local_machine_files(f"bundle-publish-missing-{index}-repo")
+                (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"publish": True}), encoding="utf-8")
+                (copied / "publish" / name).unlink()
+                bundle = self.base / f"bundle-publish-missing-{index}.zip"
+                result = self.run_bundle(copied, bundle)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertEqual(result.stdout.splitlines()[-1], f"bundle refused: publish/{name} is missing")
+                self.assertFalse(bundle.exists())
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_publish_local_override_entries_pass_through_gate(self):
         copied = self.copy_repo_without_local_machine_files("bundle-publish-gate-repo")
         (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"publish": True}), encoding="utf-8")
-        for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore"):
+        for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes"):
             with (copied / "publish" / name).open("a", encoding="utf-8") as handle:
                 handle.write("\nbundleprobe" + " exclusion\n")
         bundle = self.base / "bundle-publish-gate.zip"
         result = self.run_bundle(copied, bundle)
         self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
-        for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore"):
+        for name in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes"):
             self.assertIn(f"GATE {name}:", result.stdout)
         self.assertFalse(bundle.exists())
 
@@ -3197,6 +3199,7 @@ class InstallerTests(unittest.TestCase):
         unpacked = self.base / "published-clone"
         with zipfile.ZipFile(bundle) as archive:
             archive.extractall(unpacked)
+        self.assertTrue((unpacked / ".gitattributes").is_file())
         (unpacked / ".git").mkdir()
         home = self.new_home("published-clone-home")
         installed = subprocess.run(

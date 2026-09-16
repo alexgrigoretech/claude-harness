@@ -6,7 +6,7 @@ A shared setup for Claude Code and Codex CLI that installs into your home folder
 
 - `claude/CLAUDE.md`: the global rules (answer style, writing rules, how work is planned, verified and shipped, git rules). It imports two per-machine files from `~/.claude/local/`: `machine.md`, shipped here, and `machine.local.md`, written on your machine by `/setup` and never overwritten.
 - Hooks in plain Python with no dependencies: a secret guard on file writes and shell commands, a draft wrap guard for Markdown drafts, a session context hook that prints the branch, the git identity in use and the newest handoff file at session start, a permission denial log, a context save nudge, a git commit-msg guard, and the optional Codex-first guard.
-- Skills: `auto`, `delegate`, `humanizer`, `pr-review`, `resume`, `save`, `setup`, `ship`, `status`, `verify-pass`. The Codex ones (`auto`, `delegate`, `verify-pass`, the Codex steps in `ship`) only matter if you run Codex CLI.
+- Skills: `auto`, `delegate`, `humanizer`, `paste`, `pr-review`, `resume`, `save`, `setup`, `ship`, `status`, `verify-pass`. The Codex ones (`auto`, `delegate`, `verify-pass`, the Codex steps in `ship`) only matter if you run Codex CLI.
 - Codex house rules (`codex/AGENTS.md`) with a config template, brief templates for implementation and verification, a writing checker (`checkers/check_writing.py`) and a pull request review runner (`tools/pr_review_runner.py`).
 
 ## Requirements
@@ -32,7 +32,7 @@ Then restart Claude Code and run `/setup`. It asks who you are (so the assistant
 - Copies `claude/CLAUDE.md` to `~/.claude/CLAUDE.md`, the hooks to `~/.claude/hooks/`, the skills to `~/.claude/skills/`, the templates to `~/.claude/templates/`, `codex/AGENTS.md` to `~/.codex/AGENTS.md`, and the machine files to `~/.claude/local/`. Previous versions go to `~/.claude/local/backup-<timestamp>/`.
 - Merges into `~/.claude/settings.json` only these keys: the hook entries it owns under `PreToolUse`, `SessionStart`, `PermissionDenied` and `PostToolUse`, `permissions.allow`, `permissions.deny`, `permissions.ask`, `env.CLAUDE_CODE_SUBAGENT_MODEL` and `cleanupPeriodDays`. Everything else in the file stays as it is.
 - Merges `claude/keybindings.json` into `~/.claude/keybindings.json`, keeping your own bindings.
-- Removes nothing of yours. The delete list for this machine is empty, so a skill of your own under `~/.claude/skills/` survives an install; only a skill with one of the ten names above is replaced.
+- Removes nothing of yours. The delete list for this machine is empty, so a skill of your own under `~/.claude/skills/` survives an install; only a skill with one of the eleven names above is replaced.
 
 `~/.codex/config.toml`, the status line and plugins stay yours, by hand. `codex/config.template.toml` is the reference.
 
@@ -50,7 +50,7 @@ python install.py --machine public
 
 ## Removing
 
-Delete the hook entries in `~/.claude/settings.json` that point at `~/.claude/hooks/`, then remove `~/.claude/CLAUDE.md`, `~/.claude/hooks/`, the ten skills above from `~/.claude/skills/`, `~/.claude/templates/`, `~/.claude/local/` and `~/.codex/AGENTS.md`. What the installer replaced is under `~/.claude/local/backup-<timestamp>/`.
+Delete the hook entries in `~/.claude/settings.json` that point at `~/.claude/hooks/`, then remove `~/.claude/CLAUDE.md`, `~/.claude/hooks/`, the eleven skills above from `~/.claude/skills/`, `~/.claude/templates/`, `~/.claude/local/` and `~/.codex/AGENTS.md`. What the installer replaced is under `~/.claude/local/backup-<timestamp>/`.
 
 ## How this repository is produced
 
