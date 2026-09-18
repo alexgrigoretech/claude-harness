@@ -14,6 +14,7 @@ import unicodedata
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
+STATUSLINE_COMMAND = "bash ~/.claude/statusline-command.sh"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -80,12 +81,12 @@ def json_bytes(value):
     return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def deep_merge(base, override):
+def deep_merge(base, override, replace_whole=frozenset()):
     if not isinstance(base, dict) or not isinstance(override, dict):
         return override
     result = dict(base)
     for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+        if key not in replace_whole and key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = deep_merge(result[key], value)
         else:
             result[key] = value
@@ -99,6 +100,23 @@ def validate_machine_flags(machine, defaults, source_for_key):
         if not isinstance(flags[key], bool):
             raise ValueError(f"{source_for_key(key)}: {key} must be true or false")
     return flags
+
+
+def validate_statusline_weather(machine, source_for_key):
+    weather = machine.get("statusline_weather")
+    if weather is None:
+        return
+    if (
+        not isinstance(weather, dict)
+        or set(weather) != {"city", "lat", "lon"}
+        or not isinstance(weather["city"], str)
+        or not weather["city"].strip()
+        or type(weather["lat"]) not in (int, float)
+        or not -90 <= weather["lat"] <= 90
+        or type(weather["lon"]) not in (int, float)
+        or not -180 <= weather["lon"] <= 180
+    ):
+        raise ValueError(f"{source_for_key('statusline_weather')}: statusline_weather must be null or an object with city, lat and lon")
 
 
 def read_local_machine(path, label=None):
@@ -120,13 +138,13 @@ def load_machine(repo, name, home=None, sources=None):
         sources.update({key: tracked_path for key in machine})
     local_path = repo / "machines" / f"{name}.local.json"
     local = read_local_machine(local_path)
-    machine = deep_merge(machine, local)
+    machine = deep_merge(machine, local, replace_whole=frozenset({"statusline_weather"}))
     if sources is not None:
         sources.update({key: local_path for key in local})
     if home is not None:
         home_local_path = home / ".claude" / "local" / "machine.local.json"
         local = read_local_machine(home_local_path)
-        machine = deep_merge(machine, local)
+        machine = deep_merge(machine, local, replace_whole=frozenset({"statusline_weather"}))
         if sources is not None:
             sources.update({key: home_local_path for key in local})
         if local_path.is_file() and home_local_path.is_file():
@@ -286,7 +304,7 @@ class Installer:
         self.action(destination, "written")
         return True
 
-    def remove(self, path):
+    def remove(self, path, status="removed"):
         path = Path(path)
         if not path.exists() and not path.is_symlink():
             self.action(path, "skipped")
@@ -296,7 +314,7 @@ class Installer:
             return True
         if not remove_path(path, self.removal_failed):
             return False
-        self.action(path, "removed")
+        self.action(path, status)
         return True
 
 
@@ -407,8 +425,64 @@ def install_keybindings(installer, repo, home):
     installer.write_bytes(keybindings_path, json_bytes(merged))
 
 
-def merge_settings(existing, machine, home):
+def install_statusline(installer, repo, home, machine):
+    destination = home / ".claude" / "statusline-command.sh"
+    if not machine.get("statusline", True):
+        if destination.exists() or destination.is_symlink():
+            installer.remove(destination, status="removed (statusline false)")
+        return False
+    weather = machine.get("statusline_weather")
+    if weather is not None:
+        config = home / ".claude" / "local" / "statusline.conf"
+        if config.exists():
+            installer.action(config, "unchanged")
+        else:
+            content = f"STATUSLINE_CITY={weather['city']}\nSTATUSLINE_LAT={json.dumps(weather['lat'])}\nSTATUSLINE_LON={json.dumps(weather['lon'])}\n"
+            installer.write_bytes(config, content.encode("utf-8"))
+    source = repo / "claude" / "statusline-command.sh"
+    if not source.is_file():
+        installer.action(destination, "skipped (no claude/statusline-command.sh in the install folder)")
+        return False
+    installer.copy_file(source, destination)
+    return True
+
+
+def install_local_markdown(installer, source, destination):
+    """Keep a filled personal section when the supplied section is missing or a placeholder."""
+    content = source.read_bytes().decode("utf-8-sig")
+    section = re.compile(r"^## Who I am, for calibration(?:\r?\n|\Z).*?(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+    supplied = section.search(content)
+    placeholders = ("Not written yet", "Replace this paragraph")
+    if (supplied is None or any(text in supplied.group() for text in placeholders)) and destination.is_file():
+        existing = destination.read_bytes().decode("utf-8-sig")
+        personal = section.search(existing)
+        if (
+            not existing.startswith("# No local machine facts on this machine yet")
+            and personal
+            and not any(text in personal.group() for text in placeholders)
+        ):
+            replacement = personal.group()
+            if supplied is None:
+                content = content.rstrip("\r\n") + "\n\n" + replacement
+            else:
+                if supplied.end() < len(content) and not replacement.endswith("\n"):
+                    replacement += "\n"
+                content = content[:supplied.start()] + replacement + content[supplied.end():]
+    installer.write_bytes(destination, content.encode("utf-8"))
+
+
+def merge_settings(existing, machine, home, *, statusline_available=True, installer=None):
     settings = existing if isinstance(existing, dict) else {}
+    statusline = settings.get("statusLine")
+    harness_statusline = isinstance(statusline, dict) and statusline.get("command") == STATUSLINE_COMMAND
+    if machine.get("statusline", True):
+        if "statusLine" in settings and not harness_statusline:
+            if installer is not None:
+                installer.action(home / ".claude" / "settings.json", "statusLine kept (existing custom status line)")
+        elif statusline_available:
+            settings["statusLine"] = {"type": "command", "command": STATUSLINE_COMMAND, "padding": 0}
+    elif harness_statusline:
+        settings.pop("statusLine")
     hooks = ensure_dict(settings, "hooks")
     hook_dir = home / ".claude" / "hooks"
     interpreter = Path(sys.executable)
@@ -690,10 +764,10 @@ def load_bundle_terms(home):
 
 
 def require_bundle_domains(home, domains, required):
-    for key, (domain, owner) in required.items():
+    for key, (domain, owners) in required.items():
         if key not in domains:
             path = bundle_terms_directory(home) / f"{domain}.txt"
-            raise BundleRefusal(f"domain {domain} is owned by {owner} but {path} does not exist")
+            raise BundleRefusal(f"domain {domain} is owned by {', '.join(sorted(owners))} but {path} does not exist")
 
 
 def all_bundle_terms(home, repo=None, report=None):
@@ -704,7 +778,7 @@ def all_bundle_terms(home, repo=None, report=None):
         texts = committed_machine_texts(repo, names) if (repo / ".git").exists() else None
         for name in names:
             for domain in machine_owns(repo, name, texts=texts):
-                required.setdefault(domain.casefold(), (domain, name))
+                required.setdefault(domain.casefold(), (domain, set()))[1].add(name)
         require_bundle_domains(home, domains, required)
     global_terms = dedupe_terms(global_terms)
     domain_terms = dedupe_terms([term for terms in domains.values() for term in terms], excluded=global_terms)
@@ -768,6 +842,7 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
     add(repo / "install-manifest.json", "install-manifest.json")
     add(repo / "claude" / "CLAUDE.md", "claude/CLAUDE.md")
     add(repo / "claude" / "keybindings.json", "claude/keybindings.json")
+    add(repo / "claude" / "statusline-command.sh", "claude/statusline-command.sh")
     for source in sorted((repo / "claude" / "hooks").glob("*.py")):
         add(source, Path("claude/hooks") / source.name)
     add_tree(repo / "claude" / "skills", "claude/skills", excluded=set() if harvest else {"harvest"})
@@ -965,14 +1040,12 @@ def build_bundle(options):
             for domain in declarations:
                 owners.setdefault(domain.casefold(), set()).add(other)
                 if domain.casefold() not in owned:
-                    required.setdefault(domain.casefold(), (domain, other))
+                    required.setdefault(domain.casefold(), (domain, set()))[1].add(other)
         global_terms, domains = load_bundle_terms(options["home"])
         for domain, terms in domains.items():
             declared = owners.get(domain, set())
             if not declared:
                 raise BundleRefusal(f"domain list {terms.path} is owned by no machine; declare it in one machines/<name>.json owns list")
-            if len(declared) > 1:
-                raise BundleRefusal(f"domain list {terms.path} is owned by more than one machine: {', '.join(sorted(declared))}")
         if (options["repo"] / ".git").exists():
             relative = f"machines/{name}.json"
             try:
@@ -1031,12 +1104,14 @@ def build_bundle(options):
         f"fingerprints {fingerprints} (owned: {', '.join(owns) or 'none'})"
     )
     try:
-        machine = deep_merge(machine, local_machine)
+        machine = deep_merge(machine, local_machine, replace_whole=frozenset({"statusline_weather"}))
         flags = validate_machine_flags(
-            machine, {"harvest": True, "plan_tools": True, "publish": False, "codex_first": True},
+            machine, {"harvest": True, "plan_tools": True, "publish": False, "codex_first": True, "statusline": True},
             lambda key: local_relative if key in local_machine else f"machines/{name}.json",
         )
+        validate_statusline_weather(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         flags.pop("codex_first")
+        flags.pop("statusline")
         entries = bundle_file_entries(options["repo"], name, date, gate_record, **flags)
     except ValueError as exc:
         print(f"bundle refused: {exc}")
@@ -1183,7 +1258,8 @@ def install(options):
         tracked_flags = validate_machine_flags(read_json(tracked_path), {"publish": False}, lambda key: tracked_path)
         sources = {}
         machine = load_machine(options["repo"], name, home=options["home"], sources=sources)
-        validate_machine_flags(machine, {"codex_first": True, "publish": False}, sources.__getitem__)
+        validate_machine_flags(machine, {"codex_first": True, "publish": False, "statusline": True}, sources.__getitem__)
+        validate_statusline_weather(machine, sources.__getitem__)
         if local_markdown_destination.exists() and not local_markdown_destination.is_file():
             raise ValueError(f"{local_markdown_destination}: must be a file")
     except (OSError, ValueError) as exc:
@@ -1207,7 +1283,7 @@ def install(options):
     )
     local_markdown_path = options["repo"] / "machines" / f"{name}.local.md"
     if local_markdown_path.is_file():
-        installer.copy_file(local_markdown_path, local_dir / "machine.local.md")
+        install_local_markdown(installer, local_markdown_path, local_markdown_destination)
     elif local_markdown_destination.is_file() and not local_markdown_destination.read_text(encoding="utf-8-sig").startswith("# No local machine facts on this machine yet"):
         installer.action(local_markdown_destination, "unchanged")
     else:
@@ -1225,6 +1301,7 @@ def install(options):
         options["home"] / ".claude" / "CLAUDE.md",
     )
     install_keybindings(installer, options["repo"], options["home"])
+    statusline_installed = install_statusline(installer, options["repo"], options["home"], machine)
     for source in sorted((options["repo"] / "claude" / "hooks").glob("*.py")):
         installer.copy_file(source, options["home"] / ".claude" / "hooks" / source.name)
     skills = options["repo"] / "claude" / "skills"
@@ -1253,7 +1330,7 @@ def install(options):
 
     settings_path = options["home"] / ".claude" / "settings.json"
     existing_settings = read_json(settings_path) if settings_path.is_file() else {}
-    merged_settings = merge_settings(existing_settings, machine, options["home"])
+    merged_settings = merge_settings(existing_settings, machine, options["home"], statusline_available=statusline_installed, installer=installer)
     installer.write_bytes(settings_path, json_bytes(merged_settings))
 
     for rule in machine.get("remove_allow_rules") or []:

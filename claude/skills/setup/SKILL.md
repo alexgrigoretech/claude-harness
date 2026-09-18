@@ -9,7 +9,7 @@ The shared CLAUDE.md and the committed machine file travel in every bundle; ever
 
 ## 1. Read what is there
 
-Read `~/.claude/local/machine.md`, `~/.claude/local/machine.local.md`, `~/.claude/local/machine.json`, `~/.claude/local/machine-name` and `~/.claude/local/harness-mode`. Decide what is missing:
+Read `~/.claude/local/machine.md`, `~/.claude/local/machine.local.md`, `~/.claude/local/machine.json`, `~/.claude/local/machine-name` and `~/.claude/local/harness-mode`. When the local markdown already carries engagement bullets shipped in a bundle, ask only for the missing sections. Decide what is missing:
 
 - the `## Who I am, for calibration` section is absent, or the file still opens with the installer's stub line "No local machine facts on this machine yet", or the section still carries any placeholder text ("Not written yet", "Replace this paragraph");
 - `machine.json` has no `identities` map or no `gh_account`;
@@ -46,7 +46,7 @@ Never ask for or store a secret (token, password, key) in either file.
 
 ## 4. Write the two files
 
-Show both before writing; they are short.
+Show both before writing; they are short. When the local markdown already exists with engagement bullets, keep every existing bullet as it is and replace only the `## Who I am, for calibration` section (and add the Codex line if it is missing); do not rewrite bullets the bundle shipped.
 
 `~/.claude/local/machine.local.md`: a title line, one bullet per fact (engagement and where its repos live, data rules, the git identity rule per folder, the Codex model and version or, without Codex, the line "Codex CLI is not set up on this machine: the Codex-first section of the global rules does not apply, Claude edits directly, and the delegate, auto and verify-pass skills are not used", MCP servers), then `## Who I am, for calibration` with two to four sentences in the person's own words and in the first person. One paragraph per line, no hard wrap, no em dashes or double dashes.
 
@@ -65,7 +65,7 @@ Show both before writing; they are short.
 
 ## 5. Apply
 
-From the install folder named in `machine.md`, with the interpreter from step 2 in place of `python`: `python install.py --dry-run`, read every line, then the real run (through the `!` prefix where the permission classifier blocks config edits under `~/.claude`). On the first run after writing the json the dry run lists `~/.claude/local/machine.json` as a write, and `~/.claude/settings.json` too when the Codex answer changed the hook entries; `machine.local.md` is reported unchanged, and a re-run with nothing new reports both unchanged.
+From the install folder named in `machine.md`, with the interpreter from step 2 in place of `python`: `python install.py --dry-run`, read every line, then the real run (through the `!` prefix where the permission classifier blocks config edits under `~/.claude`). On the first run after writing the json the dry run lists `~/.claude/local/machine.json` as a write, and `~/.claude/settings.json` too when the Codex answer changed the hook entries; `machine.local.md` is reported unchanged because the installer keeps the person's section, and a re-run with nothing new reports both unchanged.
 
 If the person agreed to git changes: `git config --global user.email <default>`; per folder, `git config --global includeIf."gitdir:<folder>/".path ~/.gitconfig-<label>` and a two-line `[user]` file at that path with the folder's email; then `gh auth switch --user <account>`. Confirm inside a repo of that folder with `git config user.email`. Never set a repo-local email and never pass `-c user.email`.
 

@@ -2246,6 +2246,132 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), custom)
         self.assertIn(f"ACTION  {destination}  (unchanged)", second.stdout)
 
+    def test_install_merges_filled_local_markdown_section(self):
+        home = self.new_home("identity-merge-home")
+        copied = self.copy_repo_without_local_machine_files("identity-merge-repo")
+        source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+        supplied = "# Machine\n\n- Updated engagement facts.\n\n## Who I am, for calibration\nNot written yet.\n\n## Notes\nSupplied notes.\n"
+        source.write_bytes(supplied.encode("utf-8-sig"))
+        destination = home / ".claude" / "local" / "machine.local.md"
+        destination.parent.mkdir(parents=True)
+        personal = "## Who I am, for calibration\nI prefer concise explanations.\n### Details\nI review examples.\n\n"
+        original = ("# Machine\n\n- Previous engagement facts.\n\n" + personal + "## Notes\nPrevious notes.\n").encode("utf-8-sig")
+        destination.write_bytes(original)
+        dry_run = self.run_install(home, copied, ["--dry-run"])
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr or dry_run.stdout)
+        self.assertIn(f"ACTION  {destination}  (would write)", dry_run.stdout)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertFalse(list(destination.parent.glob("backup-*")))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        expected = supplied.replace("## Who I am, for calibration\nNot written yet.\n\n", personal).encode("utf-8")
+        self.assertEqual(destination.read_bytes(), expected)
+        self.assertIn(f"ACTION  {destination}  (written)", result.stdout)
+        backups = list(destination.parent.glob("backup-*/.claude/local/machine.local.md"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        repeated = self.run_install(home, copied)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr or repeated.stdout)
+        self.assertIn(f"ACTION  {destination}  (unchanged)", repeated.stdout)
+        self.assertEqual(destination.read_bytes(), expected)
+
+    def test_install_overwrites_placeholder_local_markdown_section(self):
+        home = self.new_home("identity-placeholder-home")
+        copied = self.copy_repo_without_local_machine_files("identity-placeholder-repo")
+        source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+        supplied = b"# Machine\n- Updated engagement facts.\n## Who I am, for calibration\nNot written yet.\n"
+        source.write_bytes(supplied)
+        destination = home / ".claude" / "local" / "machine.local.md"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"# Machine\n## Who I am, for calibration\nNot written yet. Add a paragraph.\n")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(destination.read_bytes(), supplied)
+
+    def test_install_overwrites_local_markdown_with_filled_source(self):
+        home = self.new_home("identity-filled-source-home")
+        copied = self.copy_repo_without_local_machine_files("identity-filled-source-repo")
+        source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+        supplied = b"# Machine\n- Updated engagement facts.\n## Who I am, for calibration\nI prefer examples.\n"
+        source.write_bytes(supplied)
+        destination = home / ".claude" / "local" / "machine.local.md"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"# Machine\n## Who I am, for calibration\nI prefer concise explanations.\n")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(destination.read_bytes(), supplied)
+
+    def test_install_appends_personal_section_when_source_has_none(self):
+        for index, ending in enumerate(("", "\n", "\n\n\n")):
+            with self.subTest(ending=ending):
+                home = self.new_home(f"identity-append-{index}-home")
+                copied = self.copy_repo_without_local_machine_files(f"identity-append-{index}-repo")
+                source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+                supplied = "# Machine\n- Updated engagement facts.\n\n## Notes\nSupplied notes."
+                source.write_bytes((supplied + ending).encode("utf-8-sig"))
+                destination = home / ".claude" / "local" / "machine.local.md"
+                destination.parent.mkdir(parents=True)
+                personal = "## Who I am, for calibration\nI prefer concise explanations.\n"
+                destination.write_bytes(("# Machine\n- Previous facts.\n\n" + personal + "\n## Notes\nPrevious notes.\n").encode("utf-8-sig"))
+                expected = (supplied + "\n\n" + personal + "\n").encode("utf-8")
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertEqual(destination.read_bytes(), expected)
+                repeated = self.run_install(home, copied)
+                self.assertEqual(repeated.returncode, 0, repeated.stderr or repeated.stdout)
+                self.assertEqual(destination.read_bytes(), expected)
+                self.assertIn(f"ACTION  {destination}  (unchanged)", repeated.stdout)
+
+    def test_install_replaces_alternate_supplied_placeholder_with_personal_section(self):
+        home = self.new_home("identity-alternate-source-home")
+        copied = self.copy_repo_without_local_machine_files("identity-alternate-source-repo")
+        source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+        supplied = "# Machine\n- Updated engagement facts.\n## Who I am, for calibration\nReplace this paragraph with your own words.\n\n## Notes\nSupplied notes.\n"
+        source.write_bytes(supplied.encode("utf-8"))
+        destination = home / ".claude" / "local" / "machine.local.md"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"# Machine\n## Who I am, for calibration\nI prefer concise explanations.\n\n")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(destination.read_bytes(), supplied.replace("Replace this paragraph with your own words.", "I prefer concise explanations.").encode("utf-8"))
+
+    def test_install_overwrites_alternate_destination_placeholder(self):
+        home = self.new_home("identity-alternate-destination-home")
+        copied = self.copy_repo_without_local_machine_files("identity-alternate-destination-repo")
+        source = copied / "machines" / f"{TEST_MACHINE}.local.md"
+        supplied = b"# Machine\n- Updated engagement facts.\n## Who I am, for calibration\nNot written yet.\n"
+        source.write_bytes(supplied)
+        destination = home / ".claude" / "local" / "machine.local.md"
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"# Machine\n## Who I am, for calibration\nReplace this paragraph with your own words.\n")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(destination.read_bytes(), supplied)
+
+    def test_install_local_markdown_merge_fallbacks_and_section_boundaries(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        home = self.new_home("identity-boundaries-home")
+        source = home / "source.md"
+        destination = home / "destination.md"
+        heading = "## Who I am, for calibration\n"
+        supplied = "# Machine\n- Supplied facts.\n" + heading + "Not written yet.\n"
+        for existing in (None, "# Machine\nNo section.\n", "# No local machine facts on this machine yet\n" + heading + "I prefer examples.\n"):
+            with self.subTest(existing=existing):
+                source.write_bytes(supplied.encode("utf-8"))
+                if existing is not None:
+                    destination.write_bytes(existing.encode("utf-8"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    installer.install_local_markdown(installer.Installer(home, REPO, False), source, destination)
+                self.assertEqual(destination.read_bytes(), supplied.encode("utf-8"))
+        personal = heading + "I prefer examples."
+        destination.write_bytes(personal.encode("utf-8"))
+        source.write_bytes((supplied + "## Notes\nKeep these.\n").encode("utf-8"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            installer.install_local_markdown(installer.Installer(home, REPO, False), source, destination)
+        self.assertEqual(destination.read_bytes(), ("# Machine\n- Supplied facts.\n" + personal + "\n## Notes\nKeep these.\n").encode("utf-8"))
+
     def test_install_refreshes_old_local_markdown_stub(self):
         home = self.new_home("identity-old-stub-home")
         copied = self.copy_repo_without_local_machine_files("identity-old-stub-repo")
@@ -2370,6 +2496,10 @@ class InstallerTests(unittest.TestCase):
     def test_merge_backup_and_idempotence(self):
         home = self.new_home("merge-home")
         copied = self.copy_repo_without_local_machine_files("merge-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine["delete"] = []
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
         settings_path = home / ".claude" / "settings.json"
         settings_path.parent.mkdir(parents=True)
         seeded = {
@@ -2405,6 +2535,379 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(statuses)
         self.assertTrue(all("(unchanged)" in line or "(skipped)" in line for line in statuses))
         self.assertEqual(len(list((home / ".claude" / "local").glob("backup-*"))), 1)
+
+    def test_statusline_default_install_and_replacement(self):
+        harness = {"type": "command", "command": "bash ~/.claude/statusline-command.sh", "padding": 0}
+        custom = {"command": "custom-status", "padding": 4}
+        for index, (flag, seeded) in enumerate(((None, None), (True, custom), (True, {**harness, "padding": 4}))):
+            with self.subTest(flag=flag, seeded=seeded):
+                home = self.new_home(f"statusline-default-{index}-home")
+                copied = self.copy_repo_without_local_machine_files(f"statusline-default-{index}-repo")
+                machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+                machine = read_json_test(machine_path)
+                machine.pop("statusline", None)
+                if flag is not None:
+                    machine["statusline"] = flag
+                machine_path.write_text(json.dumps(machine), encoding="utf-8")
+                settings_path = home / ".claude" / "settings.json"
+                if seeded is not None:
+                    settings_path.parent.mkdir(parents=True)
+                    settings_path.write_text(json.dumps({"statusLine": seeded}), encoding="utf-8")
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertEqual((home / ".claude" / "statusline-command.sh").read_bytes(), (copied / "claude" / "statusline-command.sh").read_bytes())
+                self.assertEqual(read_json_test(settings_path)["statusLine"], custom if seeded == custom else harness)
+                if seeded == custom:
+                    self.assertIn(f"ACTION  {settings_path}  (statusLine kept (existing custom status line))", result.stdout)
+
+    def test_statusline_disable_removes_script_and_harness_setting(self):
+        home = self.new_home("statusline-flip-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-flip-repo")
+        first = self.run_install(home, copied)
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        destination = home / ".claude" / "statusline-command.sh"
+        self.assertTrue(destination.is_file())
+        local_path = home / ".claude" / "local" / "machine.local.json"
+        local_path.write_text(json.dumps({"statusline": False}), encoding="utf-8")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse(destination.exists())
+        self.assertNotIn("statusLine", read_json_test(home / ".claude" / "settings.json"))
+        self.assertIn(f"ACTION  {destination}  (removed (statusline false))", result.stdout)
+
+    def test_statusline_disable_preserves_foreign_setting(self):
+        home = self.new_home("statusline-flip-custom-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-flip-custom-repo")
+        first = self.run_install(home, copied)
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        settings_path = home / ".claude" / "settings.json"
+        settings = read_json_test(settings_path)
+        custom = {"command": "custom-status", "padding": 4}
+        settings["statusLine"] = custom
+        settings_path.write_text(json.dumps(settings), encoding="utf-8")
+        local_path = home / ".claude" / "local" / "machine.local.json"
+        local_path.write_text(json.dumps({"statusline": False}), encoding="utf-8")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse((home / ".claude" / "statusline-command.sh").exists())
+        self.assertEqual(read_json_test(settings_path)["statusLine"], custom)
+
+    def test_statusline_disable_dry_run_preserves_script_and_settings(self):
+        home = self.new_home("statusline-flip-dry-run-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-flip-dry-run-repo")
+        first = self.run_install(home, copied)
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        destination = home / ".claude" / "statusline-command.sh"
+        original_script = destination.read_bytes()
+        settings_path = home / ".claude" / "settings.json"
+        original_settings = settings_path.read_bytes()
+        local_path = home / ".claude" / "local" / "machine.local.json"
+        local_path.write_text(json.dumps({"statusline": False}), encoding="utf-8")
+        result = self.run_install(home, copied, extra=["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn(f"ACTION  {destination}  (would remove)", result.stdout)
+        self.assertEqual(destination.read_bytes(), original_script)
+        self.assertEqual(settings_path.read_bytes(), original_settings)
+
+    def test_statusline_missing_source_preserves_harness_setting(self):
+        home = self.new_home("statusline-missing-harness-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-missing-harness-repo")
+        first = self.run_install(home, copied)
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        settings_path = home / ".claude" / "settings.json"
+        harness = read_json_test(settings_path)["statusLine"]
+        (copied / "claude" / "statusline-command.sh").unlink()
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(read_json_test(settings_path)["statusLine"], harness)
+        self.assertTrue((home / ".claude" / "statusline-command.sh").is_file())
+
+    def test_statusline_second_install_is_unchanged(self):
+        home = self.new_home("statusline-repeat-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-repeat-repo")
+        first = self.run_install(home, copied)
+        self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+        second = self.run_install(home, copied)
+        self.assertEqual(second.returncode, 0, second.stderr or second.stdout)
+        destination = home / ".claude" / "statusline-command.sh"
+        self.assertIn(f"ACTION  {destination}  (unchanged)", second.stdout)
+
+    def test_statusline_false_preserves_existing_setting(self):
+        for present in (False, True):
+            with self.subTest(present=present):
+                home = self.new_home(f"statusline-disabled-{present}-home")
+                copied = self.copy_repo_without_local_machine_files(f"statusline-disabled-{present}-repo")
+                machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+                machine = read_json_test(machine_path)
+                machine["statusline"] = False
+                machine_path.write_text(json.dumps(machine), encoding="utf-8")
+                settings_path = home / ".claude" / "settings.json"
+                settings_path.parent.mkdir(parents=True)
+                foreign = {"type": "command", "command": "custom-status", "padding": 4}
+                settings_path.write_text(json.dumps({"statusLine": foreign} if present else {}), encoding="utf-8")
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                settings = read_json_test(settings_path)
+                self.assertEqual("statusLine" in settings, present)
+                if present:
+                    self.assertEqual(settings["statusLine"], foreign)
+                self.assertFalse((home / ".claude" / "statusline-command.sh").exists())
+                self.assertNotIn("statusline-command.sh", result.stdout)
+
+    def test_statusline_invalid_flag_refuses_install_before_writes(self):
+        for location in ("tracked", "folder", "home"):
+            with self.subTest(location=location):
+                home = self.new_home(f"statusline-invalid-{location}-home")
+                copied = self.copy_repo_without_local_machine_files(f"statusline-invalid-{location}-repo")
+                path = copied / "machines" / f"{TEST_MACHINE}.json"
+                if location == "folder":
+                    path = path.with_name(f"{TEST_MACHINE}.local.json")
+                elif location == "home":
+                    path = home / ".claude" / "local" / "machine.local.json"
+                machine = read_json_test(path) if path.is_file() else {}
+                machine["statusline"] = "yes"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(machine), encoding="utf-8")
+                before = sorted(home.rglob("*"))
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertEqual(result.stdout, f"install refused: {path}: statusline must be true or false\n")
+                self.assertEqual(sorted(home.rglob("*")), before)
+                self.assertNotIn("ACTION ", result.stdout)
+
+    def test_statusline_weather_writes_fresh_config(self):
+        home = self.new_home("weather-fresh-home")
+        copied = self.copy_repo_without_local_machine_files("weather-fresh-repo")
+        path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(path)
+        machine["statusline_weather"] = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+        path.write_text(json.dumps(machine), encoding="utf-8")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        config = home / ".claude" / "local" / "statusline.conf"
+        self.assertEqual(config.read_bytes(), b"STATUSLINE_CITY=Testville\nSTATUSLINE_LAT=1.5\nSTATUSLINE_LON=2.5\n")
+        self.assertIn(f"ACTION  {config}  (written)", result.stdout)
+
+    def test_statusline_weather_preserves_existing_config(self):
+        home = self.new_home("weather-existing-home")
+        copied = self.copy_repo_without_local_machine_files("weather-existing-repo")
+        path = copied / "machines" / f"{TEST_MACHINE}.local.json"
+        path.write_text(json.dumps({"statusline_weather": {"city": "Testville", "lat": 1.5, "lon": 2.5}}), encoding="utf-8")
+        config = home / ".claude" / "local" / "statusline.conf"
+        config.parent.mkdir(parents=True)
+        original = b"custom\r\n\xff"
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertIn(f"ACTION  {config}  (unchanged)", result.stdout)
+        self.assertFalse(list(config.parent.glob("backup-*/.claude/local/statusline.conf")))
+
+    def test_statusline_weather_dry_run_and_home_override(self):
+        home = self.new_home("weather-override-home")
+        copied = self.copy_repo_without_local_machine_files("weather-override-repo")
+        path = copied / "machines" / f"{TEST_MACHINE}.local.json"
+        path.write_text(json.dumps({"statusline_weather": None}), encoding="utf-8")
+        local = home / ".claude" / "local" / "machine.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"statusline_weather": {"city": "Testville", "lat": 1.5, "lon": 2.5}}), encoding="utf-8")
+        config = local.parent / "statusline.conf"
+        dry_run = self.run_install(home, copied, ["--dry-run"])
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr or dry_run.stdout)
+        self.assertIn(f"ACTION  {config}  (would write)", dry_run.stdout)
+        self.assertFalse(config.exists())
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), b"STATUSLINE_CITY=Testville\nSTATUSLINE_LAT=1.5\nSTATUSLINE_LON=2.5\n")
+
+    def test_statusline_weather_inactive_is_silent(self):
+        for index, values in enumerate(({}, {"statusline_weather": None}, {"statusline": False, "statusline_weather": {"city": "Testville", "lat": 1.5, "lon": 2.5}})):
+            with self.subTest(values=values):
+                home = self.new_home(f"weather-inactive-{index}-home")
+                copied = self.copy_repo_without_local_machine_files(f"weather-inactive-{index}-repo")
+                path = copied / "machines" / f"{TEST_MACHINE}.json"
+                machine = read_json_test(path)
+                machine.pop("statusline_weather", None)
+                machine.update(values)
+                path.write_text(json.dumps(machine), encoding="utf-8")
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertFalse((home / ".claude" / "local" / "statusline.conf").exists())
+                self.assertNotIn("statusline.conf", result.stdout)
+
+    def test_statusline_weather_home_object_replaces_tracked_object(self):
+        home = self.new_home("weather-replace-home")
+        copied = self.copy_repo_without_local_machine_files("weather-replace-repo")
+        tracked = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(tracked)
+        machine["statusline_weather"] = {"city": "Testville source", "lat": 1.5, "lon": 2.5}
+        tracked.write_text(json.dumps(machine), encoding="utf-8")
+        local = home / ".claude" / "local" / "machine.local.json"
+        local.parent.mkdir(parents=True)
+        weather = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+        local.write_text(json.dumps({"statusline_weather": weather}), encoding="utf-8")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(read_json_test(local.parent / "machine.json")["statusline_weather"], weather)
+
+    def test_deep_merge_replace_policy_is_opt_in(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        weather = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+        base = {"section": {"left": 1}, "statusline_weather": weather}
+        override = {"section": {"right": 2}, "statusline_weather": {"city": "Testville"}}
+        self.assertEqual(installer.deep_merge(base, override), {"section": {"left": 1, "right": 2}, "statusline_weather": weather})
+        self.assertEqual(installer.deep_merge(base, override, replace_whole=frozenset({"section"})), {"section": {"right": 2}, "statusline_weather": weather})
+
+    def test_deep_merge_replace_policy_does_not_apply_to_nested_weather(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        weather = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+        base = {"statusline_weather": weather, "settings": {"statusline_weather": weather}}
+        override = {"statusline_weather": {"city": "Testville"}, "settings": {"statusline_weather": {"lat": 2.5}}}
+        result = installer.deep_merge(base, override, replace_whole=frozenset({"statusline_weather"}))
+        self.assertEqual(result["statusline_weather"], {"city": "Testville"})
+        self.assertEqual(result["settings"]["statusline_weather"], {"city": "Testville", "lat": 2.5, "lon": 2.5})
+
+    def test_statusline_weather_invalid_refuses_install_before_writes(self):
+        for present in (False, True):
+            for location in ("tracked", "folder", "home"):
+                for index, value in enumerate(({"city": "Testville"}, "Testville")):
+                    with self.subTest(present=present, location=location, value=value):
+                        home = self.new_home(f"weather-invalid-{present}-{location}-{index}-home")
+                        copied = self.copy_repo_without_local_machine_files(f"weather-invalid-{present}-{location}-{index}-repo")
+                        path = copied / "machines" / f"{TEST_MACHINE}.json"
+                        machine = read_json_test(path)
+                        machine.pop("statusline_weather", None)
+                        if present:
+                            machine["statusline_weather"] = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+                        path.write_text(json.dumps(machine), encoding="utf-8")
+                        if location == "folder":
+                            path = path.with_name(f"{TEST_MACHINE}.local.json")
+                        elif location == "home":
+                            path = home / ".claude" / "local" / "machine.local.json"
+                        machine = read_json_test(path) if path.is_file() else {}
+                        machine["statusline_weather"] = value
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(json.dumps(machine), encoding="utf-8")
+                        before = {item.relative_to(home): item.read_bytes() for item in home.rglob("*") if item.is_file()}
+                        result = self.run_install(home, copied)
+                        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                        self.assertEqual(result.stdout, f"install refused: {path}: statusline_weather must be null or an object with city, lat and lon\n")
+                        self.assertEqual({item.relative_to(home): item.read_bytes() for item in home.rglob("*") if item.is_file()}, before)
+                        self.assertNotIn("ACTION ", result.stdout)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_statusline_weather_invalid_refuses_bundle(self):
+        for location in ("tracked", "folder"):
+            for index, value in enumerate(({"city": "Testville"}, "Testville")):
+                with self.subTest(location=location, value=value):
+                    copied = self.copy_repo_without_local_machine_files(f"weather-invalid-bundle-{location}-{index}-repo")
+                    relative = f"machines/{TEST_MACHINE}{'.local' if location == 'folder' else ''}.json"
+                    path = copied / relative
+                    machine = read_json_test(path) if path.is_file() else {}
+                    machine["statusline_weather"] = value
+                    path.write_text(json.dumps(machine), encoding="utf-8")
+                    bundle = self.base / f"weather-invalid-{location}-{index}.zip"
+                    result = self.run_bundle(copied, bundle)
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertEqual(result.stdout.splitlines()[-1], f"bundle refused: {relative}: statusline_weather must be null or an object with city, lat and lon")
+                    self.assertFalse(bundle.exists())
+
+    def test_statusline_weather_schema_and_number_rendering(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        valid = {"city": "Testville", "lat": 1.5, "lon": 2.5}
+        invalid = [False, [], {}, dict(valid, extra=True), dict(valid, city=""), dict(valid, city="  "), dict(valid, city=1.5), dict(valid, lat=True), dict(valid, lon=False), dict(valid, lat="1.5"), dict(valid, lon=None), dict(valid, lat=91), dict(valid, lat=-91), dict(valid, lon=181), dict(valid, lon=-181), dict(valid, lat=float("nan"))]
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "source.json: statusline_weather must be null or an object with city, lat and lon"):
+                    installer.validate_statusline_weather({"statusline_weather": value}, lambda key: "source.json")
+        for latitude, longitude in ((1.5, 2.5), (-90, -180), (90, 180)):
+            with self.subTest(latitude=latitude, longitude=longitude):
+                weather = dict(valid, lat=latitude, lon=longitude)
+                installer.validate_statusline_weather({"statusline_weather": weather}, lambda key: "source.json")
+                writer = mock.Mock()
+                installer.install_statusline(writer, REPO, self.base, {"statusline_weather": weather})
+                writer.write_bytes.assert_called_once_with(self.base / ".claude" / "local" / "statusline.conf", f"STATUSLINE_CITY=Testville\nSTATUSLINE_LAT={json.dumps(latitude)}\nSTATUSLINE_LON={json.dumps(longitude)}\n".encode("utf-8"))
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_statusline_invalid_flag_refuses_bundle(self):
+        copied = self.copy_repo_without_local_machine_files("statusline-invalid-bundle-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine["statusline"] = "yes"
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        bundle = self.base / "statusline-invalid-bundle.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertEqual(result.stdout.splitlines()[-1], f"bundle refused: machines/{TEST_MACHINE}.json: statusline must be true or false")
+        self.assertFalse(bundle.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_statusline_bundle_contains_script_even_when_disabled(self):
+        copied = self.copy_repo_without_local_machine_files("statusline-bundle-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine["statusline"] = False
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        bundle = self.base / "statusline-bundle.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertEqual(archive.read("claude/statusline-command.sh"), (copied / "claude" / "statusline-command.sh").read_bytes())
+
+    def test_statusline_missing_source_is_skipped(self):
+        for present in (False, True):
+            with self.subTest(present=present):
+                home = self.new_home(f"statusline-missing-{present}-home")
+                copied = self.copy_repo_without_local_machine_files(f"statusline-missing-{present}-repo")
+                (copied / "claude" / "statusline-command.sh").unlink()
+                settings_path = home / ".claude" / "settings.json"
+                settings_path.parent.mkdir(parents=True)
+                foreign = {"type": "command", "command": "custom-status"}
+                settings_path.write_text(json.dumps({"statusLine": foreign} if present else {}), encoding="utf-8")
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                destination = home / ".claude" / "statusline-command.sh"
+                self.assertIn(f"ACTION  {destination}  (skipped (no claude/statusline-command.sh in the install folder))", result.stdout)
+                self.assertFalse(destination.exists())
+                settings = read_json_test(settings_path)
+                self.assertEqual("statusLine" in settings, present)
+                if present:
+                    self.assertEqual(settings["statusLine"], foreign)
+
+    def test_statusline_home_override_preserves_local_config(self):
+        home = self.new_home("statusline-home-override-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-home-override-repo")
+        local_path = home / ".claude" / "local" / "machine.local.json"
+        local_path.parent.mkdir(parents=True)
+        local_path.write_text(json.dumps({"statusline": False}), encoding="utf-8")
+        config = local_path.parent / "statusline.conf"
+        content = b"STATUSLINE_CITY=Testville\nSTATUSLINE_LAT=1.5\nSTATUSLINE_LON=2.5\n"
+        config.write_bytes(content)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse((home / ".claude" / "statusline-command.sh").exists())
+        self.assertNotIn("statusLine", read_json_test(home / ".claude" / "settings.json"))
+        self.assertEqual(config.read_bytes(), content)
+
+    def test_statusline_replacement_keeps_script_backup(self):
+        home = self.new_home("statusline-backup-home")
+        copied = self.copy_repo_without_local_machine_files("statusline-backup-repo")
+        destination = home / ".claude" / "statusline-command.sh"
+        destination.parent.mkdir(parents=True)
+        original = b"#!/usr/bin/env bash\nprintf custom\n"
+        destination.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(destination.read_bytes(), (copied / "claude" / "statusline-command.sh").read_bytes())
+        backups = list((home / ".claude" / "local").glob("backup-*/.claude/statusline-command.sh"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
 
     def test_keybindings_merge_and_idempotence(self):
         home = self.new_home("keybindings-home")
@@ -3601,16 +4104,49 @@ class InstallerTests(unittest.TestCase):
         self.assert_bundle_refused(result, bundle, f"bundle refused: domain list {self.bundle_terms_file(copied)} is owned by no machine; declare it in one machines/<name>.json owns list")
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
-    def test_bundle_refuses_domain_owned_by_multiple_machines(self):
+    def test_bundle_accepts_domain_owned_by_multiple_machines(self):
         copied = self.copy_repo_without_local_machine_files("bundle-multiple-owners-repo")
         machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
         machine = read_json_test(machine_path)
         machine["owns"] = ["PROBE"]
         machine_path.write_text(json.dumps(machine), encoding="utf-8")
-        bundle = self.base / "bundle-multiple-owners"
+        shared_term = "domainprobe" + "shared"
+        excluded_term = "domainprobe" + "excluded"
+        self.bundle_terms_file(copied).write_text(shared_term + "\n", encoding="utf-8")
+        self.bundle_terms_file(copied).with_name("beta.txt").write_text(excluded_term + "\n", encoding="utf-8")
+        (copied / "machines" / "excluded-owner.json").write_text(json.dumps({"owns": ["beta"]}), encoding="utf-8")
+        self.initialize_bundle_git(copied)
+        skill = copied / "claude" / "skills" / "save" / "SKILL.md"
+        original = skill.read_text(encoding="utf-8")
+        for name, owned in ((TEST_MACHINE, "PROBE"), ("domain-owner", "probe")):
+            with self.subTest(name=name), mock.patch.dict(globals(), TEST_MACHINE=name):
+                bundle = self.base / f"bundle-multiple-owners-{name}"
+                skill.write_text(original + "\n" + shared_term + "\n" + excluded_term + "\n", encoding="utf-8")
+                result = self.run_bundle(copied, bundle)
+                self.assert_bundle_refused(result, bundle, "bundle refused: 1 hits", machine_terms=1, owned=owned)
+                self.assertIn(": " + excluded_term + "\n", result.stdout)
+                self.assertNotIn(": " + shared_term + "\n", result.stdout)
+                skill.write_text(original + "\n" + shared_term + "\n", encoding="utf-8")
+                result = self.run_bundle(copied, bundle)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertTrue((bundle / "INSTALL.md").is_file())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_missing_shared_domain_names_all_owners(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-missing-shared-repo")
+        self.declare_bundle_domains(copied, ["probe", "beta"])
+        (copied / "machines" / "additional-owner.json").write_text(json.dumps({"owns": ["beta"]}), encoding="utf-8")
+        bundle = self.base / "bundle-missing-shared"
+        missing = self.bundle_terms_file(copied).with_name("beta.txt")
+        message = f"domain beta is owned by additional-owner, domain-owner but {missing} does not exist"
         result = self.run_bundle(copied, bundle)
-        owners = ", ".join(sorted([TEST_MACHINE, "domain-owner"]))
-        self.assert_bundle_refused(result, bundle, f"bundle refused: domain list {self.bundle_terms_file(copied)} is owned by more than one machine: {owners}")
+        self.assert_bundle_refused(result, bundle, "bundle refused: " + message)
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        with self.assertRaises(installer.BundleRefusal) as refusal:
+            installer.all_bundle_terms(self.bundle_home(copied), repo=copied)
+        self.assertEqual(str(refusal.exception), message)
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_refuses_case_colliding_domain_files(self):

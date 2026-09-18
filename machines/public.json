@@ -7,6 +7,7 @@
   "plan_tools": false,
   "codex_first": false,
   "publish": true,
+  "statusline": true,
   "health": null,
   "settings": {
     "permissions_allow": [
