@@ -24,7 +24,7 @@ from claude.hooks._common import nudge_disabled
 USAGE = (
     "usage: python install.py [--machine NAME] [--home PATH] [--repo PATH] "
     "[--dry-run] [--no-tests] [--git-hooks REPO] [--gitleaks PATH] "
-    "[--bundle NAME] [--out PATH]"
+    "[--bundle NAME] [--addon NAME] [--out PATH]"
 )
 
 
@@ -38,6 +38,7 @@ def parse_args(arguments):
         "git_hooks": None,
         "gitleaks": None,
         "bundle": None,
+        "addon": None,
         "out": None,
     }
     index = 0
@@ -54,6 +55,7 @@ def parse_args(arguments):
             "--git-hooks",
             "--gitleaks",
             "--bundle",
+            "--addon",
             "--out",
         }:
             if index + 1 >= len(arguments):
@@ -69,6 +71,10 @@ def parse_args(arguments):
         options["out"] = Path(options["out"]).expanduser().resolve()
     if options["bundle"] is not None and options["git_hooks"] is not None:
         raise ValueError("--bundle cannot be combined with --git-hooks")
+    if options["addon"] is not None:
+        for key in ("bundle", "machine", "git_hooks"):
+            if options[key] is not None:
+                raise ValueError("--addon cannot be combined with --" + key.replace("_", "-"))
     return options
 
 
@@ -664,6 +670,20 @@ PLAN_TOOLS_EXCLUDED = (
 )
 
 
+ADDONS = {
+    "daily": {
+        "description": "The daily skill and its collector: one day of work in a repository summarized for a person who was not at the keyboard.",
+        "paths": ("claude/skills/daily/", "tools/daily_collect.py", "tools/daily_collect_test.py"),
+        "steps": (
+            "1. Unzip this file into the harness install folder, the folder that holds install.py. Only the files listed above and this ADDON.md are written.",
+            '2. Add a `daily` object to `~/.claude/local/machine.local.json` (create the file as `{}` first if it does not exist): `"daily": {"output": "<folder for the summaries>"}`. Optional keys: `"roots"`, a list of folders scanned when the person asks for the machine-wide daily. The collector reads the merged `~/.claude/local/machine.json`, which the next step writes.',
+            "3. Run `python install.py` from the install folder with the interpreter the machine file names (the machine name is remembered from the first install). It copies the skill into `~/.claude/skills/` and reruns the hook tests.",
+            "4. Restart Claude Code and type `daily`.",
+        ),
+    },
+}
+
+
 class BundleRefusal(ValueError):
     pass
 
@@ -770,7 +790,7 @@ def require_bundle_domains(home, domains, required):
             raise BundleRefusal(f"domain {domain} is owned by {', '.join(sorted(owners))} but {path} does not exist")
 
 
-def all_bundle_terms(home, repo=None, report=None):
+def all_bundle_terms(home, repo=None, report=None, *, details=None):
     global_terms, domains = load_bundle_terms(home)
     if repo is not None:
         required = {}
@@ -784,6 +804,8 @@ def all_bundle_terms(home, repo=None, report=None):
     domain_terms = dedupe_terms([term for terms in domains.values() for term in terms], excluded=global_terms)
     if report is not None:
         report(len(global_terms), len(domain_terms), len(domains))
+    if details is not None:
+        details.update(global_count=len(global_terms), domain_count=len(domain_terms), domains=domains)
     return global_terms + domain_terms
 
 
@@ -806,9 +828,7 @@ def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publis
     )
 
 
-def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False):
-    entries = {}
-
+def bundle_entry_adders(entries, *, plan_tools=True):
     def add(source, relative):
         source = Path(source)
         relative = Path(relative)
@@ -838,6 +858,12 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
                 continue
             add(path, Path(relative) / child)
 
+    return add, add_tree
+
+
+def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False):
+    entries = {}
+    add, add_tree = bundle_entry_adders(entries, plan_tools=plan_tools)
     add(repo / "install.py", "install.py")
     add(repo / "install-manifest.json", "install-manifest.json")
     add(repo / "claude" / "CLAUDE.md", "claude/CLAUDE.md")
@@ -915,6 +941,20 @@ def write_bundle_tree(root, entries):
         destination = root / Path(relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
+
+
+def write_bundle_output(output, entries):
+    if output.suffix.lower() == ".zip":
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
+            root = Path(temporary)
+            write_bundle_tree(root, entries)
+            archive = Path(shutil.make_archive(str(output.with_suffix("")), "zip", root_dir=root))
+            if str(archive) != str(output):
+                archive.replace(output)
+    else:
+        output.mkdir(parents=True, exist_ok=True)
+        write_bundle_tree(output, entries)
 
 
 def tracked_machine_names(repo):
@@ -1125,17 +1165,73 @@ def build_bundle(options):
         print(f"bundle would write {output} ({len(entries)} files)")
         return 0
 
-    if is_zip:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
-            root = Path(temporary)
-            write_bundle_tree(root, entries)
-            archive_base = str(output)[:-4]
-            shutil.make_archive(archive_base, "zip", root_dir=root)
-    else:
-        output.mkdir(parents=True, exist_ok=True)
-        write_bundle_tree(output, entries)
+    write_bundle_output(output, entries)
     print(f"bundle written {output} ({len(entries)} files)")
+    return 0
+
+
+def addon_install_text(name, date, commit, gate_record):
+    addon = ADDONS[name]
+    return (
+        "# {} addon\n\n".format(name.title())
+        + "Built {} from {}. {}\n\n".format(date, commit, addon["description"])
+        + "Files:\n{}\n\n".format("\n".join(addon["paths"]))
+        + gate_record + "\n\n"
+        + "Install, on a machine that already runs the harness (a bundle install or a clone of the public repository):\n\n"
+        + "\n".join(addon["steps"]) + "\n\n"
+        + "Update: unzip a newer addon over the same folder and run install.py again. Remove: delete the listed files from the install folder and `~/.claude/skills/{}/`.\n".format(name)
+    )
+
+
+def build_addon(options):
+    name = options["addon"]
+    if name not in ADDONS:
+        print("addon refused: unknown addon {}; available addons: {}".format(name, ", ".join(sorted(ADDONS))))
+        return 2
+
+    def report(global_count, domain_count, list_count):
+        print("addon gate: {} global terms, {} terms from {} domain lists".format(global_count, domain_count, list_count))
+
+    try:
+        details = {}
+        gate_terms = all_bundle_terms(options["home"], options["repo"], report, details=details)
+        domains = details["domains"]
+        fingerprints = ", ".join(sorted(terms.fingerprint for terms in domains.values()))
+        gate_record = "Addon gate applied: {} global terms, {} domain lists with {} terms, fingerprints {}".format(
+            details["global_count"], len(domains), details["domain_count"], fingerprints,
+        )
+        date = datetime.date.today().isoformat()
+        entries = {}
+        add, add_tree = bundle_entry_adders(entries)
+        for relative in ADDONS[name]["paths"]:
+            source = options["repo"] / relative
+            if not source.exists():
+                raise BundleRefusal("{} is missing".format(relative))
+            if relative.endswith("/"):
+                before = len(entries)
+                add_tree(source, relative)
+                if len(entries) == before:
+                    raise BundleRefusal("{} holds no files".format(relative))
+            else:
+                add(source, relative)
+        entries["ADDON.md"] = addon_install_text(name, date, bundle_commit(options["repo"]), gate_record).encode("utf-8")
+        entries = sorted(entries.items())
+    except (OSError, ValueError) as exc:
+        print("addon refused: {}".format(exc))
+        return 2
+    hits = bundle_gate(entries, gate_terms)
+    if hits:
+        print("addon refused: {} hits".format(hits))
+        return 2
+    output = options["out"] or options["repo"] / "bundles" / "harness-addon-{}-{}.zip".format(name, date)
+    if output.exists():
+        print("addon refused: addon output must not exist: {}".format(output))
+        return 2
+    if options["dry_run"]:
+        print("addon would write {} ({} files)".format(output, len(entries)))
+        return 0
+    write_bundle_output(output, entries)
+    print("addon written {} ({} files)".format(output, len(entries)))
     return 0
 
 
@@ -1243,6 +1339,8 @@ def install_git_hooks(options):
 
 
 def install(options):
+    if options["addon"] is not None:
+        return build_addon(options)
     if options["bundle"] is not None:
         return build_bundle(options)
     if options["git_hooks"] is not None:

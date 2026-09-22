@@ -1,4 +1,4 @@
-# Harness bundle for public, built 2026-09-18
+# Harness bundle for public, built 2026-09-22
 
 1. Clone the repository as the harness install folder named in machines/public.md, or unpack this folder there. Update it later with git pull; a release replaces the shared files and never touches your local files.
 2. Dry run and read every line: `python install.py --machine public --dry-run` (use the interpreter the machine file names; where the permission classifier blocks config edits, run the real install with the ! prefix).

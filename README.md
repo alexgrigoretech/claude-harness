@@ -40,6 +40,14 @@ Then restart Claude Code and run `/setup`. It asks who you are (so the assistant
 
 The house rule is that Claude plans, hands implementation to Codex CLI with a written brief, and verifies the diff; a hook blocks direct edits to source files unless a named exception is written to a marker file. On this machine the hook is off by default. `/setup` asks whether Codex is installed and logged in; if it is, it records `"codex_first": true` in `~/.claude/local/machine.local.json` and the next `install.py` run turns the hook on. Without Codex, Claude edits directly and the rule does not apply.
 
+## Addons
+
+Some house tools stay out of the main install because they assume a project layout of their own. They ship as addon zips on this repository's Releases page, each with an `ADDON.md` that repeats the steps below.
+
+- `daily`: type `daily` in a project and get one day of work summarized for a person who was not at the keyboard: a one minute status in plain words for the client or a manager, then milestones, successes, bottlenecks and insights for the person who did the work, and a training block that says what to do differently tomorrow, measured from git, handoff files, review logs, Codex run logs and the day's Claude Code session transcripts. `daily short` gives the status block alone.
+
+Install: unzip the addon into the harness install folder (the clone), add `"daily": {"output": "<folder for the summaries>"}` to `~/.claude/local/machine.local.json`, run `python install.py --machine public` again and restart Claude Code. Update by unzipping a newer addon over the same folder and running the installer again.
+
 ## Updating
 
 ```

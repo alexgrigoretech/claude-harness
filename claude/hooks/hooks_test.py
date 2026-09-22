@@ -4693,6 +4693,246 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertFalse(bundle.exists())
 
+    def run_addon(self, copied, output, name="daily", extra=None):
+        command = [
+            sys.executable, str(REPO / "install.py"), "--addon", name,
+            "--out", str(output), "--repo", str(copied), "--home", str(self.bundle_home(copied)),
+        ]
+        if extra:
+            command.extend(extra)
+        return subprocess.run(command, capture_output=True, text=True, check=False)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_daily_zip(self):
+        copied = self.copy_repo_without_local_machine_files("addon-zip-repo")
+        addon = self.base / "addon.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("addon gate:", result.stdout)
+        self.assertIn("addon written", result.stdout)
+        self.assertIn("(4 files)", result.stdout)
+        with zipfile.ZipFile(addon) as archive:
+            names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
+            instructions = archive.read("ADDON.md").decode("utf-8")
+        self.assertEqual(names, ["ADDON.md", "claude/skills/daily/SKILL.md", "tools/daily_collect.py", "tools/daily_collect_test.py"])
+        self.assertTrue(instructions.startswith("# Daily addon\n\nBuilt "))
+        self.assertIn("from an uncommitted tree.", instructions)
+        fingerprint = hashlib.sha256(self.bundle_terms_file(copied).read_bytes()).hexdigest()[:8]
+        self.assertRegex(instructions, r"Addon gate applied: \d+ global terms, 1 domain lists with 1 terms, fingerprints " + fingerprint)
+        for step in ("1. Unzip this file", "2. Add a `daily` object", "3. Run `python install.py`", "4. Restart Claude Code and type `daily`."):
+            self.assertIn(step, instructions)
+        self.assertIn('"daily": {"output": "<folder for the summaries>"}', instructions)
+        self.assertIn("~/.claude/local/machine.json", instructions)
+        self.assertIn("Update: unzip a newer addon", instructions)
+        self.assertIn("Only the files listed above and this ADDON.md are written.", instructions)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_dry_run_writes_nothing(self):
+        copied = self.copy_repo_without_local_machine_files("addon-dry-repo")
+        addon = self.base / "addon-dry-parent" / "addon.zip"
+        result = self.run_addon(copied, addon, extra=["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("addon would write {} (4 files)".format(addon), result.stdout)
+        self.assertFalse(addon.parent.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_unknown_is_refused(self):
+        copied = self.copy_repo_without_local_machine_files("addon-unknown-repo")
+        addon = self.base / "addon-unknown.zip"
+        result = self.run_addon(copied, addon, name="missing")
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertEqual(result.stdout, "addon refused: unknown addon missing; available addons: daily\n")
+        self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_output_exists_is_refused(self):
+        copied = self.copy_repo_without_local_machine_files("addon-existing-repo")
+        for directory in (False, True):
+            with self.subTest(directory=directory):
+                addon = self.base / ("addon-existing-directory" if directory else "addon-existing.zip")
+                if directory:
+                    addon.mkdir()
+                else:
+                    addon.write_bytes(b"keep")
+                result = self.run_addon(copied, addon)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn("addon refused: addon output must not exist: {}".format(addon), result.stdout)
+                self.assertEqual(list(addon.iterdir()) if directory else addon.read_bytes(), [] if directory else b"keep")
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_cannot_combine_with_bundle_or_machine(self):
+        copied = self.copy_repo_without_local_machine_files("addon-combined-repo")
+        addon = self.base / "addon-combined.zip"
+        for option, value in (("--bundle", TEST_MACHINE), ("--machine", TEST_MACHINE), ("--git-hooks", str(copied))):
+            with self.subTest(option=option):
+                result = self.run_addon(copied, addon, extra=[option, value])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--addon cannot be combined with " + option, result.stderr)
+                self.assertIn("usage: python install.py", result.stderr)
+                self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_gate_refuses_terms(self):
+        copied = self.copy_repo_without_local_machine_files("addon-gate-repo")
+        term = "addonprobe" + " exclusion"
+        self.bundle_terms_file(copied).write_text(term + "\n", encoding="utf-8")
+        skill = copied / "claude/skills/daily/SKILL.md"
+        original = skill.read_text(encoding="utf-8")
+        line_number = len((original + "\n").splitlines()) + 1
+        skill.write_text(original + "\n" + term + "\n", encoding="utf-8")
+        addon = self.base / "addon-gate.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("GATE claude/skills/daily/SKILL.md:{}: {}".format(line_number, term), result.stdout)
+        self.assertIn("addon refused: 1 hits", result.stdout)
+        self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_installs_over_a_bundle_tree(self):
+        copied = self.copy_repo_without_local_machine_files("addon-source-repo")
+        addon = self.base / "addon-install.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        (copied / "machines" / (TEST_MACHINE + ".local.json")).write_text(json.dumps({"plan_tools": False}), encoding="utf-8")
+        target = self.base / "addon-target-bundle"
+        result = self.run_bundle(copied, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        for relative in ("claude/skills/daily", "tools/daily_collect.py", "tools/daily_collect_test.py"):
+            self.assertFalse((target / relative).exists(), relative)
+        with zipfile.ZipFile(addon) as archive:
+            archive.extractall(target)
+        home = self.new_home("addon-install-home")
+        with mock.patch.dict(globals(), REPO=target):
+            installed = self.run_install(home, target)
+        self.assertEqual(installed.returncode, 0, installed.stderr or installed.stdout)
+        destination = home / ".claude/skills/daily/SKILL.md"
+        self.assertTrue(destination.is_file())
+        self.assertEqual(destination.read_bytes(), (copied / "claude/skills/daily/SKILL.md").read_bytes())
+        tested = subprocess.run(
+            [sys.executable, str(target / "tools/daily_collect_test.py")], cwd=target,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False,
+        )
+        self.assertEqual(tested.returncode, 0, tested.stderr or tested.stdout)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_requires_every_declared_domain_list(self):
+        copied = self.copy_repo_without_local_machine_files("addon-required-domain-repo")
+        self.declare_bundle_domains(copied, ["probe", "missing"])
+        addon = self.base / "addon-required-domain.zip"
+        result = self.run_addon(copied, addon)
+        bundle = self.run_bundle(copied, self.base / "addon-required-domain-bundle")
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertEqual(bundle.returncode, 2, bundle.stderr or bundle.stdout)
+        self.assertEqual(result.stdout, bundle.stdout.replace("bundle refused:", "addon refused:"))
+        self.assertIn("domain missing is owned by domain-owner but ", result.stdout)
+        self.assertIn("does not exist", result.stdout)
+        self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_missing_paths_are_refused(self):
+        for index, relative in enumerate(("tools/daily_collect.py", "claude/skills/daily/")):
+            with self.subTest(relative=relative):
+                copied = self.copy_repo_without_local_machine_files("addon-missing-path-{}-repo".format(index))
+                source = copied / relative
+                self.assertTrue(source.resolve().is_relative_to(self.base.resolve()))
+                if source.is_dir():
+                    shutil.rmtree(source)
+                else:
+                    source.unlink()
+                addon = self.base / "addon-missing-path-{}.zip".format(index)
+                result = self.run_addon(copied, addon)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn("addon refused: {} is missing".format(relative), result.stdout)
+                self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_empty_tree_is_refused(self):
+        copied = self.copy_repo_without_local_machine_files("addon-empty-tree-repo")
+        source = copied / "claude/skills/daily"
+        self.assertTrue(source.resolve().is_relative_to(self.base.resolve()))
+        shutil.rmtree(source)
+        source.mkdir()
+        addon = self.base / "addon-empty-tree.zip"
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                if cached:
+                    (source / "ignored.pyc").write_bytes(b"cached")
+                result = self.run_addon(copied, addon)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn("addon refused: claude/skills/daily/ holds no files", result.stdout)
+                self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_and_bundle_accept_uppercase_zip_suffix(self):
+        copied = self.copy_repo_without_local_machine_files("addon-uppercase-repo")
+        for name, build in (("addon", self.run_addon), ("bundle", self.run_bundle)):
+            with self.subTest(name=name):
+                output = self.base / (name + ".release.ZIP")
+                result = build(copied, output)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertTrue(zipfile.is_zipfile(output))
+                self.assertIn(output.name, [path.name for path in output.parent.iterdir()])
+
+    def test_addon_install_text_uses_named_steps(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        addon = {"description": "Fixture addon.", "paths": ("fixture.txt",), "steps": ("1. TODO: configure the fixture addon.",)}
+        with mock.patch.dict(installer.ADDONS, sample=addon):
+            text = installer.addon_install_text("sample", "2026-09-22", "fixture", "Fixture gate record")
+        self.assertIn("# Sample addon", text)
+        self.assertIn(addon["steps"][0], text)
+        self.assertNotIn("daily", text)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_requires_domain_lists(self):
+        copied = self.copy_repo_without_local_machine_files("addon-no-domains-repo", terms=False)
+        addon = self.base / "addon-no-domains.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("addon refused: no domain lists under ", result.stdout)
+        self.assertIn("(one file per engagement or product family, see README)", result.stdout)
+        self.assertFalse(addon.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_directory_skips_cached_files_and_refuses_terms(self):
+        copied = self.copy_repo_without_local_machine_files("addon-tree-repo")
+        skill = copied / "claude/skills/daily"
+        cache = skill / "__pycache__"
+        cache.mkdir()
+        (cache / "bundle-terms.txt").write_text("ignored", encoding="utf-8")
+        (skill / "ignored.pyc").write_bytes(b"\xff")
+        addon = self.base / "addon-tree"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(len([path for path in addon.rglob("*") if path.is_file()]), 4)
+        (skill / "bundle-terms.txt").write_text("refuse", encoding="utf-8")
+        refused = self.base / "addon-tree-refused"
+        result = self.run_addon(copied, refused)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("terms file inside the bundle tree: claude/skills/daily/bundle-terms.txt", result.stdout)
+        self.assertFalse(refused.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_applies_all_domains_and_deduplicates_terms(self):
+        copied = self.copy_repo_without_local_machine_files("addon-domains-repo")
+        term = "addonprobe" + " exclusion"
+        terms = self.bundle_terms_file(copied)
+        terms.write_text(term + "\n" + term + "\n", encoding="utf-8")
+        second = terms.with_name("second.txt")
+        second.write_text(term + "\n", encoding="utf-8")
+        machine_path = copied / "machines" / (TEST_MACHINE + ".json")
+        machine = read_json_test(machine_path)
+        machine["owns"] = ["probe", "second"]
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        addon = self.base / "addon-domains.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertRegex(result.stdout, r"addon gate: \d+ global terms, 1 terms from 2 domain lists")
+        fingerprints = ", ".join(sorted(hashlib.sha256(path.read_bytes()).hexdigest()[:8] for path in (terms, second)))
+        with zipfile.ZipFile(addon) as archive:
+            self.assertIn("fingerprints " + fingerprints, archive.read("ADDON.md").decode("utf-8"))
+
     def assert_gate_matches_reference(self, source, content, expected_hits):
         spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
         installer = importlib.util.module_from_spec(spec)
