@@ -385,13 +385,68 @@ class PRReviewTest(unittest.TestCase):
         self.assertEqual(scorer.review_cost(None, scorer.DEFAULT_PRICES["agy"]), 0.0)
         self.assertEqual(scorer.review_cost(None, scorer.DEFAULT_PRICES["codex"]), 0.0)
         self.assertNotIn("gemini", scorer.DEFAULT_PRICES)
+        self.assertEqual(scorer.DEFAULT_PRICES["haiku"], (0.10, 0.50))
+        self.assertAlmostEqual(scorer.review_cost(
+            {"input_tokens": 1_000_000, "output_tokens": 1_000_000}, scorer.DEFAULT_PRICES["haiku"]
+        ), 0.60)
 
     def test_reviewer_override_replaces_default(self):
         override = runner.parse_override(f"agy={self.command(self.plain)}")
         configs = runner.load_reviewer_configs([override], home=self.home)
         self.assertEqual(configs["agy"]["cmd"], self.command(self.plain))
         self.assertTrue(configs["agy"]["stdin"])
-        self.assertEqual(list(configs), ["agy", "codex", "kimi"])
+        self.assertEqual(list(configs), ["agy", "codex", "haiku", "kimi"])
+
+    def test_default_haiku_reviewer(self):
+        config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "haiku")
+        self.assertEqual(config, {
+            "name": "haiku",
+            "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."',
+            "stdin": True,
+        })
+        tokens = runner.command_tokens(config["cmd"])
+        self.assertEqual(tokens[tokens.index("--max-turns") + 1], "1")
+        self.assertEqual(tokens[tokens.index("--tools") + 1], "")
+        self.assertEqual(tokens[tokens.index("--append-system-prompt") + 1], "Reply with the JSON findings array only, no prose.")
+
+    def test_reviewer_environment_removes_claude_session_markers(self):
+        with mock.patch.dict(os.environ, {
+            "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "REVIEW_TEST": "kept",
+        }):
+            for config in runner.DEFAULT_REVIEWERS:
+                with self.subTest(reviewer=config["name"]):
+                    with mock.patch.object(runner, "prepare_command", return_value=[sys.executable]):
+                        with mock.patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess(
+                            [], 0, stdout="[]", stderr=""
+                        )) as run:
+                            result = runner.run_reviewer(config, "prompt")
+                    self.assertEqual(result.status, "ok")
+                    environment = run.call_args.kwargs["env"]
+                    self.assertNotIn("CLAUDECODE", environment)
+                    self.assertNotIn("CLAUDE_CODE_ENTRYPOINT", environment)
+                    self.assertEqual(environment["REVIEW_TEST"], "kept")
+                    self.assertEqual(os.environ["CLAUDECODE"], "1")
+                    self.assertEqual(os.environ["CLAUDE_CODE_ENTRYPOINT"], "cli")
+
+    def test_codex_fallback_model(self):
+        self.assertEqual(runner.configured_codex_model(self.home), "gpt-6.1-sol")
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        for machine in ({}, {"codex_model": " "}, {"codex_model": 123}, []):
+            with self.subTest(machine=machine):
+                (local / "machine.json").write_text(json.dumps(machine), encoding="utf-8")
+                self.assertEqual(runner.configured_codex_model(self.home), "gpt-6.1-sol")
+
+    def test_claude_and_kimi_resolve_from_path(self):
+        directory = self.root / "reviewer-bin"
+        directory.mkdir()
+        for name in ("claude", "kimi"):
+            with self.subTest(name=name):
+                executable = directory / (name + ".exe" if os.name == "nt" else name)
+                executable.write_text("", encoding="utf-8")
+                executable.chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": str(directory)}):
+                    self.assertEqual(Path(runner.resolve_reviewer_executable(name)), executable.resolve())
 
     def test_prepare_command_replaces_repo_with_resolved_path(self):
         config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "codex")

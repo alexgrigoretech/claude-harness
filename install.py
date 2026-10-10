@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -15,6 +16,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 STATUSLINE_COMMAND = "bash ~/.claude/statusline-command.sh"
+DEFAULT_CODEX_EFFORT = "high"
+DEFAULT_CLAUDE_EFFORT = {"claude-fable-5-1": "medium", "claude-opus-5-5": "high", "claude-sonnet-5-5": "medium", "claude-haiku-5-5": "medium"}
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -108,6 +111,41 @@ def validate_machine_flags(machine, defaults, source_for_key):
     return flags
 
 
+def validate_gh_accounts(machine, source_for_key):
+    configured = machine.get("gh_accounts")
+    if configured is not None and not isinstance(configured, dict):
+        raise ValueError(f"{source_for_key('gh_accounts')}: gh_accounts must be an object")
+    accounts = dict(configured or {})
+    for prefix, login in accounts.items():
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(f"{source_for_key('gh_accounts')}: gh_accounts key {prefix!r} must be a non empty folder prefix")
+        if prefix != "default" and not prefix.startswith(("/", "~/")) and prefix != "~" and not re.match(r"^[A-Za-z]:[/\\]", prefix):
+            raise ValueError(f"{source_for_key('gh_accounts')}: gh_accounts key {prefix!r} must be absolute, ~ or start with ~/")
+        if not isinstance(login, str) or not login.strip():
+            raise ValueError(f"{source_for_key('gh_accounts')}: gh_accounts.{prefix} must be a non empty string")
+    legacy = machine.get("gh_account")
+    if legacy is not None:
+        if not isinstance(legacy, str) or not legacy.strip():
+            raise ValueError(f"{source_for_key('gh_account')}: gh_account must be a non empty string")
+        if "default" in accounts and accounts["default"] != legacy:
+            raise ValueError(f"{source_for_key('gh_accounts')}: gh_accounts.default and gh_account must agree")
+        accounts.setdefault("default", legacy)
+    return accounts if configured is not None or legacy is not None else None
+
+
+def validate_machine_efforts(machine, source_for_key):
+    allowed = ("low", "medium", "high", "xhigh")
+    codex = machine.get("codex_effort")
+    if codex is not None and codex not in ("minimal", "low", "medium", "high", "xhigh"):
+        raise ValueError(f"{source_for_key('codex_effort')}: codex_effort must be minimal, low, medium, high, xhigh or null")
+    claude = machine.get("claude_effort")
+    if claude is not None and (
+        not isinstance(claude, dict)
+        or any(not isinstance(model, str) or not model or effort not in allowed for model, effort in claude.items())
+    ):
+        raise ValueError(f"{source_for_key('claude_effort')}: claude_effort must be a model map with values low, medium, high or xhigh, or null")
+
+
 def validate_statusline_weather(machine, source_for_key):
     weather = machine.get("statusline_weather")
     if weather is None:
@@ -123,6 +161,42 @@ def validate_statusline_weather(machine, source_for_key):
         or not -180 <= weather["lon"] <= 180
     ):
         raise ValueError(f"{source_for_key('statusline_weather')}: statusline_weather must be null or an object with city, lat and lon")
+
+
+def validate_proxy(machine, source_for_key):
+    if "proxy" not in machine:
+        return
+    prefix = f"{source_for_key('proxy')}: proxy"
+    proxy = machine["proxy"]
+    if not isinstance(proxy, dict):
+        raise ValueError(f"{prefix} must be an object")
+    unknown = sorted(set(proxy) - {
+        "host", "port", "scheme", "key_file", "claude_command", "codex_command", "bin_dir",
+    })
+    if unknown:
+        raise ValueError(f"{prefix} has unknown keys: {', '.join(unknown)}")
+    for key in ("host", "key_file", "claude_command", "codex_command", "bin_dir"):
+        if key not in proxy and key not in ("host", "key_file"):
+            continue
+        if not isinstance(proxy.get(key), str) or not proxy[key].strip():
+            raise ValueError(f"{prefix}.{key} must be a non empty string")
+    if type(proxy.get("port", 8317)) is not int or not 1 <= proxy.get("port", 8317) <= 65535:
+        raise ValueError(f"{prefix}.port must be an integer from 1 to 65535")
+    if proxy.get("scheme", "http") not in ("http", "https"):
+        raise ValueError(f"{prefix}.scheme must be http or https")
+    if machine.get("os") not in ("windows", "linux", "darwin"):
+        raise ValueError(f"{prefix} requires os windows, linux or darwin; got {machine.get('os')!r}")
+
+
+def validate_remote(machine, source_for_key):
+    if "remote" not in machine:
+        return
+    from tools.remote_prompt import validate_remote_block
+
+    try:
+        validate_remote_block(machine["remote"])
+    except ValueError as exc:
+        raise ValueError(f"{source_for_key('remote')}: {exc}") from exc
 
 
 def read_local_machine(path, label=None):
@@ -403,6 +477,94 @@ def merge_keybindings(existing, defaults):
     return merged
 
 
+def git_config_value(value):
+    if any(ord(character) < 32 for character in value):
+        raise ValueError("git credential configuration must not contain control characters")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def install_gh_credentials(installer, machine):
+    begin = b"# harness gh accounts begin"
+    end = b"# harness gh accounts end"
+    destination = installer.home / ".gitconfig"
+    accounts = validate_gh_accounts(machine, lambda key: destination)
+    for login in (accounts or {}).values():
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login) or login.lower().startswith("todo"):
+            installer.action(destination, f"skipped (gh account {login} is a placeholder)")
+            return
+    if accounts == {}:
+        installer.action(destination, "skipped (no gh accounts configured)")
+        return
+    if destination.exists() and not destination.is_file():
+        raise ValueError(".gitconfig must be a file")
+    original = destination.read_bytes() if destination.is_file() else b""
+    pattern = re.compile(rb"^" + begin + rb"\r?\n.*?^" + end + rb"(?:\r?\n|$)", re.MULTILINE | re.DOTALL)
+    matches = list(pattern.finditer(original))
+    if len(matches) > 1 or original.count(begin) != len(matches) or original.count(end) != len(matches):
+        raise ValueError(".gitconfig has invalid harness gh accounts markers")
+    previous = matches[0] if matches else None
+    outside = original[:previous.start()] + original[previous.end():] if previous else original
+    fragments = {}
+    block = b""
+    if accounts:
+        newline_match = re.search(rb"\r?\n", previous.group() if previous else original)
+        newline = newline_match.group().decode() if newline_match else "\n"
+        interpreter = str(Path(sys.executable).resolve()).replace("\\", "/")
+        helper_path = (installer.home / ".claude/hooks/gh_credential_helper.py").resolve().as_posix()
+        helper = git_config_value(f'!"{interpreter}" -I "{helper_path}"')
+        hosts = ("github.com", "gist.github.com")
+        existing = {}
+        scope = None
+        for line in outside.decode("utf-8", errors="surrogateescape").splitlines():
+            if line.lstrip().startswith("["):
+                section = re.match(r'\s*\[credential(?:\s+"https://(github\.com|gist\.github\.com)")?\s*\]', line, re.IGNORECASE)
+                scope = (section.group(1) or "default").lower() if section else None
+            elif scope and re.match(r"\s*helper\s*=", line, re.IGNORECASE) and re.search(r"\bauth\s+git-credential\b", line.partition("=")[2]):
+                existing[scope] = line
+        lines = [begin.decode(), "# The installer rewrites this block on every run; re-run install.py after a Python upgrade."]
+        for host in hosts:
+            lines.extend([f'[credential "https://{host}"]', "\thelper =", f"\thelper = {helper}"])
+            lines.append(existing.get(host, existing.get("default", "\thelper = !gh auth git-credential")))
+            if "default" in accounts:
+                lines.append("\tusername = " + git_config_value(accounts["default"]))
+        prefixes = []
+        for prefix, login in accounts.items():
+            if prefix == "default":
+                continue
+            normalized = prefix.replace("\\", "/")
+            if normalized == "~" or normalized.startswith("~/"):
+                normalized = installer.home.resolve().as_posix() + normalized[1:]
+            normalized = os.path.abspath(os.path.normpath(normalized)).replace("\\", "/").rstrip("/")
+            prefixes.append((normalized, prefix, login))
+        for normalized, prefix, login in sorted(prefixes, key=lambda entry: (len(entry[0]), entry[0].lower())):
+            slug = re.sub(r"[^a-z0-9]+", "-", prefix.lower()).strip("-") or "root"
+            fragment = installer.home / ".claude/local" / ("gitconfig-gh-" + slug)
+            if fragment.exists() and not fragment.is_file():
+                raise ValueError(f"{fragment}: git credential fragment must be a file")
+            if fragment in fragments:
+                raise ValueError(f"gh_accounts prefixes have the same fragment slug: {slug}")
+            content = []
+            for host in hosts:
+                content.extend([f'[credential "https://{host}"]', "\tusername = " + git_config_value(login)])
+            fragments[fragment] = ("\n".join(content) + "\n").encode("utf-8")
+            lines.extend([f'[includeIf {git_config_value("gitdir/i:" + normalized + "/")}]', "\tpath = " + git_config_value(fragment.resolve().as_posix())])
+        lines.append(end.decode())
+        block = (newline.join(lines) + (newline if not previous or previous.group().endswith(b"\n") else "")).encode("utf-8")
+    if previous:
+        updated = original[:previous.start()] + block + original[previous.end():]
+    else:
+        separator = b"" if not original or original.endswith(b"\n") or not block else (b"\r\n" if b"\r\n" in original else b"\n")
+        updated = original + separator + block
+    for fragment, content in fragments.items():
+        installer.write_bytes(fragment, content)
+    if updated != original:
+        installer.write_bytes(destination, updated)
+    for fragment in (installer.home / ".claude/local").glob("gitconfig-gh-*"):
+        if fragment.is_file() and fragment not in fragments:
+            installer.backup(fragment)
+            installer.remove(fragment)
+
+
 def install_keybindings(installer, repo, home):
     keybindings_path = home / ".claude" / "keybindings.json"
     default_keybindings_path = repo / "claude" / "keybindings.json"
@@ -453,6 +615,453 @@ def install_statusline(installer, repo, home, machine):
     return True
 
 
+PROXY_SH = r"""#!/bin/sh
+# Written by install.py from the machine's proxy block. HARNESS_PROXY=off forces the own login.
+{resolve}
+if [ "$HARNESS_PROXY" != "force" ]; then
+  if [ "$HARNESS_PROXY" = "off" ] || {bypass}; then
+    exec "$real" "$@"
+  fi
+fi
+tok=$({token})
+if [ -n "$tok" ] && curl -sf -m 2 -o /dev/null -H "Authorization: Bearer $tok" {probe} 2>/dev/null; then
+  echo "{name} via the proxy pool" >&2
+  {execute}
+fi
+if [ "$HARNESS_PROXY" = "force" ]; then
+  echo "proxy unreachable" >&2
+  exit 1
+fi
+echo "proxy down, {name} on this device's own login" >&2
+exec "$real" "$@"
+"""
+
+PROXY_SH_RESOLVE = r"""resolve_path() {{
+  target=$1
+  while [ -L "$target" ]; do
+    folder=$(CDPATH= cd -P "$(dirname "$target")" && pwd) || return 1
+    target=$(readlink "$target") || return 1
+    case "$target" in /*) ;; *) target="$folder/$target" ;; esac
+  done
+  folder=$(CDPATH= cd -P "$(dirname "$target")" && pwd) || return 1
+  printf '%s/%s\n' "$folder" "$(basename "$target")"
+}}
+self=$(resolve_path "$0")
+own_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+real=""
+remaining=$PATH
+while :; do
+  folder=${{remaining%%:*}}
+  [ -n "$folder" ] || folder=.
+  directory=$(CDPATH= cd -P "$folder" 2>/dev/null && pwd)
+  if [ -n "$directory" ] && [ "$directory" != "$own_dir" ]; then
+    for candidate in "$directory/{name}"{extensions}; do
+      [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+      resolved=$(resolve_path "$candidate")
+      [ "$resolved" = "$self" ] && continue
+      [ "$(dirname "$resolved")" = "$own_dir" ] && continue
+      real=$candidate
+      break
+    done
+  fi
+  [ -z "$real" ] || break
+  case "$remaining" in *:*) remaining=${{remaining#*:}} ;; *) break ;; esac
+done
+if [ -z "$real" ]; then
+  echo "{name}: real binary not found on PATH" >&2
+  exit 127
+fi"""
+
+PROXY_SH_ALIAS = """#!/bin/sh
+# Written by install.py from the machine's proxy block. HARNESS_PROXY=off forces the own login.
+HARNESS_PROXY=force exec "$(dirname "$0")/{name}" "$@"
+"""
+
+PROXY_CMD = r"""@rem Written by install.py from the machine's proxy block. HARNESS_PROXY=off forces the own login.
+@echo off
+setlocal DisableDelayedExpansion
+{resolve}
+if "%HARNESS_PROXY%"=="force" goto probe
+if "%HARNESS_PROXY%"=="off" goto own
+{bypass}
+:probe
+set "tok="
+{token}
+if not defined tok goto down
+@rem Call lets cmd probe stubs return. The validated key alphabet and percent-free base URL make its second expansion safe.
+call curl -sf -m 2 -o NUL -H "Authorization: Bearer %tok%" "{base}/v1/models" 2>NUL
+if errorlevel 1 goto down
+echo {name} via the proxy pool >&2
+{prepare}@rem The next line ends the local scope on purpose: a batch target such as the npm codex.cmd shim would otherwise start after the implicit endlocal and lose the variables.
+{execute}
+exit /b %errorlevel%
+:down
+if "%HARNESS_PROXY%"=="force" (
+  echo proxy unreachable >&2
+  exit /b 1
+)
+echo proxy down, {name} on this device's own login >&2
+:own
+"%real%" %*
+exit /b %errorlevel%
+"""
+
+PROXY_CMD_RESOLVE = r"""set "proxy_orig_path=%PATH%"
+set "proxy_path="
+for %%D in ("%PATH:;=" "%") do call :path_entry "%%~D"
+set "PATH=%proxy_path%"
+set "real="
+{lookup}
+set "PATH=%proxy_orig_path%"
+if defined real goto resolved
+echo {name}: real binary not found on PATH >&2
+exit /b 127
+:path_entry
+for %%F in ("%~1\.") do if /i "%%~fF\"=="%~dp0" exit /b
+if defined proxy_path (set "proxy_path=%proxy_path%;%~1") else set "proxy_path=%~1"
+exit /b
+:resolved"""
+
+PROXY_CMD_ALIAS = r"""@rem Written by install.py from the machine's proxy block. HARNESS_PROXY=off forces the own login.
+@echo off
+setlocal DisableDelayedExpansion
+set "HARNESS_PROXY=force"
+"%~dp0{name}.cmd" %*
+"""
+
+PROXY_CODEX_CONFIG = """model_provider = "cliproxyapi"
+model = {model}
+{effort_line}
+[model_providers.cliproxyapi]
+base_url = {base_url}
+model_catalog_url = {catalog_url}
+experimental_bearer_token = {token}
+name = "OpenAI"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = true
+"""
+
+
+def proxy_bin_dir(machine):
+    return machine["proxy"].get("bin_dir", ".claude/local/bin")
+
+
+def proxy_path(raw, home):
+    path, _ = machine_file_path(raw, home)
+    return path.resolve()
+
+
+def proxy_key(machine, home, dry_run):
+    if "proxy" not in machine:
+        return None
+    path = proxy_path(machine["proxy"]["key_file"], home)
+    try:
+        key = path.read_text(encoding="utf-8-sig").rstrip("\r\n")
+    except FileNotFoundError:
+        if dry_run:
+            return None
+        raise ValueError(f"proxy key file not found: {path} (copy the device's client key there by hand first)")
+    if not key:
+        raise ValueError(f"proxy key file must hold a non empty key on one line: {path}")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", key) is None:
+        raise ValueError(f"proxy key file holds characters outside letters, digits, dash and underscore: {path}")
+    return key
+
+
+def is_proxy_launcher(path):
+    try:
+        return b"Written by install.py from the machine's proxy block" in path.read_bytes()
+    except OSError:
+        return False
+
+
+def proxy_launcher_conflicts(machine, home):
+    if "proxy" not in machine:
+        return []
+    bin_dir = proxy_path(proxy_bin_dir(machine), home)
+    conflicts = []
+    for name in ("claude", "codex", "claude-proxy", "codex-proxy"):
+        for suffix in ("", ".cmd") if machine["os"] == "windows" else ("",):
+            path = bin_dir / (name + suffix)
+            if not os.path.lexists(path):
+                continue
+            if not is_proxy_launcher(path):
+                conflicts.append(path)
+    return conflicts
+
+
+REMOTE_SKILL_MARKER = "Written by install.py from the machine's remote block"
+
+
+def remote_skill_conflicts(machine, home):
+    conflicts = []
+    for name in machine.get("remote", {}):
+        path = Path(home) / ".claude" / "skills" / name / "SKILL.md"
+        if not os.path.lexists(path):
+            continue
+        try:
+            managed = REMOTE_SKILL_MARKER.encode("utf-8") in path.read_bytes()
+        except OSError:
+            managed = False
+        if not managed:
+            conflicts.append(path)
+    return conflicts
+
+
+def check_remote_skills(machine, home, repo):
+    for name in machine.get("remote", {}):
+        if (Path(repo) / "claude" / "skills" / name).is_dir():
+            raise ValueError(f"remote.{name} conflicts with a repository skill")
+    conflicts = remote_skill_conflicts(machine, home)
+    if conflicts:
+        raise ValueError(f"{conflicts[0]} exists and was not written by install.py (choose another remote name or move that file)")
+
+
+def install_remote_skills(installer, machine, repo):
+    tool = shlex.quote((installer.repo / "tools" / "remote_prompt.py").resolve().as_posix())
+    for name in machine.get("remote", {}):
+        description = f'Run a prompt on the {name} machine through claude -p over ssh (or locally when this is that machine). Use when the user types /{name} followed by a prompt, "ask {name} to", "run on {name}", "on {name}:", or wants a goal executed on {name}.'
+        content = f'''---
+name: {name}
+description: {json.dumps(description)}
+---
+
+# /{name}
+
+{REMOTE_SKILL_MARKER}. Edit `remote.{name}` in the machine's local json and run install.py again; never edit this file.
+
+The argument is the prompt to run on `{name}`; it may start with a slash command such as `/auto <goal>`, which the remote session expands itself. Steps:
+
+1. Write the argument verbatim to `<scratchpad>/remote-{name}-<timestamp>.md` (the session scratchpad, never the project).
+2. Short prompts (a question, a status, a one step task): run `python {tool} {name} --prompt-file <that file>` from the Bash tool and relay the stdout answer; the stderr footer carries the session id, turns, duration and cost; a `permission denied` block in stderr means the remote session was blocked and the user must decide.
+3. Long prompts (anything starting with `/auto`, `/ship`, or a task that would run Codex): add `--detach`, print the run id, then poll `python {tool} {name} --collect` no more than once every five minutes (Monitor or a background Bash loop), and relay the result when it arrives. Exit 4 means still running. Exit 3 means finished without a result. The tool passes a headless system prompt telling the remote session to keep long jobs in the foreground or under setsid nohup; `--no-preamble` skips it.
+4. Follow-ups in the same remote conversation: add `--continue`. Collect a detached run first; `--continue` refuses an uncollected run. Use `--resume <session id>` to choose a session explicitly.
+5. `--cwd <folder>` runs in another folder on that machine; `--dry-run` shows the exact command without running it. For an ssh entry, from Git Bash prefix the command with `MSYS_NO_PATHCONV=1` and quote the value, such as `--cwd '/srv/app'` or `--cwd '~/x'`. This disables path conversion for every argument, so give `--prompt-file` and `--machine-json` values as Windows paths such as `C:/Users/...` or `F:/...`, not `/c/Users/...` forms, to avoid a `No such file or directory` error.
+
+An ssh entry must point at a machine whose login shell is POSIX; a Windows host over ssh is not supported.
+
+Never put the prompt on the command line; always use the prompt file. Never run two detached runs on the same machine at once without the user asking.
+'''
+        installer.write_bytes(installer.home / ".claude" / "skills" / name / "SKILL.md", content.encode("utf-8"))
+
+
+CODEX_PROXY_OVERRIDES = (
+    "model_provider=cliproxyapi",
+    'model_providers.cliproxyapi.name="OpenAI"',
+    "model_providers.cliproxyapi.base_url={base_url}",
+    "model_providers.cliproxyapi.model_catalog_url={catalog_url}",
+    'model_providers.cliproxyapi.wire_api="responses"',
+    "model_providers.cliproxyapi.requires_openai_auth=false",
+    "model_providers.cliproxyapi.supports_websockets=true",
+    'model_providers.cliproxyapi.env_key="CLIPROXY_API_KEY"',
+)
+
+
+def codex_proxy_overrides(base):
+    return [value.format(base_url=json.dumps(base + "/v1"), catalog_url=json.dumps(base + "/v1/models")) for value in CODEX_PROXY_OVERRIDES]
+
+
+def proxy_launchers(machine, home, base):
+    proxy = machine["proxy"]
+    bin_dir = proxy_path(proxy_bin_dir(machine), home)
+    files = {}
+    overrides = codex_proxy_overrides(base)
+    for name in ("claude", "codex"):
+        command = proxy.get(name + "_command")
+        command_path = proxy_path(os.path.expandvars(os.path.expanduser(command)), home) if command else None
+        profile = home / (".claude-proxy/settings.json" if name == "claude" else ".codex-proxy/config.toml")
+        profile_sh = shlex.quote(profile.as_posix())
+        resolve = "real=" + shlex.quote(command_path.as_posix()) if command_path else PROXY_SH_RESOLVE.format(
+            name=name, extensions=f' "$directory/{name}.exe" "$directory/{name}.cmd"' if machine["os"] == "windows" else "",
+        )
+        if name == "claude":
+            bypass = '[ "${ANTHROPIC_BASE_URL+x}" = x ]'
+            token = r"""sed -n 's/.*"ANTHROPIC_AUTH_TOKEN": *"\([^"]*\)".*/\1/p' """ + profile_sh + " 2>/dev/null"
+            execute = f'ANTHROPIC_BASE_URL={shlex.quote(base)} ANTHROPIC_AUTH_TOKEN="$tok" CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 exec "$real" "$@"'
+        else:
+            bypass = '[ "${CODEX_HOME+x}" = x ] || [ "${OPENAI_BASE_URL+x}" = x ]'
+            token = r"""sed -n 's/^experimental_bearer_token *= *"\([^"]*\)".*/\1/p' """ + profile_sh + " 2>/dev/null"
+            config_args = " ".join("-c " + shlex.quote(value) for value in overrides)
+            execute = f'''# The launcher recognises a subcommand only as the first word, so put options after it. The same rule applies to nested subcommands.
+  sub=
+  nested=
+  case "${{1-}}" in
+    ""|-*|help|*[[:space:]]*|*'"'*) ;;
+    *)
+      sub=$1
+      shift
+      if [ "$sub" = "exec" ]; then
+        case "${{1-}}" in
+          resume|fork|review) nested=$1; shift ;;
+        esac
+      fi
+      ;;
+  esac
+  CLIPROXY_API_KEY="$tok" exec "$real" ${{sub:+"$sub"}} ${{nested:+"$nested"}} {config_args} "$@"'''
+        files[bin_dir / name] = PROXY_SH.format(
+            resolve=resolve, bypass=bypass, token=token, probe=shlex.quote(base + "/v1/models"),
+            name=name, execute=execute.rstrip(),
+        ).encode("utf-8")
+        files[bin_dir / (name + "-proxy")] = PROXY_SH_ALIAS.format(name=name).encode("utf-8")
+        if machine["os"] != "windows":
+            continue
+        lookup = "\n".join(
+            f'for /f "delims=" %%R in (\'where $PATH:{name}{suffix} 2^>NUL\') do if not defined real set "real=%%R"'
+            for suffix in (".exe", ".cmd", "")
+        )
+        resolve = f'set "real={command_path}"' if command_path else PROXY_CMD_RESOLVE.format(name=name, lookup=lookup)
+        prepare = ""
+        if name == "claude":
+            bypass = "if defined ANTHROPIC_BASE_URL goto own"
+            token = f'''for /f "tokens=2 delims=:" %%T in ('findstr /c:"\\"ANTHROPIC_AUTH_TOKEN\\"" "{profile}" 2^>NUL') do set "tok=%%T"
+if not defined tok goto down
+set "tok=%tok: =%"
+if not defined tok goto down
+set "tok=%tok:,=%"
+if not defined tok goto down
+set "tok=%tok:"=%"'''
+            execute = f'endlocal & set "ANTHROPIC_BASE_URL={base}" & set "ANTHROPIC_AUTH_TOKEN=%tok%" & set "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1" & "%real%" %*'
+        else:
+            bypass = "if defined CODEX_HOME goto own\nif defined OPENAI_BASE_URL goto own"
+            token = f'''for /f "tokens=2 delims==" %%T in ('findstr /b /c:"experimental_bearer_token" "{profile}" 2^>NUL') do set "tok=%%T"
+if not defined tok goto down
+set "tok=%tok: =%"
+if not defined tok goto down
+set "tok=%tok:"=%"'''
+            config_args = " ".join('-c "' + value.replace('"', r'\"') + '"' for value in overrides)
+            prepare = f'''@rem The launcher recognises a subcommand only as the first word, so put options after it. The same rule applies to nested subcommands.
+@rem Cmd does not treat backslash as an escape. Callers pass prompts through stdin or a file, never on the command line.
+set "rest="
+set "rest1="
+set "rest2="
+set "second="
+set args=%*
+set "captured="
+setlocal EnableDelayedExpansion
+for /f "eol= tokens=1* delims=\t " %%A in ("!args!") do endlocal & set "captured=1" & set "sub=%%A" & set rest1=%%B
+if not defined captured goto proxy_root_local
+setlocal EnableDelayedExpansion
+set "bare=!sub:"=!"
+if not "!bare!"=="!sub!" goto proxy_root_local
+if "!sub:~0,1!"=="-" goto proxy_root_local
+if /i "!sub!"=="help" goto proxy_root_local
+endlocal
+@rem Delayed expansion reads the saved arguments without reparsing metacharacters.
+@rem End the nested scope before assigning the remainder to preserve literal exclamation marks.
+if not defined rest1 goto proxy_select
+set "captured="
+setlocal EnableDelayedExpansion
+for /f "eol= tokens=2* delims=\t " %%A in ("!args!") do endlocal & set "captured=1" & set "second=%%A" & set rest2=%%B
+if not defined captured goto proxy_root_local
+:proxy_select
+setlocal EnableDelayedExpansion
+@rem Nested command grammar matches Codex 0.160.0.
+if /i "!sub!"=="exec" for %%N in (resume fork review) do if /i "!second!"=="%%N" goto proxy_nested
+set "rest=!rest1!"
+goto proxy_selected
+:proxy_nested
+set "sub=exec !second!"
+set "rest=!rest2!"
+:proxy_selected
+endlocal & set "sub=%sub%" & set rest=%rest%
+goto proxy_execute
+:proxy_root_local
+endlocal
+:proxy_root
+set "sub="
+set rest=%*
+:proxy_execute
+'''
+            execute = f'endlocal & set "CLIPROXY_API_KEY=%tok%" & "%real%" %sub% {config_args} %rest%'
+        files[bin_dir / (name + ".cmd")] = PROXY_CMD.format(
+            resolve=resolve, bypass=bypass, token=token, base=base, name=name, prepare=prepare, execute=execute,
+        ).replace("\n", "\r\n").encode("utf-8")
+        files[bin_dir / (name + "-proxy.cmd")] = PROXY_CMD_ALIAS.format(name=name).replace("\n", "\r\n").encode("utf-8")
+    return files
+
+
+def proxy_path_note(machine, home):
+    bin_dir = proxy_path(proxy_bin_dir(machine), home)
+    windows = machine["os"] == "windows"
+    path_dirs = [
+        Path(os.path.expandvars(os.path.expanduser(part))).resolve()
+        for part in os.environ.get("PATH", "").split(os.pathsep)
+    ]
+    labels = [str(path).casefold() if windows else str(path) for path in path_dirs]
+    bin_label = str(bin_dir).casefold() if windows else str(bin_dir)
+    bin_index = labels.index(bin_label) if bin_label in labels else len(path_dirs)
+    for index, directory in enumerate(path_dirs):
+        if labels[index] == bin_label:
+            continue
+        for name in ("claude", "codex"):
+            for suffix in ("", ".exe", ".cmd") if windows else ("",):
+                candidate = directory / (name + suffix)
+                if candidate.is_file() and (windows or os.access(candidate, os.X_OK)) and not is_proxy_launcher(candidate):
+                    if bin_index > index:
+                        print(f"proxy launchers in {bin_dir}: this folder must come before {directory} on PATH, or the bare claude and codex skip the pool")
+                    return
+    if bin_index == len(path_dirs):
+        print(f"proxy launchers in {bin_dir}: make sure this folder precedes the real claude and codex on PATH")
+
+
+def install_proxy(installer, machine, statusline_installed, key, conflicts=()):
+    if "proxy" not in machine:
+        return
+    proxy = machine["proxy"]
+    home = installer.home
+    host = proxy["host"]
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    base = f"{proxy.get('scheme', 'http')}://{host}:{proxy.get('port', 8317)}"
+    settings_path = home / ".claude-proxy" / "settings.json"
+    config_path = home / ".codex-proxy" / "config.toml"
+    auth_path = home / ".codex-proxy" / "auth.json"
+    launchers = proxy_launchers(machine, home, base)
+    if key is None:
+        path = proxy_path(proxy["key_file"], home)
+        for destination in (settings_path, config_path, auth_path, *launchers):
+            status = "would refuse (existing file not written by install.py)" if destination in conflicts else f"would write (key file missing: {path})"
+            installer.action(destination, status)
+    else:
+        try:
+            settings = read_json(settings_path)
+        except (OSError, ValueError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        ensure_dict(settings, "env").update({
+            "ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        })
+        if statusline_installed:
+            settings.setdefault("statusLine", {"type": "command", "command": STATUSLINE_COMMAND, "padding": 0})
+        existing = config_path.read_bytes().decode("utf-8-sig") if config_path.is_file() else ""
+        effort = machine.get("codex_effort", DEFAULT_CODEX_EFFORT)
+        effort_line = f'model_reasoning_effort = {json.dumps(effort)}\n' if effort is not None else ""
+        if effort is None:
+            previous_effort = top_level_toml_line(existing.encode("utf-8"), "model_reasoning_effort")
+            if previous_effort:
+                effort_line = (previous_effort[1] + previous_effort[2]).decode("utf-8")
+        config = PROXY_CODEX_CONFIG.format(
+            model=json.dumps(machine.get("codex_model", "gpt-6.1-sol")), base_url=json.dumps(base + "/v1"),
+            catalog_url=json.dumps(base + "/v1/models"), token=json.dumps(key), effort_line=effort_line,
+        )
+        match = re.search(r"^\[projects\.", existing, re.MULTILINE)
+        tail = existing[match.start():] if match else ""
+        if tail:
+            config += "\n" + tail
+        profiles = {settings_path: json_bytes(settings), config_path: config.encode("utf-8"), auth_path: json_bytes({"OPENAI_API_KEY": key})}
+        for destination, content in {**profiles, **launchers}.items():
+            if destination in conflicts:
+                installer.action(destination, "would refuse (existing file not written by install.py)")
+                continue
+            installer.write_bytes(destination, content)
+            if not installer.dry_run and machine["os"] != "windows" and os.name != "nt":
+                os.chmod(destination, 0o600 if destination in profiles else 0o755)
+    proxy_path_note(machine, home)
+
+
 def install_local_markdown(installer, source, destination):
     """Keep a filled personal section when the supplied section is missing or a placeholder."""
     content = source.read_bytes().decode("utf-8-sig")
@@ -475,6 +1084,86 @@ def install_local_markdown(installer, source, destination):
                     replacement += "\n"
                 content = content[:supplied.start()] + replacement + content[supplied.end():]
     installer.write_bytes(destination, content.encode("utf-8"))
+
+
+def top_level_toml_line(content, key):
+    for token in re.finditer(rb"""#[^\r\n]*|\"\"\"|'''|"(?:\\[^\r\n]|[^"\\\r\n])*"|'[^'\r\n]*'""", content):
+        if token[0] in (b'"""', b"'''"):
+            line_start = max(content.rfind(b"\n", 0, token.start()), content.rfind(b"\r", 0, token.start())) + 1
+            content = content[:line_start]
+            break
+    start = rb"(?:\A|(?<=\n)|(?<=\r))(?:\xef\xbb\xbf)?"
+    header = re.search(start + rb"[ \t]*\[", content)
+    top_level = content[:header.start()] if header else content
+    return re.search(start + rb"(" + re.escape(key.encode("ascii")) + rb"[ \t]*=[^\r\n]*)(\r\n|\r|\n|$)", top_level)
+
+
+def rewrite_codex_toml_key(content, key, desired, parsed):
+    assignment = top_level_toml_line(content, key)
+    unrecognised = f"skipped ({key} present in a form the installer does not rewrite)"
+    encoded = json.dumps(desired, ensure_ascii=False)[1:-1].replace("\x7f", "\\u007f").encode("utf-8")
+    line = key.encode("ascii") + b' = "' + encoded + b'"'
+    if assignment:
+        value = re.fullmatch(re.escape(key.encode("ascii")) + rb'''[ \t]*=[ \t]*(["'])([^"'\r\n]*)\1[ \t]*(?:#.*)?''', assignment[1])
+        if value is None:
+            return content, unrecognised
+        if value[1] == b"'":
+            if "'" in desired or any(ord(character) < 32 or ord(character) == 127 for character in desired):
+                return content, unrecognised
+            encoded = desired.encode("utf-8")
+        if value[2] == encoded:
+            return content, "unchanged"
+        start = assignment.start(1) + value.start(2)
+        end = assignment.start(1) + value.end(2)
+        updated = content[:start] + encoded + content[end:]
+    else:
+        if parsed is None:
+            return content, "skipped (no tomllib to confirm the key is absent)"
+        if key in parsed:
+            return content, unrecognised
+        model = top_level_toml_line(content, "model") if key == "model_reasoning_effort" else None
+        ending = re.search(rb"\r\n|\n|\r", content)
+        newline = model[2] if model and model[2] else ending[0] if ending else b"\n"
+        offset = model.end() if model else 3 if content.startswith(b"\xef\xbb\xbf") else 0
+        separator = newline if model and not model[2] else b""
+        updated = content[:offset] + separator + line + newline + content[offset:]
+    return updated, None
+
+
+def install_codex_effort(installer, machine):
+    values = [("model", machine.get("codex_model")),
+              ("model_reasoning_effort", machine.get("codex_effort", DEFAULT_CODEX_EFFORT))]
+    values = [(key, value) for key, value in values if value is not None]
+    if not values:
+        return
+    path = installer.home / ".codex" / "config.toml"
+    if not path.is_file():
+        installer.action(path, "skipped (no ~/.codex/config.toml)")
+        return
+    content = path.read_bytes()
+    parsed = None
+    try:
+        import tomllib
+    except ImportError:
+        pass
+    else:
+        try:
+            parsed = tomllib.loads(content.decode("utf-8-sig"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+            installer.action(path, "skipped (config.toml did not parse)")
+            return
+    statuses = []
+    for key, value in values:
+        content, status = rewrite_codex_toml_key(content, key, value, parsed)
+        statuses.append(status)
+    if all(status == "unchanged" for status in statuses):
+        installer.action(path, "unchanged")
+        return
+    for status in statuses:
+        if status is not None and status != "unchanged":
+            installer.action(path, status)
+    if None in statuses:
+        installer.write_bytes(path, content)
 
 
 def merge_settings(existing, machine, home, *, statusline_available=True, installer=None):
@@ -570,6 +1259,11 @@ def merge_settings(existing, machine, home, *, statusline_available=True, instal
     desired = machine.get("settings")
     if not isinstance(desired, dict):
         desired = {}
+    efforts = machine.get("claude_effort", DEFAULT_CLAUDE_EFFORT)
+    if efforts:
+        models = ensure_dict(settings, "modelSettings")
+        for model, effort in efforts.items():
+            ensure_dict(models, model)["effortLevel"] = effort
     permissions = ensure_dict(settings, "permissions")
     union_list(permissions, "allow", desired.get("permissions_allow") or [])
     union_list(permissions, "deny", desired.get("permissions_deny") or [])
@@ -679,6 +1373,24 @@ ADDONS = {
             '2. Add a `daily` object to `~/.claude/local/machine.local.json` (create the file as `{}` first if it does not exist): `"daily": {"output": "<folder for the summaries>"}`. Optional keys: `"roots"`, a list of folders scanned when the person asks for the machine-wide daily. The collector reads the merged `~/.claude/local/machine.json`, which the next step writes.',
             "3. Run `python install.py` from the install folder with the interpreter the machine file names (the machine name is remembered from the first install). It copies the skill into `~/.claude/skills/` and reruns the hook tests.",
             "4. Restart Claude Code and type `daily`.",
+        ),
+    },
+    "usage": {
+        "description": "The usage skill and the local usage page: Claude and Codex five hour and seven day meters with reset countdowns, served on loopback from the status line cache and the local Codex session files.",
+        "paths": (
+            "monitor/local.py",
+            "monitor/local.html",
+            "monitor/heartbeat.py",
+            "monitor/local_test.py",
+            "monitor/heartbeat_test.py",
+            "monitor/fixtures/proxy-credentials.json",
+            "monitor/USAGE.md",
+            "claude/skills/usage/SKILL.md",
+        ),
+        "steps": (
+            "1. Unzip this file into the harness install folder, the folder that holds install.py. Only the files listed above and this ADDON.md are written.",
+            "2. Run `python install.py` from the install folder with the interpreter the machine file names (the machine name is remembered from the first install). It copies the skill into `~/.claude/skills/` and reruns the hook tests. No key in `machine.local.json` is needed.",
+            "3. Restart Claude Code and type `usage`. The page opens on http://127.0.0.1:9000; `monitor/USAGE.md` says what it reads, what it writes and what stays off.",
         ),
     },
 }
@@ -809,7 +1521,7 @@ def all_bundle_terms(home, repo=None, report=None, *, details=None):
     return global_terms + domain_terms
 
 
-def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publish=False):
+def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publish=False, machine=None):
     heading = f"# Harness bundle for {name}, built {date} from {commit}\n\n{gate_record}\n\n"
     first = f"1. Unpack this folder as the harness install folder named in machines/{name}.md. Replace the previous folder entirely; keep nothing from it."
     restart = "4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files."
@@ -819,11 +1531,20 @@ def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publis
         restart = "4. Restart Claude Code and run /setup; it asks who you are, your git identities and gh account, and whether you use Codex CLI, and writes the local files."
     elif harvest:
         restart += " Memories travel back with `python harvest.py --export <folder>`."
+    proxy_step = ""
+    dry_run_step = 2
+    real_run_step = 3
+    if machine is not None and "proxy" in machine:
+        proxy_step = f"2. Before running install.py, copy the device's client key to `{machine['proxy']['key_file']}` by hand. The proxy launchers land in `{proxy_bin_dir(machine)}` (relative to the home unless absolute) and must precede the real binaries on PATH.\n"
+        dry_run_step = 3
+        real_run_step = 4
+        restart = "5." + restart[2:]
     return (
         f"{heading}"
         f"{first}\n"
-        f"2. Dry run and read every line: `python install.py --machine {name} --dry-run` (use the interpreter the machine file names; where the permission classifier blocks config edits, run the real install with the ! prefix).\n"
-        f"3. Real run: `python install.py --machine {name}`. The hook tests run last and all must pass.\n"
+        f"{proxy_step}"
+        f"{dry_run_step}. Dry run and read every line: `python install.py --machine {name} --dry-run` (use the interpreter the machine file names; where the permission classifier blocks config edits, run the real install with the ! prefix).\n"
+        f"{real_run_step}. Real run: `python install.py --machine {name}`. The hook tests run last and all must pass.\n"
         f"{restart}\n"
     )
 
@@ -861,7 +1582,7 @@ def bundle_entry_adders(entries, *, plan_tools=True):
     return add, add_tree
 
 
-def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False):
+def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False, machine=None):
     entries = {}
     add, add_tree = bundle_entry_adders(entries, plan_tools=plan_tools)
     add(repo / "install.py", "install.py")
@@ -871,7 +1592,7 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
     add(repo / "claude" / "statusline-command.sh", "claude/statusline-command.sh")
     for source in sorted((repo / "claude" / "hooks").glob("*.py")):
         add(source, Path("claude/hooks") / source.name)
-    add_tree(repo / "claude" / "skills", "claude/skills", excluded=set() if harvest else {"harvest"})
+    add_tree(repo / "claude" / "skills", "claude/skills", excluded={"usage"} if harvest else {"harvest", "usage"})
     agents = repo / "claude" / "agents"
     if agents.is_dir():
         for source in sorted(agents.glob("*.md")):
@@ -905,7 +1626,7 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
         if source.is_file():
             add(source, Path("machines") / source.name)
     commit = bundle_commit(repo)
-    entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, publish=publish).encode("utf-8")
+    entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, publish=publish, machine=machine).encode("utf-8")
     return sorted(entries.items())
 
 
@@ -1150,9 +1871,12 @@ def build_bundle(options):
             lambda key: local_relative if key in local_machine else f"machines/{name}.json",
         )
         validate_statusline_weather(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
+        validate_proxy(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
+        validate_remote(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
+        validate_gh_accounts(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         flags.pop("codex_first")
         flags.pop("statusline")
-        entries = bundle_file_entries(options["repo"], name, date, gate_record, **flags)
+        entries = bundle_file_entries(options["repo"], name, date, gate_record, machine=machine, **flags)
     except ValueError as exc:
         print(f"bundle refused: {exc}")
         return 2
@@ -1357,7 +2081,18 @@ def install(options):
         sources = {}
         machine = load_machine(options["repo"], name, home=options["home"], sources=sources)
         validate_machine_flags(machine, {"codex_first": True, "publish": False, "statusline": True}, sources.__getitem__)
+        validate_machine_efforts(machine, sources.__getitem__)
+        validate_gh_accounts(machine, sources.__getitem__)
+        machine.setdefault("codex_effort", DEFAULT_CODEX_EFFORT)
+        machine.setdefault("claude_effort", DEFAULT_CLAUDE_EFFORT.copy())
         validate_statusline_weather(machine, sources.__getitem__)
+        validate_proxy(machine, sources.__getitem__)
+        validate_remote(machine, sources.__getitem__)
+        key = proxy_key(machine, options["home"], options["dry_run"])
+        proxy_conflicts = proxy_launcher_conflicts(machine, options["home"])
+        if proxy_conflicts and not options["dry_run"]:
+            raise ValueError(f"{proxy_conflicts[0]} exists and was not written by install.py (set proxy.bin_dir to another folder or move that file)")
+        check_remote_skills(machine, options["home"], options["repo"])
         if local_markdown_destination.exists() and not local_markdown_destination.is_file():
             raise ValueError(f"{local_markdown_destination}: must be a file")
     except (OSError, ValueError) as exc:
@@ -1400,6 +2135,7 @@ def install(options):
     )
     install_keybindings(installer, options["repo"], options["home"])
     statusline_installed = install_statusline(installer, options["repo"], options["home"], machine)
+    install_proxy(installer, machine, statusline_installed, key, proxy_conflicts)
     for source in sorted((options["repo"] / "claude" / "hooks").glob("*.py")):
         installer.copy_file(source, options["home"] / ".claude" / "hooks" / source.name)
     skills = options["repo"] / "claude" / "skills"
@@ -1408,6 +2144,8 @@ def install(options):
             installer.sync_directory(
                 source, options["home"] / ".claude" / "skills" / source.name
             )
+    install_gh_credentials(installer, machine)
+    install_remote_skills(installer, machine, options["repo"])
     agents = options["repo"] / "claude" / "agents"
     if agents.is_dir():
         for source in sorted(agents.glob("*.md")):
@@ -1430,6 +2168,7 @@ def install(options):
     existing_settings = read_json(settings_path) if settings_path.is_file() else {}
     merged_settings = merge_settings(existing_settings, machine, options["home"], statusline_available=statusline_installed, installer=installer)
     installer.write_bytes(settings_path, json_bytes(merged_settings))
+    install_codex_effort(installer, machine)
 
     for rule in machine.get("remove_allow_rules") or []:
         path, allowed = machine_file_path(rule.get("file", ""), options["home"])

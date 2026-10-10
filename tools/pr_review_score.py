@@ -16,6 +16,7 @@ REPO_ROOT = getattr(runner, "REPO_ROOT", Path(__file__).resolve().parents[1])
 DEFAULT_PRICES = {
     "agy": (0.0, 0.0),
     "codex": (0.0, 0.0),
+    "haiku": (0.10, 0.50),
     "kimi": (0.60, 2.50),
 }
 

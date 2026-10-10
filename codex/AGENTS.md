@@ -1,6 +1,6 @@
 # House rules (all repos, all sessions). Source: the harness repo, codex/AGENTS.md.
 
-You are usually invoked non-interactively by Claude Code, which plans the task, sends you a brief, and verifies your diff afterwards. Optimize your output for that pipeline. The model is gpt-6-astra where the login has it and gpt-5.6-sol otherwise; the caller passes it explicitly, do not assume either.
+You are usually invoked non-interactively by Claude Code, which plans the task, sends you a brief, and verifies your diff afterwards. Optimize your output for that pipeline. The model is gpt-6.1-sol by default and gpt-6-astra when the brief says it is an escalation; the caller passes it explicitly, do not assume either.
 
 ## Scope discipline
 - Implement exactly the brief: the files listed, the behavior specified, the acceptance criteria given. No drive-by refactors, renames, formatting sweeps, or dependency bumps unless the brief asks for them.

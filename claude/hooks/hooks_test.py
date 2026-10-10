@@ -46,7 +46,7 @@ class AtomicWriteTextTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
 
     def test_creates_parent_directory_and_writes_lf_only(self):
         path = self.base / "new-dir/x.txt"
@@ -195,7 +195,7 @@ class FileLockTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.path = Path(temporary.name) / "nested" / "shared.json"
+        self.path = Path(temporary.name).resolve() / "nested" / "shared.json"
 
     def test_shared_path_expansion(self):
         home = self.path.parent
@@ -446,7 +446,9 @@ class FileLockTests(unittest.TestCase):
                 with file_lock(self.path, timeout=0):
                     current = lock.stat()
                     self.assertEqual(len(acquisitions), 2)
-                    self.assertNotEqual(acquisitions[0], acquisitions[1])
+                    if recreate:
+                        # Without a recreate, ext4 hands the reopened file the inode it just freed, so only the recreated case guarantees a different inode.
+                        self.assertNotEqual(acquisitions[0], acquisitions[1])
                     self.assertEqual(acquisitions[-1], (current.st_ino, current.st_dev))
 
 
@@ -454,7 +456,7 @@ class HookCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory()
-        cls.home = Path(cls.temporary.name)
+        cls.home = Path(cls.temporary.name).resolve()
 
     @classmethod
     def tearDownClass(cls):
@@ -2045,10 +2047,224 @@ class DraftWrapGuardTests(HookCase):
 
 
 class InstallerTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def gh_credentials_fixture(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "home with spaces"
+            home.mkdir()
+            yield module, module.Installer(home, REPO, False), home
+
+    def gh_config(self, home, key, cwd=None):
+        environment = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(home / ".gitconfig"), HOME=str(home))
+        return subprocess.run(["git", "config", "--get-all", key], cwd=cwd or home, env=environment, capture_output=True, text=True, timeout=10)
+
+    def test_gh_credentials_block_and_fragments(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            machine = {"gh_accounts": {"~/projects/nested": "nested", "default": "personal", "~/projects": "work"}}
+            module.install_gh_credentials(installer, machine)
+            config = (home / ".gitconfig").read_text()
+            self.assertIn('# harness gh accounts begin\n', config)
+            self.assertIn('# harness gh accounts end\n', config)
+            self.assertLess(config.index("gitconfig-gh-projects\""), config.index("gitconfig-gh-projects-nested\""))
+            for host in ("github.com", "gist.github.com"):
+                helpers = self.gh_config(home, f"credential.https://{host}.helper")
+                self.assertEqual(helpers.returncode, 0, helpers.stderr)
+                interpreter = str(Path(sys.executable).resolve()).replace("\\", "/")
+                self.assertEqual(helpers.stdout.splitlines(), ["", f'!"{interpreter}" -I "{home.as_posix()}/.claude/hooks/gh_credential_helper.py"', '!gh auth git-credential'])
+                for folder, expected in (("elsewhere", "personal"), ("projects/repo", "work"), ("projects/nested/repo", "nested")):
+                    repo = home / folder
+                    subprocess.run(["git", "init", str(repo)], capture_output=True, check=True)
+                    result = self.gh_config(home, f"credential.https://{host}.username", repo)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[-1], expected)
+            for slug, login in (("projects", "work"), ("projects-nested", "nested")):
+                fragment = home / ".claude/local" / ("gitconfig-gh-" + slug)
+                self.assertEqual(fragment.read_text(), f'[credential "https://github.com"]\n\tusername = "{login}"\n[credential "https://gist.github.com"]\n\tusername = "{login}"\n')
+
+    def test_gh_credentials_idempotent_and_backed_up(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            config = home / ".gitconfig"
+            original = b"[user]\r\n\tname = Example\r\n"
+            config.write_bytes(original)
+            machine = {"gh_accounts": {"default": "personal", "~/projects": "work"}}
+            module.install_gh_credentials(installer, machine)
+            first = config.read_bytes()
+            self.assertTrue(first.startswith(original))
+            self.assertNotIn(b"\n", first.replace(b"\r\n", b""))
+            self.assertEqual((installer.backup_root / ".gitconfig").read_bytes(), original)
+            module.install_gh_credentials(module.Installer(home, REPO, False), machine)
+            self.assertEqual(config.read_bytes(), first)
+            self.assertEqual(len(list((home / ".claude/local").glob("backup-*"))), 1)
+
+    def test_gh_credentials_replace_block_in_place(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            prefix = b"# untouched prefix\r\n[user]\r\n\tname = Example\r\n"
+            suffix = b"[alias]\r\n\ts = status\r\n# untouched suffix"
+            config = home / ".gitconfig"
+            config.write_bytes(prefix + b"# harness gh accounts begin\r\n# old block\r\n# harness gh accounts end\r\n" + suffix)
+            module.install_gh_credentials(installer, {"gh_accounts": {"default": "new"}})
+            result = config.read_bytes()
+            self.assertTrue(result.startswith(prefix))
+            self.assertTrue(result.endswith(suffix))
+            self.assertNotIn(b"# old block", result)
+            self.assertEqual(result.count(b"# harness gh accounts begin"), 1)
+
+    def test_gh_credentials_reset_and_reuse_existing_helper(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            original = b'[credential "https://github.com"]\n\thelper = !gh auth git-credential\n[credential "https://gist.github.com"]\n\thelper = !gh auth git-credential\n'
+            config = home / ".gitconfig"
+            config.write_bytes(original)
+            module.install_gh_credentials(installer, {"gh_account": "personal"})
+            result = config.read_bytes()
+            self.assertTrue(result.startswith(original))
+            self.assertEqual(result.count(b"!gh auth git-credential"), 4)
+            self.assertIn(b'https://github.com"]\n\thelper =\n', result)
+            self.assertEqual(self.gh_config(home, "credential.https://github.com.username").stdout.strip(), "personal")
+
+    def test_gh_credentials_remove_block_and_fragments(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            config = home / ".gitconfig"
+            original = b"# user content\n"
+            config.write_bytes(original)
+            module.install_gh_credentials(installer, {"gh_accounts": {"default": "personal", "~/projects": "work"}})
+            module.install_gh_credentials(installer, {})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(list((home / ".claude/local").glob("gitconfig-gh-*")), [])
+
+    def test_gh_credentials_dry_run_writes_nothing(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            installer.dry_run = True
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                module.install_gh_credentials(installer, {"gh_accounts": {"default": "personal", "~/projects": "work"}})
+            self.assertIn("would write", output.getvalue())
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_gh_credentials_reuse_quoted_and_bare_helpers(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            windows_line = r"    helper = !'C:\\Program Files\\GitHub CLI\\gh.exe' auth git-credential"
+            bare_line = "\thelper = !'/opt/GitHub CLI/gh' auth git-credential"
+            original = ('[credential]\n' + bare_line + '\n[credential "https://github.com"]\n' + windows_line + '\n').encode()
+            config = home / ".gitconfig"
+            config.write_bytes(original)
+            module.install_gh_credentials(installer, {"gh_account": "personal"})
+            first = config.read_bytes()
+            self.assertTrue(first.startswith(original))
+            block = first[len(original):].decode()
+            self.assertEqual(block.count(windows_line), 1)
+            self.assertEqual(block.count(bare_line), 1)
+            self.assertLess(block.index(windows_line), block.index('[credential "https://gist.github.com"]'))
+            self.assertIn("# The installer rewrites this block on every run; re-run install.py after a Python upgrade.", block)
+            module.install_gh_credentials(installer, {"gh_account": "personal"})
+            self.assertEqual(config.read_bytes(), first)
+
+    def test_gh_credentials_placeholders_preserve_configuration(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            config = home / ".gitconfig"
+            config.write_bytes(b"# keep this content\n")
+            module.install_gh_credentials(installer, {"gh_accounts": {"default": "valid", "~/projects": "work"}})
+            original = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+            for invalid in ("TODO", "TODO-sample-handle", "ToDo", "bad_name", "bad login", "-start", "end-", "a" * 40):
+                for machine in (
+                    {"gh_accounts": {"default": invalid}},
+                    {"gh_account": invalid},
+                    {"gh_accounts": {"~/projects": "valid"}, "gh_account": invalid},
+                    {"gh_accounts": {"default": "valid", "~/projects": invalid}},
+                ):
+                    with self.subTest(machine=machine), contextlib.redirect_stdout(io.StringIO()) as output:
+                        module.validate_gh_accounts(machine, lambda key: "probe.json")
+                        module.install_gh_credentials(installer, machine)
+                        self.assertIn(f"skipped (gh account {invalid} is a placeholder)", output.getvalue())
+                        self.assertEqual({path: path.read_bytes() for path in home.rglob("*") if path.is_file()}, original)
+
+    def test_gh_credentials_default_fallback_and_agreement(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for accounts in ({"~/projects": "work"}, {"default": "personal", "~/projects": "work"}):
+                machine = {"gh_accounts": accounts, "gh_account": "personal"}
+                module.validate_gh_accounts(machine, lambda key: "probe.json")
+                module.install_gh_credentials(installer, machine)
+                self.assertEqual(self.gh_config(home, "credential.https://github.com.username").stdout.strip(), "personal")
+                self.assertEqual(machine["gh_accounts"], accounts)
+            with self.assertRaisesRegex(ValueError, "gh_accounts.default.*gh_account"):
+                module.validate_gh_accounts({"gh_accounts": {"default": "personal"}, "gh_account": "other"}, lambda key: "probe.json")
+
+    def test_gh_credentials_removal_requires_absent_or_null_keys(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            config = home / ".gitconfig"
+            original = b"# preserved\n"
+            config.write_bytes(original)
+            for machine in ({}, {"gh_accounts": None}, {"gh_account": None}, {"gh_accounts": None, "gh_account": None}):
+                module.install_gh_credentials(installer, {"gh_accounts": {"default": "personal", "~/projects": "work"}})
+                installed = config.read_bytes()
+                fragments = {path: path.read_bytes() for path in (home / ".claude/local").glob("gitconfig-gh-*")}
+                module.install_gh_credentials(installer, {"gh_accounts": {}})
+                self.assertEqual(config.read_bytes(), installed)
+                self.assertEqual({path: path.read_bytes() for path in fragments}, fragments)
+                module.install_gh_credentials(installer, machine)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(list((home / ".claude/local").glob("gitconfig-gh-*")), [])
+            module.install_gh_credentials(installer, {"gh_accounts": None, "gh_account": "personal"})
+            self.assertEqual(self.gh_config(home, "credential.https://github.com.username").stdout.strip(), "personal")
+
+    def test_gh_credentials_valid_login_boundaries(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for login in ("a", "9", "a-b", "a" * 39):
+                with self.subTest(login=login), contextlib.redirect_stdout(io.StringIO()) as output:
+                    module.install_gh_credentials(installer, {"gh_account": login})
+                    self.assertNotIn("skipped", output.getvalue())
+                    self.assertEqual(self.gh_config(home, "credential.https://github.com.username").stdout.strip(), login)
+
+    def test_gh_accounts_reject_relative_prefixes(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for prefix in ("relative", "./repo", "C:relative", "~alex/work", "~other"):
+                with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, re.escape(prefix)):
+                    module.validate_gh_accounts({"gh_accounts": {prefix: "valid"}}, lambda key: "probe.json")
+            for prefix in ("default", "~/repo", "~", "/srv/repo", "C:/repo", "C:\\repo"):
+                module.validate_gh_accounts({"gh_accounts": {prefix: "valid"}}, lambda key: "probe.json")
+
+    def test_install_with_placeholder_gh_login_completes(self):
+        home = self.new_home("placeholder-gh-home")
+        copied = self.copy_repo_without_local_machine_files("placeholder-gh-repo")
+        local = home / ".claude/local/machine.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"gh_account": "TODO"}), encoding="utf-8")
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("skipped (gh account TODO is a placeholder)", result.stdout)
+        self.assertFalse((home / ".gitconfig").exists())
+
+    def test_gh_accounts_validation(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for value in ([], "login", {"": "login"}, {"default": 123}, {"default": ""}, {"~/repo": None}):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "gh_accounts"):
+                module.validate_gh_accounts({"gh_accounts": value}, lambda key: "probe.json")
+        for value in (123, "", " "):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "gh_account"):
+                module.validate_gh_accounts({"gh_account": value}, lambda key: "probe.json")
+        module.validate_gh_accounts({}, lambda key: "probe.json")
+        module.validate_gh_accounts({"gh_accounts": {"default": "login", "~/repo": "other"}}, lambda key: "probe.json")
+
+    def test_remote_skill_headless_guidance(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            installer = mock.Mock(home=Path(temporary), repo=REPO)
+            module.install_remote_skills(installer, {"remote": {"probe": {"ssh": "probe-alias"}}}, REPO)
+            text = installer.write_bytes.call_args.args[1].decode()
+            sentence = "The tool passes a headless system prompt telling the remote session to keep long jobs in the foreground or under setsid nohup; `--no-preamble` skips it."
+            self.assertEqual(text.count(sentence), 1)
+            self.assertLess(text.index("3. Long prompts"), text.index(sentence))
+            self.assertLess(text.index(sentence), text.index("4. Follow-ups"))
+
     @classmethod
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory()
-        cls.base = Path(cls.temporary.name)
+        cls.base = Path(cls.temporary.name).resolve()
 
     @classmethod
     def tearDownClass(cls):
@@ -2078,6 +2294,7 @@ class InstallerTests(unittest.TestCase):
             "checkers",
             "tools",
             "publish",
+            "monitor",
         ):
             source = REPO / directory
             if source.exists():
@@ -2156,6 +2373,7 @@ class InstallerTests(unittest.TestCase):
         for path in (
             home / ".claude" / "CLAUDE.md",
             home / ".claude" / "hooks" / "secret_guard.py",
+            home / ".claude" / "hooks" / "gh_credential_helper.py",
             home / ".claude" / "hooks" / "draft_wrap_guard.py",
             home / ".claude" / "hooks" / "context_save_nudge.py",
             home / ".claude" / "local" / "machine.json",
@@ -2183,8 +2401,14 @@ class InstallerTests(unittest.TestCase):
             set(machine["settings"]["permissions_deny"])
             <= set(settings["permissions"]["deny"])
         )
-        self.assertEqual(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "opus")
+        self.assertEqual(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "sonnet")
         self.assertEqual(settings["cleanupPeriodDays"], 90)
+        self.assertEqual(settings["modelSettings"]["claude-fable-5-1"]["effortLevel"], "medium")
+        installed_machine = read_json_test(home / ".claude" / "local" / "machine.json")
+        self.assertEqual(installed_machine["codex_effort"], "high")
+        self.assertEqual(installed_machine["claude_effort"], {"claude-fable-5-1": "medium", "claude-opus-5-5": "high", "claude-sonnet-5-5": "medium", "claude-haiku-5-5": "medium"})
+        self.assertFalse((home / ".codex" / "config.toml").exists())
+        self.assertIn(f'ACTION  {home / ".codex" / "config.toml"}  (skipped (no ~/.codex/config.toml))', result.stdout)
         self.assertNotIn("autoMode", settings)
         self.assertEqual(
             (home / ".claude" / "local" / "machine.local.md").read_text(
@@ -2412,7 +2636,7 @@ class InstallerTests(unittest.TestCase):
         copied = self.copy_repo_without_local_machine_files("home-local-json-repo")
         local_path = home / ".claude" / "local" / "machine.local.json"
         local_path.parent.mkdir(parents=True)
-        local = {"gh_account": "someone", "identities": {"default": "someone@example.invalid"}}
+        local = {"gh_account": "someone", "gh_accounts": {"default": "someone", "~/projects": "other"}, "identities": {"default": "someone@example.invalid"}}
         local_path.write_text(json.dumps(local), encoding="utf-8")
         original = local_path.read_bytes()
         tracked = read_json_test(copied / "machines" / f"{TEST_MACHINE}.json")
@@ -2422,6 +2646,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 machine = read_json_test(home / ".claude" / "local" / "machine.json")
                 self.assertEqual(machine["gh_account"], "someone")
+                self.assertEqual(machine["gh_accounts"], local["gh_accounts"])
                 self.assertEqual(machine["identities"]["default"], "someone@example.invalid")
                 self.assertTrue(tracked.keys() <= machine.keys())
                 self.assertEqual(machine["settings"], tracked["settings"])
@@ -2533,7 +2758,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(after_tree, before_tree)
         statuses = [line for line in second.stdout.splitlines() if line.startswith("ACTION")]
         self.assertTrue(statuses)
-        self.assertTrue(all("(unchanged)" in line or "(skipped)" in line for line in statuses))
+        self.assertTrue(all("(unchanged)" in line or "(skipped)" in line or "(skipped (no ~/.codex/config.toml))" in line for line in statuses))
         self.assertEqual(len(list((home / ".claude" / "local").glob("backup-*"))), 1)
 
     def test_statusline_default_install_and_replacement(self):
@@ -2674,6 +2899,616 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.stdout, f"install refused: {path}: statusline must be true or false\n")
                 self.assertEqual(sorted(home.rglob("*")), before)
                 self.assertNotIn("ACTION ", result.stdout)
+
+    def copy_codex_effort_repo(self, name):
+        copied = self.copy_repo_without_local_machine_files(name)
+        path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(path)
+        machine.pop("codex_model", None)
+        path.write_text(json.dumps(machine), encoding="utf-8")
+        return copied
+
+    @contextlib.contextmanager
+    def codex_config_fixture(self, name, original, dry_run=False):
+        home = self.new_home(f"codex-{name}-home")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        config.write_bytes(original)
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module.Installer(home, REPO, dry_run)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            yield module, installer, config, output
+
+    def test_codex_model_preserves_other_bytes(self):
+        for index, original in enumerate((
+            b'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n# keep\n[profile]\nmodel = "nested"',
+            b"\xef\xbb\xbf# keep\r\nmodel\t= 'gpt-6-astra'  # keep\r\n[profile]\r\nmodel = 'nested'\r\n",
+            b'model = "gpt-6-astra"',
+        )):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-bytes-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+                self.assertEqual(config.read_bytes(), original.replace(b"gpt-6-astra", b"gpt-6.1-sol"))
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+                self.assertEqual((installer.backup_root / ".codex/config.toml").read_bytes(), original)
+
+    def test_codex_model_already_set_is_unchanged(self):
+        original = b"\xef\xbb\xbfmodel  = 'gpt-6.1-sol' # keep\r\n"
+        with self.codex_config_fixture("model-unchanged", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (unchanged)\n")
+            self.assertIsNone(installer.backup_root)
+
+    def test_codex_model_absent_is_inserted_first(self):
+        for index, (original, expected) in enumerate((
+            (b'model_reasoning_effort = "high"\n# keep\n', b'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "high"\n# keep\n'),
+            (b'\xef\xbb\xbf# keep\r\nmodel_reasoning_effort = "high"\r\n', b'\xef\xbb\xbfmodel = "gpt-6.1-sol"\r\n# keep\r\nmodel_reasoning_effort = "high"\r\n'),
+            (b'# keep\n[profile]\nkeep = true', b'model = "gpt-6.1-sol"\n# keep\n[profile]\nkeep = true'),
+            (b'notes = """\nkeep\n"""\n', b'model = "gpt-6.1-sol"\nnotes = """\nkeep\n"""\n'),
+            (b'model_reasoning_effort = "high"', b'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "high"'),
+            (b'', b'model = "gpt-6.1-sol"\n'),
+        )):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-insert-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+                self.assertEqual(config.read_bytes(), expected)
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_model_and_effort_absent_are_inserted_in_order(self):
+        original = b"\xef\xbb\xbf# keep\r\n[profile]\r\nkeep = true"
+        with self.codex_config_fixture("model-effort-insert", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            self.assertEqual(config.read_bytes(), b'\xef\xbb\xbfmodel = "gpt-6.1-sol"\r\nmodel_reasoning_effort = "high"\r\n' + original[3:])
+            self.assertEqual(output.getvalue().splitlines(), [f"ACTION  {config}  (written)"])
+
+    def assert_codex_model_skipped(self, name, original, reason):
+        with self.codex_config_fixture(f"model-skip-{name}", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped ({reason}))\n")
+            self.assertIsNone(installer.backup_root)
+
+    def test_codex_model_indented_key_is_skipped(self):
+        self.assert_codex_model_skipped("indented", b'  model = "gpt-6-astra"\n',
+                                       "model present in a form the installer does not rewrite")
+
+    def test_codex_model_quoted_key_is_skipped(self):
+        for index, original in enumerate((b'"model" = "gpt-6-astra"\n', b"'model' = 'gpt-6-astra'\n")):
+            with self.subTest(index=index):
+                self.assert_codex_model_skipped(f"quoted-{index}", original,
+                                               "model present in a form the installer does not rewrite")
+
+    def test_codex_model_in_table_does_not_block_top_level_insertion(self):
+        for index, original in enumerate((
+            b'[profiles.fast]\nmodel = "x"\n',
+            b'[profile]\nmodel = "gpt-6-astra"\n',
+            b'profile = { model = "gpt-6-astra" }\n',
+            b'[[profiles]]\nmodel = "gpt-6-astra"\n',
+            b'profile.nested.model = "gpt-6-astra"\n',
+        )):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-table-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+                self.assertEqual(config.read_bytes(), b'model = "gpt-6.1-sol"\n' + original)
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_model_after_multiline_string_is_skipped(self):
+        for index, original in enumerate((
+            b'notes = """\n[Rules]\nkeep\n"""\nmodel = "gpt-6-astra"\n',
+            b'notes = """\nkeep\n"""\nmodel = "gpt-6-astra"\n',
+            b"notes = '''\nkeep\n'''\nmodel = 'gpt-6-astra'\n",
+            b'notes = """\nmodel = "inside string"\n"""\nmodel = "gpt-6-astra"\n',
+        )):
+            with self.subTest(index=index):
+                self.assert_codex_model_skipped(f"multiline-{index}", original,
+                                               "model present in a form the installer does not rewrite")
+
+    def test_codex_model_triple_quotes_in_comments_or_single_line_strings_allow_rewrite(self):
+        for index, prefix in enumerate((b'# """\n', b"# '''\n", b"notes = \"'''\"\n", b"notes = '\"\"\"'\n")):
+            original = prefix + b'model = "gpt-6-astra"\nmodel_reasoning_effort = "medium"\n'
+            with self.subTest(index=index), self.codex_config_fixture(f"model-comment-quotes-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+                self.assertEqual(config.read_bytes(), original.replace(b"gpt-6-astra", b"gpt-6.1-sol").replace(b'"medium"', b'"high"'))
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_multiline_key_values_do_not_expose_partial_assignments(self):
+        import tomllib
+        for key, desired, original, inserted in (
+            ("model", "gpt-6-astra", b'model = """gpt-6-astra"""\n# keep\n', b'model_reasoning_effort = "high"\n'),
+            ("model_reasoning_effort", "medium", b'model_reasoning_effort = """medium"""\n# keep\n', b'model = "gpt-6.1-sol"\n'),
+        ):
+            with self.subTest(key=key), self.codex_config_fixture(f"multiline-value-{key}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+                self.assertEqual(config.read_bytes(), inserted + original)
+                self.assertEqual(tomllib.loads(config.read_bytes().decode("utf-8"))[key], desired)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"ACTION  {config}  (skipped ({key} present in a form the installer does not rewrite))",
+                    f"ACTION  {config}  (written)",
+                ])
+
+    def test_codex_model_invalid_toml_is_skipped(self):
+        for index, original in enumerate((b'model = "gpt-6-astra"\n[broken', b'model = "old"\nmodel = "duplicate"\n', b'model = "\xff"\n')):
+            with self.subTest(index=index):
+                self.assert_codex_model_skipped(f"invalid-{index}", original, "config.toml did not parse")
+
+    def test_codex_model_unrecognised_value_is_skipped(self):
+        self.assert_codex_model_skipped("numeric", b'model = 123\n',
+                                       "model present in a form the installer does not rewrite")
+
+    def test_codex_model_absent_or_null_machine_value_prints_nothing(self):
+        original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "medium"\n'
+        for index, machine in enumerate(({"codex_effort": None}, {"codex_model": None, "codex_effort": None})):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-disabled-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, machine)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIsNone(installer.backup_root)
+
+    def test_codex_model_and_effort_change_in_one_write(self):
+        original = b'\xef\xbb\xbfmodel = "gpt-6-astra" # keep\r\nmodel_reasoning_effort = "medium"\r\n[profile]\r\nkeep = true'
+        with self.codex_config_fixture("model-effort-write", original) as (module, installer, config, output):
+            with mock.patch.object(installer, "write_bytes", wraps=installer.write_bytes) as writer:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            expected = original.replace(b"gpt-6-astra", b"gpt-6.1-sol").replace(b'"medium"', b'"high"')
+            writer.assert_called_once_with(config, expected)
+            self.assertEqual(config.read_bytes(), expected)
+            self.assertEqual(output.getvalue().splitlines(), [f"ACTION  {config}  (written)"])
+            self.assertEqual((installer.backup_root / ".codex/config.toml").read_bytes(), original)
+
+    def test_codex_model_and_effort_unchanged_report_once(self):
+        original = b'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "high"\n'
+        with self.codex_config_fixture("model-effort-unchanged", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (unchanged)\n")
+
+    def test_codex_model_and_effort_missing_file_report_once(self):
+        home = self.new_home("codex-model-effort-missing-home")
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module.Installer(home, REPO, False)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+        config = home / ".codex/config.toml"
+        self.assertFalse(config.exists())
+        self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (no ~/.codex/config.toml))\n")
+
+    def test_codex_model_dry_run_writes_nothing(self):
+        original = b'model = "gpt-6-astra"\r\n# keep\r\n'
+        with self.codex_config_fixture("model-dry", original, dry_run=True) as (module, installer, config, output):
+            before = sorted(installer.home.rglob("*"))
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(sorted(installer.home.rglob("*")), before)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (would write)\n")
+
+    def test_codex_model_and_effort_dry_run_writes_nothing(self):
+        original = b'model = "gpt-6-astra"\r\nmodel_reasoning_effort = "medium"\r\n'
+        with self.codex_config_fixture("model-effort-dry", original, dry_run=True) as (module, installer, config, output):
+            before = sorted(installer.home.rglob("*"))
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(sorted(installer.home.rglob("*")), before)
+            self.assertEqual(output.getvalue().splitlines(), [f"ACTION  {config}  (would write)"])
+
+    def test_codex_model_without_tomllib_skips_insertion(self):
+        original = b'model_reasoning_effort = "high"\n# \xff\n'
+        with self.codex_config_fixture("model-no-tomllib", original) as (module, installer, config, output):
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (no tomllib to confirm the key is absent))\n")
+
+    def test_codex_model_without_tomllib_replaces_recognised_key(self):
+        original = b'model = "gpt-6-astra" # keep\r\n# \xff\r\n'
+        with self.codex_config_fixture("model-no-tomllib-replace", original) as (module, installer, config, output):
+            with mock.patch.dict(sys.modules, {"tomllib": None}):
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": None})
+            self.assertEqual(config.read_bytes(), original.replace(b"gpt-6-astra", b"gpt-6.1-sol"))
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_model_skip_does_not_block_effort(self):
+        original = b'  model = "gpt-6-astra"\nmodel_reasoning_effort = "medium"\n'
+        with self.codex_config_fixture("model-skip-effort-write", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            self.assertEqual(config.read_bytes(), original.replace(b'"medium"', b'"high"'))
+            self.assertEqual(output.getvalue().splitlines(), [
+                f"ACTION  {config}  (skipped (model present in a form the installer does not rewrite))",
+                f"ACTION  {config}  (written)",
+            ])
+
+    def test_codex_model_write_omits_unchanged_effort_action(self):
+        original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n'
+        with self.codex_config_fixture("model-write-effort-unchanged", original) as (module, installer, config, output):
+            module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            self.assertEqual(config.read_bytes(), original.replace(b"gpt-6-astra", b"gpt-6.1-sol"))
+            self.assertEqual(output.getvalue().splitlines(), [f"ACTION  {config}  (written)"])
+
+    def test_codex_model_skipped_and_effort_unchanged_report_only_skip(self):
+        original = b'  model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n'
+        with self.codex_config_fixture("model-skipped-effort-unchanged", original) as (module, installer, config, output):
+            with mock.patch.object(installer, "write_bytes", wraps=installer.write_bytes) as writer:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            writer.assert_not_called()
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (model present in a form the installer does not rewrite))\n")
+
+    def test_codex_model_changed_and_effort_skipped_report_skip_before_write(self):
+        original = b'model = "gpt-6-astra"\n  model_reasoning_effort = "medium"\n'
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), self.codex_config_fixture(f"model-write-effort-skipped-{dry_run}", original, dry_run=dry_run) as (module, installer, config, output):
+                with mock.patch.object(installer, "write_bytes", wraps=installer.write_bytes) as writer:
+                    module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+                expected = original.replace(b"gpt-6-astra", b"gpt-6.1-sol")
+                writer.assert_called_once_with(config, expected)
+                self.assertEqual(config.read_bytes(), original if dry_run else expected)
+                status = "would write" if dry_run else "written"
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f"ACTION  {config}  (skipped (model_reasoning_effort present in a form the installer does not rewrite))",
+                    f"ACTION  {config}  ({status})",
+                ])
+
+    def test_codex_model_and_effort_skips_are_reported_in_key_order(self):
+        original = b'  model = "gpt-6-astra"\n  model_reasoning_effort = "medium"\n'
+        with self.codex_config_fixture("model-effort-skipped", original) as (module, installer, config, output):
+            with mock.patch.object(installer, "write_bytes", wraps=installer.write_bytes) as writer:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            writer.assert_not_called()
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue().splitlines(), [
+                f"ACTION  {config}  (skipped (model present in a form the installer does not rewrite))",
+                f"ACTION  {config}  (skipped (model_reasoning_effort present in a form the installer does not rewrite))",
+            ])
+
+    def test_codex_model_and_effort_parse_failure_is_reported_once(self):
+        original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "medium"\n[broken'
+        with self.codex_config_fixture("model-effort-parse-failure", original) as (module, installer, config, output):
+            with mock.patch.object(installer, "write_bytes", wraps=installer.write_bytes) as writer:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            writer.assert_not_called()
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (config.toml did not parse))\n")
+
+    def test_codex_model_and_effort_parse_once(self):
+        import tomllib
+        original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "medium"\n'
+        with self.codex_config_fixture("model-effort-parse-once", original) as (module, installer, config, output):
+            with mock.patch.object(tomllib, "loads", wraps=tomllib.loads) as parser:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            parser.assert_called_once_with(original.decode("utf-8-sig"))
+            self.assertEqual(config.read_bytes(), original.replace(b"gpt-6-astra", b"gpt-6.1-sol").replace(b'"medium"', b'"high"'))
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_model_failed_write_does_not_drop_effort_skip_or_print_written(self):
+        original = b'model = "gpt-6-astra"\n  model_reasoning_effort = "medium"\n'
+        with self.codex_config_fixture("model-write-false-effort-skipped", original) as (module, installer, config, output):
+            with mock.patch.object(installer, "write_bytes", return_value=False) as writer:
+                module.install_codex_effort(installer, {"codex_model": "gpt-6.1-sol", "codex_effort": "high"})
+            writer.assert_called_once_with(config, original.replace(b"gpt-6-astra", b"gpt-6.1-sol"))
+            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (model_reasoning_effort present in a form the installer does not rewrite))\n")
+
+    def test_codex_model_and_effort_use_merged_machine_json(self):
+        copied = self.copy_repo_without_local_machine_files("model-merged-repo")
+        home = self.new_home("model-merged-home")
+        local = home / ".claude/local/machine.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"codex_model": "gpt-6-astra", "codex_effort": "low"}), encoding="utf-8")
+        config = home / ".codex/config.toml"
+        config.parent.mkdir()
+        original = b'model = "gpt-6.1-sol" # keep\r\nmodel_reasoning_effort = "medium"\r\n[profile]\r\nkeep = true'
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), original.replace(b"gpt-6.1-sol", b"gpt-6-astra").replace(b'"medium"', b'"low"'))
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith(f"ACTION  {config}  ")], [f"ACTION  {config}  (written)"])
+        backups = list((home / ".claude/local").glob("backup-*/.codex/config.toml"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+
+    def test_codex_model_absent_or_null_machine_json_leaves_model_untouched(self):
+        copied = self.copy_codex_effort_repo("model-disabled-repo")
+        original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n'
+        for index, override in enumerate(({}, {"codex_model": None})):
+            with self.subTest(index=index):
+                home = self.new_home(f"model-disabled-json-{index}-home")
+                local = home / ".claude/local/machine.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(json.dumps(override), encoding="utf-8")
+                config = home / ".codex/config.toml"
+                config.parent.mkdir()
+                config.write_bytes(original)
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual([line for line in result.stdout.splitlines() if line.startswith(f"ACTION  {config}  ")], [f"ACTION  {config}  (unchanged)"])
+
+    def test_codex_model_values_are_toml_safe(self):
+        import tomllib
+        for index, (original, desired) in enumerate((
+            (b'model = "old"\n', 'test"model\\value\n\x7f'),
+            (b'', 'test"model\\value\n\x7f'),
+            (b'model = "old"\n', "test" + "".join(chr(codepoint) for codepoint in range(32)) + "\x7f\u00e9"),
+            (b"model = 'old'\n", 'test\\model'),
+        )):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-safe-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": desired, "codex_effort": None})
+                parsed = tomllib.loads(config.read_bytes().decode("utf-8-sig"))
+                self.assertEqual(parsed["model"], desired)
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (written)\n")
+
+    def test_codex_model_unsafe_literal_value_is_skipped(self):
+        original = b"model = 'old'\n"
+        for index, desired in enumerate(("test'model", "test\nmodel", "test\x7fmodel")):
+            with self.subTest(index=index), self.codex_config_fixture(f"model-unsafe-{index}", original) as (module, installer, config, output):
+                module.install_codex_effort(installer, {"codex_model": desired, "codex_effort": None})
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(output.getvalue(), f"ACTION  {config}  (skipped (model present in a form the installer does not rewrite))\n")
+
+    def test_codex_effort_preserves_other_bytes(self):
+        copied = self.copy_codex_effort_repo("effort-bytes-repo")
+        for index, (original, expected) in enumerate((
+            (b'\xef\xbb\xbfmodel = "test"\r\nmodel_reasoning_effort = "medium"\r\n# keep\r\n[profile]\r\nmodel_reasoning_effort = "high"\r\n',
+             b'\xef\xbb\xbfmodel = "test"\r\nmodel_reasoning_effort = "high"\r\n# keep\r\n[profile]\r\nmodel_reasoning_effort = "high"\r\n'),
+            (b'model = "test"\n# keep\n[profile]\nmodel_reasoning_effort = "high"',
+             b'model = "test"\nmodel_reasoning_effort = "high"\n# keep\n[profile]\nmodel_reasoning_effort = "high"'),
+            (b'\xef\xbb\xbf# keep\r\n[profile]\r\nmodel = "test"\r\n',
+             b'\xef\xbb\xbfmodel_reasoning_effort = "high"\r\n# keep\r\n[profile]\r\nmodel = "test"\r\n'),
+            (b'model = "test"', b'model = "test"\nmodel_reasoning_effort = "high"\n'),
+            (b'', b'model_reasoning_effort = "high"\n'),
+        )):
+            with self.subTest(index=index):
+                home = self.new_home(f"effort-bytes-{index}-home")
+                config = home / ".codex" / "config.toml"
+                config.parent.mkdir()
+                config.write_bytes(original)
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertEqual(config.read_bytes(), expected)
+                self.assertIn(f"ACTION  {config}  (written)", result.stdout)
+                backups = list((home / ".claude" / "local").glob("backup-*/.codex/config.toml"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), original)
+
+    def test_effort_explicit_values_preserve_other_model_settings(self):
+        home = self.new_home("effort-explicit-home")
+        copied = self.copy_codex_effort_repo("effort-explicit-repo")
+        local = home / ".claude" / "local" / "machine.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"codex_effort": "low", "claude_effort": {"claude-fable-5-1": "high"}}), encoding="utf-8")
+        settings_path = home / ".claude" / "settings.json"
+        settings_path.write_text(json.dumps({"modelSettings": {
+            "claude-fable-5-1": {"effortLevel": "low", "keep": True},
+            "claude-opus-5-5": {"effortLevel": "high", "keep": "value"},
+        }}), encoding="utf-8")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        config.write_bytes(b'model_reasoning_effort = "high"\n')
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), b'model_reasoning_effort = "low"\n')
+        self.assertEqual(read_json_test(settings_path)["modelSettings"], {
+            "claude-fable-5-1": {"effortLevel": "high", "keep": True},
+            "claude-opus-5-5": {"effortLevel": "high", "keep": "value"},
+        })
+
+    def test_effort_invalid_values_refuse_before_writes(self):
+        copied = self.copy_repo_without_local_machine_files("effort-invalid-repo")
+        cases = (("codex_effort", "max"), ("codex_effort", []), ("claude_effort", "high"),
+                 ("claude_effort", {"model": "max"}), ("claude_effort", {"model": None}),
+                 ("claude_effort", {"model": []}))
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key, value=value):
+                home = self.new_home(f"effort-invalid-{index}-home")
+                local = home / ".claude" / "local" / "machine.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(json.dumps({key: value}), encoding="utf-8")
+                before = {str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}
+                paths = sorted(home.rglob("*"))
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(key, result.stdout)
+                for allowed in ("low", "medium", "high", "xhigh"):
+                    self.assertIn(allowed, result.stdout)
+                self.assertNotIn("ACTION ", result.stdout)
+                self.assertEqual(sorted(home.rglob("*")), paths)
+                self.assertEqual({str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}, before)
+
+    def test_effort_null_disables_changes(self):
+        home = self.new_home("effort-null-home")
+        copied = self.copy_codex_effort_repo("effort-null-repo")
+        local = home / ".claude" / "local" / "machine.local.json"
+        local.parent.mkdir(parents=True)
+        local.write_text(json.dumps({"codex_effort": None, "claude_effort": None}), encoding="utf-8")
+        models = {"claude-opus-5-5": {"effortLevel": "high", "keep": True}}
+        settings_path = home / ".claude" / "settings.json"
+        settings_path.write_text(json.dumps({"modelSettings": models}), encoding="utf-8")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b'\xef\xbb\xbfmodel_reasoning_effort = "high"\r\n'
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertNotIn(f"ACTION  {config} ", result.stdout)
+        self.assertEqual(read_json_test(settings_path)["modelSettings"], models)
+
+    def test_effort_dry_run_writes_nothing(self):
+        home = self.new_home("effort-dry-home")
+        copied = self.copy_codex_effort_repo("effort-dry-repo")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b'model_reasoning_effort = "medium"\r\n'
+        config.write_bytes(original)
+        paths = sorted(home.rglob("*"))
+        result = self.run_install(home, copied, ["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn(f"ACTION  {config}  (would write)", result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(sorted(home.rglob("*")), paths)
+
+    def test_codex_effort_already_set_is_unchanged(self):
+        home = self.new_home("effort-unchanged-home")
+        copied = self.copy_codex_effort_repo("effort-unchanged-repo")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b"\xef\xbb\xbfmodel_reasoning_effort  = 'high' # keep\r\n"
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertIn(f"ACTION  {config}  (unchanged)", result.stdout)
+        self.assertFalse(list((home / ".claude" / "local").glob("backup-*/.codex/config.toml")))
+
+    def assert_codex_effort_skipped(self, name, original, reason):
+        home = self.new_home(f"effort-skip-{name}-home")
+        copied = self.copy_codex_effort_repo(f"effort-skip-{name}-repo")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertIn(f"ACTION  {config}  (skipped ({reason}))", result.stdout)
+        self.assertFalse(list((home / ".claude" / "local").glob("backup-*/.codex/config.toml")))
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires tomllib")
+    def test_codex_effort_indented_key_is_skipped(self):
+        self.assert_codex_effort_skipped("indented", b'  model_reasoning_effort = "high"\n',
+                                       "model_reasoning_effort present in a form the installer does not rewrite")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires tomllib")
+    def test_codex_effort_quoted_key_is_skipped(self):
+        self.assert_codex_effort_skipped("quoted", b'"model_reasoning_effort" = "high"\n',
+                                       "model_reasoning_effort present in a form the installer does not rewrite")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires tomllib")
+    def test_codex_effort_after_multiline_string_is_skipped(self):
+        self.assert_codex_effort_skipped("multiline", b'notes = """\n[Rules]\nkeep\n"""\nmodel_reasoning_effort = "high"\n',
+                                       "model_reasoning_effort present in a form the installer does not rewrite")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires tomllib")
+    def test_codex_effort_after_multiline_string_without_table_header_is_skipped(self):
+        self.assert_codex_effort_skipped("multiline-no-header", b'notes = """\nkeep\n"""\nmodel_reasoning_effort = "high"\n',
+                                       "model_reasoning_effort present in a form the installer does not rewrite")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires tomllib")
+    def test_codex_effort_invalid_toml_is_skipped(self):
+        for index, original in enumerate((
+            b'model_reasoning_effort = "high"\n[broken',
+            b'model_reasoning_effort = "high"\nmodel_reasoning_effort = "low"\n',
+            b'model = "test"\rmodel_reasoning_effort = "high"\r[profile]\rkeep = true',
+            b'model = "\xff"\n',
+        )):
+            with self.subTest(index=index):
+                self.assert_codex_effort_skipped(f"invalid-{index}", original, "config.toml did not parse")
+
+    def test_codex_effort_preserves_inline_comment(self):
+        home = self.new_home("effort-comment-home")
+        copied = self.copy_codex_effort_repo("effort-comment-repo")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b'model_reasoning_effort = "medium" # bumped for refactors\r\n'
+        config.write_bytes(original)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(config.read_bytes(), b'model_reasoning_effort = "high" # bumped for refactors\r\n')
+        self.assertIn(f"ACTION  {config}  (written)", result.stdout)
+
+    def test_codex_effort_without_tomllib_skips_insertion(self):
+        home = self.new_home("effort-no-tomllib-home")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b'model = "test"\n# \xff\n'
+        config.write_bytes(original)
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = mock.Mock(home=home)
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            module.install_codex_effort(installer, {"codex_effort": "medium"})
+        installer.write_bytes.assert_not_called()
+        installer.action.assert_called_once_with(config, "skipped (no tomllib to confirm the key is absent)")
+        self.assertEqual(config.read_bytes(), original)
+
+    def test_codex_effort_without_tomllib_skips_indented_key(self):
+        home = self.new_home("effort-no-tomllib-indented-home")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        original = b'  model_reasoning_effort = "high"\r\n'
+        config.write_bytes(original)
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module.Installer(home, REPO, False)
+        with mock.patch.dict(sys.modules, {"tomllib": None}), contextlib.redirect_stdout(io.StringIO()) as output:
+            module.install_codex_effort(installer, {"codex_effort": "medium"})
+        self.assertIn(f"ACTION  {config}  (skipped (no tomllib to confirm the key is absent))", output.getvalue())
+        self.assertEqual(config.read_bytes(), original)
+        self.assertIsNone(installer.backup_root)
+
+    def test_codex_effort_without_tomllib_replaces_recognised_key(self):
+        home = self.new_home("effort-no-tomllib-replace-home")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        config.write_bytes(b'model_reasoning_effort = "high" # keep\r\n# \xff\r\n')
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module.Installer(home, REPO, False)
+        with mock.patch.dict(sys.modules, {"tomllib": None}), contextlib.redirect_stdout(io.StringIO()) as output:
+            module.install_codex_effort(installer, {"codex_effort": "medium"})
+        self.assertEqual(config.read_bytes(), b'model_reasoning_effort = "medium" # keep\r\n# \xff\r\n')
+        self.assertIn(f"ACTION  {config}  (written)", output.getvalue())
+
+    def test_effort_helpers_apply_defaults_without_install(self):
+        home = self.new_home("effort-direct-default-home")
+        config = home / ".codex" / "config.toml"
+        config.parent.mkdir()
+        config.write_bytes(b'model_reasoning_effort = "medium"\n')
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        installer = module.Installer(home, REPO, False)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            module.install_codex_effort(installer, {})
+        self.assertEqual(config.read_bytes(), b'model_reasoning_effort = "high"\n')
+        self.assertIn(f"ACTION  {config}  (written)", output.getvalue())
+        settings = module.merge_settings({}, {}, home)
+        self.assertEqual(settings["modelSettings"], {
+            "claude-fable-5-1": {"effortLevel": "medium"},
+            "claude-opus-5-5": {"effortLevel": "high"},
+            "claude-sonnet-5-5": {"effortLevel": "medium"},
+            "claude-haiku-5-5": {"effortLevel": "medium"},
+        })
+
+    def test_effort_extended_values_allow_claude_xhigh(self):
+        copied = self.copy_codex_effort_repo("effort-extended-repo")
+        for effort in ("minimal", "xhigh"):
+            for key in ("codex_effort", "claude_effort"):
+                with self.subTest(effort=effort, key=key):
+                    home = self.new_home(f"effort-extended-{effort}-{key}-home")
+                    local = home / ".claude" / "local" / "machine.local.json"
+                    local.parent.mkdir(parents=True)
+                    local.write_text(json.dumps({key: effort if key == "codex_effort" else {"model": effort}}), encoding="utf-8")
+                    config = home / ".codex" / "config.toml"
+                    config.parent.mkdir()
+                    original = b'model_reasoning_effort = "medium"\n'
+                    config.write_bytes(original)
+                    result = self.run_install(home, copied)
+                    if key == "codex_effort":
+                        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                        self.assertEqual(config.read_bytes(), f'model_reasoning_effort = "{effort}"\n'.encode("ascii"))
+                    elif effort == "xhigh":
+                        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                        settings = read_json_test(home / ".claude" / "settings.json")
+                        self.assertEqual(settings["modelSettings"]["model"]["effortLevel"], "xhigh")
+                    else:
+                        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                        self.assertIn("claude_effort must be a model map with values low, medium, high or xhigh, or null", result.stdout)
+                        self.assertNotIn("ACTION ", result.stdout)
+                        self.assertEqual(config.read_bytes(), original)
 
     def test_statusline_weather_writes_fresh_config(self):
         home = self.new_home("weather-fresh-home")
@@ -3609,6 +4444,24 @@ class InstallerTests(unittest.TestCase):
                     shared_steps = steps[1:3]
                 else:
                     self.assertEqual(steps[1:3], shared_steps)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_public_excludes_usage_skill_but_addon_includes_it(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-public-usage-repo")
+        bundle = self.base / "bundle-public-usage.zip"
+        result = subprocess.run(
+            [sys.executable, str(REPO / "install.py"), "--bundle", "public",
+             "--out", str(bundle), "--repo", str(copied), "--home", str(self.bundle_home(copied))],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertFalse(any(name.startswith("claude/skills/usage/") for name in archive.namelist()))
+        addon = self.base / "bundle-public-usage-addon.zip"
+        result = self.run_addon(copied, addon, name="usage")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(addon) as archive:
+            self.assertIn("claude/skills/usage/SKILL.md", archive.namelist())
 
     def test_bundle_install_text_keeps_audit_details_only_when_not_published(self):
         spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
@@ -4727,6 +5580,35 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Only the files listed above and this ADDON.md are written.", instructions)
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_usage_zip(self):
+        copied = self.copy_repo_without_local_machine_files("addon-usage-repo")
+        addon = self.base / "addon-usage.zip"
+        result = self.run_addon(copied, addon, name="usage")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("addon gate:", result.stdout)
+        self.assertIn("addon written", result.stdout)
+        self.assertIn("(9 files)", result.stdout)
+        with zipfile.ZipFile(addon) as archive:
+            names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
+            instructions = archive.read("ADDON.md").decode("utf-8")
+        self.assertEqual(names, sorted([
+            "ADDON.md",
+            "monitor/local.py",
+            "monitor/local.html",
+            "monitor/heartbeat.py",
+            "monitor/local_test.py",
+            "monitor/heartbeat_test.py",
+            "monitor/fixtures/proxy-credentials.json",
+            "monitor/USAGE.md",
+            "claude/skills/usage/SKILL.md",
+        ]))
+        self.assertTrue(instructions.startswith("# Usage addon\n\nBuilt "))
+        for step in ("1. Unzip this file", "2. Run `python install.py`", "3. Restart Claude Code and type `usage`."):
+            self.assertIn(step, instructions)
+        self.assertIn("http://127.0.0.1:9000", instructions)
+        self.assertIn("No key in `machine.local.json` is needed.", instructions)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_addon_dry_run_writes_nothing(self):
         copied = self.copy_repo_without_local_machine_files("addon-dry-repo")
         addon = self.base / "addon-dry-parent" / "addon.zip"
@@ -4741,7 +5623,7 @@ class InstallerTests(unittest.TestCase):
         addon = self.base / "addon-unknown.zip"
         result = self.run_addon(copied, addon, name="missing")
         self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
-        self.assertEqual(result.stdout, "addon refused: unknown addon missing; available addons: daily\n")
+        self.assertEqual(result.stdout, "addon refused: unknown addon missing; available addons: daily, usage\n")
         self.assertFalse(addon.exists())
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
@@ -5145,10 +6027,745 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue((skill / "SKILL.md").is_file())
 
 
+class ProxyInstallerTests(unittest.TestCase):
+    new_home = InstallerTests.new_home
+    copy_repo_without_local_machine_files = InstallerTests.copy_repo_without_local_machine_files
+    bundle_home = InstallerTests.bundle_home
+    bundle_terms_file = InstallerTests.bundle_terms_file
+    declare_bundle_domains = InstallerTests.declare_bundle_domains
+    run_bundle = InstallerTests.run_bundle
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.home = self.new_home("home with spaces")
+        self.repo = self.new_home("repo")
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.key = "sk-" + "cpa-TESTKEY"
+        (self.home / "client.key").write_text(self.key + "\n", encoding="utf-8")
+        self.machine = {
+            "name": "probe", "os": "linux", "codex_model": "gpt-6-astra", "statusline": False,
+            "proxy": {"host": "127.0.0.1", "key_file": "client.key"},
+        }
+        for relative, content in {
+            "machines/probe.md": "# Probe\n", "claude/CLAUDE.md": "# Shared\n",
+            "codex/AGENTS.md": "# Shared\n", "install-manifest.json": "{}",
+        }.items():
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    def run_proxy_install(self, dry_run=False):
+        (self.repo / "machines/probe.json").write_text(json.dumps(self.machine), encoding="utf-8")
+        flag = "-" * 2
+        args = [flag + "machine", "probe", flag + "home", str(self.home), flag + "repo", str(self.repo), flag + "no-tests"]
+        if dry_run:
+            args.append(flag + "dry-run")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.module.main(args)
+        return result, output.getvalue()
+
+    def written_paths(self):
+        directory = self.module.proxy_path(self.module.proxy_bin_dir(self.machine), self.home)
+        profiles = [self.home / ".claude-proxy/settings.json", self.home / ".codex-proxy/config.toml", self.home / ".codex-proxy/auth.json"]
+        launchers = [directory / name for name in ("claude", "codex", "claude-proxy", "codex-proxy")]
+        if self.machine["os"] == "windows":
+            launchers += [path.with_suffix(".cmd") for path in launchers]
+        return profiles, launchers
+
+    def _probe_environment(self, curl_name, curl_body):
+        probe_dir = self.home / "probe bin"
+        probe_dir.mkdir()
+        probe = probe_dir / curl_name
+        probe.write_text(curl_body, encoding="utf-8", newline="\r\n" if curl_name.endswith(".cmd") else "\n")
+        if not curl_name.endswith(".cmd"):
+            probe.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = str(probe_dir) + os.pathsep + environment.get("PATH", "")
+        environment["HARNESS_PROXY"] = ""
+        for name in ("CODEX_HOME", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"):
+            environment.pop(name, None)
+        return environment
+
+    def test_no_proxy_does_nothing(self):
+        del self.machine["proxy"]
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        self.assertNotIn("proxy", output)
+        self.assertFalse((self.home / ".claude-proxy").exists())
+        self.assertFalse((self.home / ".codex-proxy").exists())
+        self.assertFalse((self.home / ".claude/local/bin").exists())
+
+    def test_proxy_profile_uses_configured_effort(self):
+        import tomllib
+        for effort in ("minimal", "low", "medium", "high", "xhigh"):
+            with self.subTest(effort=effort):
+                self.machine["codex_effort"] = effort
+                result, output = self.run_proxy_install()
+                self.assertEqual(result, 0, output)
+                config = tomllib.loads((self.home / ".codex-proxy/config.toml").read_text(encoding="utf-8"))
+                self.assertEqual(config["model_reasoning_effort"], effort)
+
+    def test_proxy_effort_default_without_install(self):
+        import tomllib
+        installer = self.module.Installer(self.home, self.repo, False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.module.install_proxy(installer, self.machine, False, self.key)
+        config = tomllib.loads((self.home / ".codex-proxy/config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(config["model_reasoning_effort"], "high")
+
+    def test_proxy_null_effort_preserves_existing_value(self):
+        import tomllib
+        self.machine["codex_effort"] = None
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        path = self.home / ".codex-proxy/config.toml"
+        self.assertNotIn("model_reasoning_effort", tomllib.loads(path.read_text(encoding="utf-8")))
+        path.write_bytes(b'model_reasoning_effort = "high"\n' + path.read_bytes())
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        self.assertEqual(tomllib.loads(path.read_text(encoding="utf-8"))["model_reasoning_effort"], "high")
+
+    def test_linux_profiles_and_launchers(self):
+        import tomllib
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        profiles, launchers = self.written_paths()
+        self.assertEqual(len(profiles + launchers), 7)
+        settings = read_json_test(profiles[0])
+        self.assertEqual(settings["env"], {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317", "ANTHROPIC_AUTH_TOKEN": self.key,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        })
+        self.assertNotIn("statusLine", settings)
+        config = tomllib.loads(profiles[1].read_text(encoding="utf-8"))
+        self.assertEqual(config["model"], "gpt-6-astra")
+        self.assertEqual(config["model_reasoning_effort"], "high")
+        provider = config["model_providers"]["cliproxyapi"]
+        self.assertEqual(provider["experimental_bearer_token"], self.key)
+        self.assertTrue(provider["requires_openai_auth"])
+        self.assertEqual(provider["base_url"], "http://127.0.0.1:8317/v1")
+        self.assertEqual(provider["model_catalog_url"], "http://127.0.0.1:8317/v1/models")
+        self.assertNotIn("projects", config)
+        self.assertEqual(read_json_test(profiles[2]), {"OPENAI_API_KEY": self.key})
+        self.assertTrue(profiles[2].read_bytes().endswith(b"\n"))
+        for path in launchers:
+            content = path.read_bytes()
+            self.assertNotIn(self.key.encode(), content)
+            self.assertNotIn(b"\r", content)
+            self.assertIn(b"Written by install.py", content)
+            self.assertIn(b"HARNESS_PROXY=off", content)
+        if os.name != "nt":
+            for path in profiles + launchers:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600 if path in profiles else 0o755)
+        self.assertEqual(sum(str(path) in output for path in profiles + launchers), 7)
+
+    def test_windows_launchers_and_line_endings(self):
+        self.machine["os"] = "windows"
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        profiles, launchers = self.written_paths()
+        self.assertEqual(len(profiles + launchers), 11)
+        for path in profiles + launchers:
+            content = path.read_bytes()
+            if path in launchers:
+                self.assertNotIn(self.key.encode(), content)
+                if path.suffix == ".cmd":
+                    self.assertIn(b"\r\n", content)
+                    self.assertNotIn(b"\n", content.replace(b"\r\n", b""))
+                else:
+                    self.assertNotIn(b"\r", content)
+        codex = (self.home / ".claude/local/bin/codex.cmd").read_text()
+        self.assertLess(codex.index("where $PATH:codex.cmd"), codex.index("where $PATH:codex 2"))
+        self.assertIn("setlocal DisableDelayedExpansion", codex)
+        self.assertIn("exit /b %errorlevel%", codex)
+        self.assertIn("proxy launchers in", output)
+
+    def test_darwin_defaults(self):
+        self.machine["os"] = "darwin"
+        del self.machine["codex_model"]
+        native = self.home / ".local/bin/claude"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"native binary placeholder")
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        self.assertTrue((self.home / ".claude/local/bin/claude").is_file())
+        self.assertEqual(native.read_bytes(), b"native binary placeholder")
+        self.assertIn('model = "gpt-6.1-sol"', (self.home / ".codex-proxy/config.toml").read_text())
+
+    def test_preserve_settings_and_replace_environment(self):
+        path = self.home / ".claude-proxy/settings.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"foreign": [1], "env": {"KEEP": "yes", "ANTHROPIC_AUTH_TOKEN": "old"}, "statusLine": None}))
+        self.machine["statusline"] = True
+        (self.repo / "claude/statusline-command.sh").write_text("#!/bin/sh\n")
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        settings = read_json_test(path)
+        self.assertEqual(settings["foreign"], [1])
+        self.assertEqual(settings["env"]["KEEP"], "yes")
+        self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], self.key)
+        self.assertIsNone(settings["statusLine"])
+        self.assertTrue(list((self.home / ".claude/local").glob("backup-*")))
+
+    def test_invalid_settings_are_replaced(self):
+        path = self.home / ".claude-proxy/settings.json"
+        path.parent.mkdir()
+        for content in ("broken", "[]", '{"env": null}'):
+            with self.subTest(content=content):
+                path.write_text(content)
+                self.assertEqual(self.run_proxy_install()[0], 0)
+                self.assertEqual(read_json_test(path)["env"]["ANTHROPIC_AUTH_TOKEN"], self.key)
+
+    def test_statusline_matches_normal_settings(self):
+        self.machine["statusline"] = True
+        (self.repo / "claude/statusline-command.sh").write_text("#!/bin/sh\n")
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        self.assertEqual(read_json_test(self.home / ".claude-proxy/settings.json")["statusLine"], read_json_test(self.home / ".claude/settings.json")["statusLine"])
+
+    def test_preserves_existing_projects_tail_unchanged(self):
+        path = self.home / ".codex-proxy/config.toml"
+        path.parent.mkdir()
+        tail = b'[projects."/old"] # Keep this entry\r\ntrust_level = "trusted"\r\n\r\n[other]\r\nvalue = 1\r\n\r\n'
+        path.write_bytes(b'model = "old"\n' + tail)
+        self.machine["codex_model"] = "test-model"
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        first = path.read_bytes()
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        self.assertEqual(path.read_bytes(), first)
+        content = first.decode()
+        self.assertTrue(first.endswith(tail))
+        self.assertIn('model = "test-model"', content)
+        self.assertEqual(content.count('[projects."'), 1)
+
+    def test_key_rotation_updates_auth(self):
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        (self.home / "client.key").write_text("replacement-placeholder\n")
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        for path in self.written_paths()[0]:
+            self.assertIn("replacement-placeholder", path.read_text())
+            self.assertNotIn(self.key, path.read_text())
+
+    def test_missing_key_refuses_before_writes(self):
+        self.machine["proxy"]["key_file"] = "missing.key"
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 2)
+        self.assertIn(f"install refused: proxy key file not found: {self.home / 'missing.key'} (copy the device's client key there by hand first)", output)
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_missing_key_dry_run_lists_every_path(self):
+        self.machine["proxy"]["key_file"] = "missing.key"
+        result, output = self.run_proxy_install(dry_run=True)
+        self.assertEqual(result, 0, output)
+        self.assertEqual(output.count(f"would write (key file missing: {self.home / 'missing.key'})"), 7)
+        for path in sum(self.written_paths(), []):
+            self.assertIn(str(path), output)
+            self.assertFalse(path.exists())
+
+    def test_dry_run_with_key_writes_nothing(self):
+        result, output = self.run_proxy_install(dry_run=True)
+        self.assertEqual(result, 0, output)
+        for path in sum(self.written_paths(), []):
+            self.assertIn(str(path), output)
+            self.assertFalse(path.exists())
+
+    def test_proxy_validation_types_and_required_keys(self):
+        valid = self.machine["proxy"].copy()
+        cases = [(None, "proxy must be an object"), ([], "proxy must be an object")]
+        for key in ("host", "key_file", "claude_command", "codex_command", "bin_dir"):
+            for value in (None, 1, [], "", " "):
+                cases.append(({**valid, key: value}, f"proxy.{key} must be a non empty string"))
+        for key in ("host", "key_file"):
+            cases.append(({field: value for field, value in valid.items() if field != key}, f"proxy.{key} must be a non empty string"))
+        for proxy, message in cases:
+            with self.subTest(proxy=proxy):
+                self.machine["proxy"] = proxy
+                result, output = self.run_proxy_install()
+                self.assertEqual(result, 2, output)
+                self.assertIn("install refused:", output)
+                self.assertIn(message, output)
+
+    def test_proxy_validation_port_scheme_unknown_os(self):
+        valid = self.machine["proxy"].copy()
+        for key, values, message in (
+            ("port", (0, 65536, True, 1.5, "8317", None), "port must be an integer from 1 to 65535"),
+            ("scheme", ("ftp", "", 1, [], None), "scheme must be http or https"),
+        ):
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.machine["proxy"] = {**valid, key: value}
+                    result, output = self.run_proxy_install()
+                    self.assertEqual(result, 2, output)
+                    self.assertIn(message, output)
+        self.machine["proxy"] = {**valid, "z": 1, "a": 2}
+        self.assertIn("unknown keys: a, z", self.run_proxy_install()[1])
+        self.machine["proxy"] = valid
+        self.machine["os"] = "other-os"
+        self.assertIn("got 'other-os'", self.run_proxy_install()[1])
+
+    def test_trusted_is_an_unknown_key(self):
+        self.machine["proxy"]["trusted"] = ["/tmp/work"]
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 2, output)
+        self.assertIn("proxy has unknown keys: trusted", output)
+        self.assertFalse((self.home / ".claude").exists())
+
+    def test_foreign_launcher_refuses_whole_install(self):
+        self.machine["os"] = "windows"
+        path = self.home / ".claude/local/bin/codex-proxy.cmd"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"foreign binary placeholder")
+        before = self.module.tree_snapshot(self.home)
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 2, output)
+        self.assertIn(f"install refused: {path} exists and was not written by install.py (set proxy.bin_dir to another folder or move that file)", output)
+        self.assertEqual(self.module.tree_snapshot(self.home), before)
+        self.assertNotIn("ACTION", output)
+
+    def test_foreign_launcher_dry_run_reports_and_continues(self):
+        path = self.home / ".claude/local/bin/claude"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"foreign binary placeholder")
+        before = self.module.tree_snapshot(self.home)
+        for key_file in ("client.key", "missing.key"):
+            with self.subTest(key_file=key_file):
+                self.machine["proxy"]["key_file"] = key_file
+                result, output = self.run_proxy_install(dry_run=True)
+                self.assertEqual(result, 0, output)
+                self.assertIn(f"ACTION  {path}  (would refuse (existing file not written by install.py))", output)
+                self.assertEqual(output.count("would refuse"), 1)
+                self.assertIn("install complete", output)
+                for destination in sum(self.written_paths(), []):
+                    self.assertIn(str(destination), output)
+                self.assertEqual(self.module.tree_snapshot(self.home), before)
+
+    def check_symlink_collision(self, dangling):
+        self.machine["proxy"]["bin_dir"] = ".local/bin"
+        path = self.home / ".local/bin/claude"
+        path.parent.mkdir(parents=True)
+        target = self.home / "native-claude"
+        if not dangling:
+            target.write_bytes(b"native binary placeholder")
+        try:
+            path.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        for dry_run in (False, True):
+            result, output = self.run_proxy_install(dry_run=dry_run)
+            self.assertEqual(result, 0 if dry_run else 2, output)
+            self.assertIn("would refuse" if dry_run else "install refused:", output)
+            self.assertIn(str(path), output)
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(Path(os.readlink(path)), target)
+            self.assertFalse((self.home / ".claude/local/machine-name").exists())
+            if dangling:
+                self.assertFalse(target.exists())
+            else:
+                self.assertEqual(target.read_bytes(), b"native binary placeholder")
+
+    def test_native_symlink_is_not_overwritten(self):
+        self.check_symlink_collision(dangling=False)
+
+    def test_dangling_symlink_is_not_overwritten(self):
+        self.check_symlink_collision(dangling=True)
+
+    def test_managed_launcher_can_be_updated(self):
+        path = self.home / ".claude/local/bin/claude"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"# Written by install.py from the machine's proxy block\nold launcher\n")
+        result, output = self.run_proxy_install()
+        self.assertEqual(result, 0, output)
+        self.assertIn(b"claude via the proxy pool", path.read_bytes())
+        self.assertNotIn(b"old launcher", path.read_bytes())
+
+    def test_path_note_only_when_launcher_folder_is_absent(self):
+        original = os.environ.get("PATH")
+        directory = self.home / ".claude/local/bin"
+        try:
+            for system in ("linux", "darwin", "windows"):
+                self.machine["os"] = system
+                for present in (False, True):
+                    with self.subTest(system=system, present=present):
+                        entry = str(directory if present else self.home / "other")
+                        os.environ["PATH"] = entry.swapcase() if system == "windows" else entry
+                        result, output = self.run_proxy_install(dry_run=True)
+                        self.assertEqual(result, 0, output)
+                        self.assertEqual("proxy launchers in" in output, not present)
+        finally:
+            if original is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original
+
+    def test_path_note_checks_precedence_and_expands_entries(self):
+        directory = self.home / ".claude/local/bin"
+        for system, suffix in (("linux", ""), ("darwin", ""), ("windows", ".exe"), ("windows", ".cmd")):
+            real_dir = self.home / (system + (suffix or "-plain"))
+            real_dir.mkdir()
+            binary = real_dir / ("codex" + suffix)
+            binary.write_bytes(b"binary placeholder")
+            if os.name != "nt":
+                os.chmod(binary, 0o755)
+            self.machine["os"] = system
+            for entries, warning in (
+                (["$PROXY_TEST_REAL", "~/.claude/local/bin"], True),
+                (["~/.claude/local/bin", "$PROXY_TEST_REAL"], False),
+                (["$PROXY_TEST_REAL"], True),
+                (["$PROXY_TEST_REAL", "~/.claude/local/bin", "$PROXY_TEST_REAL"], True),
+            ):
+                with self.subTest(system=system, suffix=suffix, entries=entries), mock.patch.dict(os.environ, {
+                    "HOME": str(self.home), "USERPROFILE": str(self.home),
+                    "PROXY_TEST_REAL": str(real_dir), "PATH": os.pathsep.join(entries),
+                }):
+                    result, output = self.run_proxy_install(dry_run=True)
+                    self.assertEqual(result, 0, output)
+                    message = f"proxy launchers in {directory}: this folder must come before {real_dir} on PATH, or the bare claude and codex skip the pool"
+                    self.assertEqual(message in output, warning)
+                    self.assertEqual("proxy launchers in" in output, warning)
+
+    def test_path_note_skips_managed_launchers(self):
+        earlier = self.home / "earlier"
+        earlier.mkdir()
+        (earlier / "codex").write_bytes(b"# Written by install.py from the machine's proxy block\n")
+        if os.name != "nt":
+            os.chmod(earlier / "codex", 0o755)
+        directory = self.home / ".claude/local/bin"
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join((str(earlier), str(directory)))}):
+            result, output = self.run_proxy_install(dry_run=True)
+        self.assertEqual(result, 0, output)
+        self.assertNotIn("proxy launchers in", output)
+
+    def test_cmd_lookup_restores_path_and_preserves_arguments(self):
+        self.machine["os"] = "windows"
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        directory = self.home / ".claude/local/bin"
+        for name in ("claude", "codex"):
+            content = (directory / (name + ".cmd")).read_text()
+            lookups = [content.index(f"where $PATH:{name}{suffix} 2") for suffix in (".exe", ".cmd", "")]
+            self.assertEqual(lookups, sorted(lookups))
+            self.assertEqual(content.count('do if not defined real set "real=%%R"'), 3)
+            saved = content.index('set "proxy_orig_path=%PATH%"')
+            stripped = content.index('set "PATH=%proxy_path%"')
+            restored = content.index('set "PATH=%proxy_orig_path%"')
+            self.assertLess(saved, stripped)
+            self.assertLess(stripped, lookups[0])
+            self.assertLess(lookups[-1], restored)
+            self.assertLess(restored, content.index("if defined real goto resolved"))
+            self.assertLess(restored, content.index('"%real%" '))
+            self.assertNotIn('call "', content)
+            self.assertIn('"%real%" %*\nexit /b %errorlevel%', content)
+            alias = (directory / (name + "-proxy.cmd")).read_text()
+            self.assertNotIn('call "', alias)
+            self.assertTrue(alias.endswith(f'"%~dp0{name}.cmd" %*\n'))
+
+    def test_codex_launchers_use_environment_key(self):
+        self.machine["os"] = "windows"
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        directory = self.home / ".claude/local/bin"
+        for suffix in ("", ".cmd"):
+            content = (directory / ("codex" + suffix)).read_text()
+            self.assertNotIn(self.key, content)
+            self.assertIn("model_providers.cliproxyapi.env_key=", content)
+            self.assertIn("model_providers.cliproxyapi.requires_openai_auth=false", content)
+            self.assertNotIn("model_providers.cliproxyapi.experimental_bearer_token=", content)
+            self.assertIn("experimental_bearer_token", content)
+            if suffix:
+                self.assertIn('endlocal & set "CLIPROXY_API_KEY=%tok%" & "%real%" %sub% -c ', content)
+                marker, token, own_args = '"%real%"', "%tok%", "%*"
+                env_key = r'env_key=\"CLIPROXY_API_KEY\"'
+            else:
+                self.assertIn('CLIPROXY_API_KEY="$tok" exec "$real"', content)
+                marker, token, own_args = 'exec "$real"', "$tok", '"$@"'
+                env_key = 'env_key="CLIPROXY_API_KEY"'
+            pool_invocations = 0
+            for line in content.splitlines():
+                if marker not in line:
+                    continue
+                invocation = line.split(marker, 1)[1].strip()
+                self.assertNotIn(token, invocation)
+                if invocation == own_args:
+                    self.assertNotIn("env_key", line)
+                    self.assertNotIn(token, line)
+                else:
+                    self.assertIn(env_key, invocation)
+                    pool_invocations += 1
+            self.assertEqual(pool_invocations, 1)
+
+    def test_codex_launchers_place_overrides_after_subcommands(self):
+        self.machine["os"] = "windows"
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        directory = self.home / ".claude/local/bin"
+        shell = (directory / "codex").read_text()
+        self.assertIn('CLIPROXY_API_KEY="$tok" exec "$real" ${sub:+"$sub"} ${nested:+"$nested"} -c ', shell)
+        self.assertIn('""|-*|help|', shell)
+        batch = (directory / "codex.cmd").read_text()
+        captures = [line for line in batch.splitlines() if line.startswith("for /f ") and '"!args!"' in line]
+        self.assertEqual(len(captures), 2)
+        for capture in captures:
+            self.assertIn("eol=", capture)
+            self.assertRegex(capture, 'delims=[ \\t]*\\t[ \\t]*"')
+        self.assertRegex(batch, r'if /i "!sub!"=="help" goto proxy_root\w*')
+        self.assertRegex(batch, r'"%real%" %sub% -c [^\r\n]+ %rest%')
+        self.assertEqual(batch.count('endlocal & set "CLIPROXY_API_KEY=%tok%"'), 1)
+        for name in ("claude", "codex"):
+            self.assertIn('call curl -sf -m 2', (directory / (name + ".cmd")).read_text())
+        for content, marker, token in ((shell, 'exec "$real"', "$tok"), (batch, '"%real%"', "%tok%")):
+            self.assertNotIn(self.key, content)
+            for line in content.splitlines():
+                if marker in line:
+                    self.assertNotIn(token, line.split(marker, 1)[1])
+
+    @unittest.skipUnless(
+        shutil.which("sh") and not any(part.lower() in ("system32", "windowsapps") for part in Path(shutil.which("sh")).parts),
+        "requires a native POSIX sh on PATH, not a WSL launcher",
+    )
+    def test_codex_shell_launcher_argument_placement(self):
+        self.machine["os"] = "linux"
+        binary = self.home / "real codex"
+        self.machine["proxy"]["codex_command"] = str(binary)
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@"\n', encoding="utf-8", newline="\n")
+        binary.chmod(0o755)
+        environment = self._probe_environment("curl", "#!/bin/sh\nexit 0\n")
+        overrides = []
+        for value in self.module.codex_proxy_overrides("http://127.0.0.1:8317"):
+            overrides.extend(["-c", value])
+        for arguments, expected in (
+            (["exec", "-", "-m", "x"], ["exec"] + overrides + ["-", "-m", "x"]),
+            (["exec", "resume", "abc"], ["exec", "resume"] + overrides + ["abc"]),
+            (["-m", "x"], overrides + ["-m", "x"]),
+            ([], overrides),
+            (["resume", "abc"], ["resume"] + overrides + ["abc"]),
+            (["exec", "two words", ""], ["exec"] + overrides + ["two words", ""]),
+            (["fix a&b"], overrides + ["fix a&b"]),
+            (["two words prompt"], overrides + ["two words prompt"]),
+            (['say "hi"'], overrides + ['say "hi"']),
+            (["two\twords"], overrides + ["two\twords"]),
+            (["help"], overrides + ["help"]),
+            (["help", "exec"], overrides + ["help", "exec"]),
+            (["exec", "review", "x"], ["exec", "review"] + overrides + ["x"]),
+            (["exec", "fork", "abc"], ["exec", "fork"] + overrides + ["abc"]),
+            (["-m", "x", "exec"], overrides + ["-m", "x", "exec"]),
+            (["exec", "--json", "resume", "abc"], ["exec"] + overrides + ["--json", "resume", "abc"]),
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [shutil.which("sh"), (self.home / ".claude/local/bin/codex").as_posix(), *arguments],
+                    env=environment, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("codex via the proxy pool", result.stderr)
+                self.assertEqual(result.stdout.splitlines(), expected)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows cmd.exe")
+    def test_codex_cmd_launcher_argument_placement(self):
+        self.machine["os"] = "windows"
+        binary = self.home / "real codex.cmd"
+        self.machine["proxy"]["codex_command"] = str(binary)
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        native_probe = self.home / "native arguments.py"
+        native_output = self.home / "native arguments.json"
+        native_probe.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+        binary.write_text(f'''@echo off
+setlocal DisableDelayedExpansion
+"{sys.executable}" "{native_probe}" %* > "{native_output}"
+:loop
+if [%1]==[] goto done
+echo(%1
+shift
+goto loop
+:done
+echo %CLIPROXY_API_KEY%
+''', encoding="utf-8", newline="\r\n")
+        environment = self._probe_environment("curl.cmd", "@exit /b 0\n")
+        overrides = []
+        native_overrides = []
+        for value in self.module.codex_proxy_overrides("http://127.0.0.1:8317"):
+            overrides.extend(["-c", '"' + value.replace('"', r'\"') + '"'])
+            native_overrides.extend(["-c", value])
+        launcher = self.home / ".claude/local/bin/codex.cmd"
+        for arguments, prefix, remainder, native_remainder in (
+            ("exec - -m x", ["exec"], ["-", "-m", "x"], ["-", "-m", "x"]),
+            ("exec resume abc", ["exec", "resume"], ["abc"], ["abc"]),
+            ("-m x", [], ["-m", "x"], ["-m", "x"]),
+            ("", [], [], []),
+            ('exec - -c model_reasoning_effort="high" --sandbox workspace-write', ["exec"],
+             ["-", "-c", "model_reasoning_effort", '"high"', "--sandbox", "workspace-write"],
+             ["-", "-c", "model_reasoning_effort=high", "--sandbox", "workspace-write"]),
+            ("exec resume", ["exec", "resume"], [], []),
+            ("app-server", ["app-server"], [], []),
+            ('exec "a&b"', ["exec"], ['"a&b"'], ["a&b"]),
+            (r'exec "C:\Program Files (x86)\x"', ["exec"], [r'"C:\Program Files (x86)\x"'], [r'C:\Program Files (x86)\x']),
+            ("exec", ["exec"], [], []),
+            ('exec resume "a&b"', ["exec", "resume"], ['"a&b"'], ["a&b"]),
+            ('exec "a|b"', ["exec"], ['"a|b"'], ["a|b"]),
+            ('exec "a(b)c"', ["exec"], ['"a(b)c"'], ["a(b)c"]),
+            ('exec "a=b,c;d"', ["exec"], ['"a=b,c;d"'], ["a=b,c;d"]),
+            ('exec "a""b"', ["exec"], ['"a""b"'], ['a"b']),
+            ('exec "a!PATH!b"', ["exec"], ['"a!PATH!b"'], ["a!PATH!b"]),
+            ('exec resume "a!PATH!b"', ["exec", "resume"], ['"a!PATH!b"'], ["a!PATH!b"]),
+            ('"fix a&b"', [], ['"fix a&b"'], ["fix a&b"]),
+            ('"two words prompt"', [], ['"two words prompt"'], ["two words prompt"]),
+            ('"a(b)c"', [], ['"a(b)c"'], ["a(b)c"]),
+            ('"a!PATH!b"', [], ['"a!PATH!b"'], ["a!PATH!b"]),
+            ('"exec"', [], ['"exec"'], ["exec"]),
+            ('fi"x a&b"', [], ['fi"x a&b"'], ["fix a&b"]),
+            ("help", [], ["help"], ["help"]),
+            ("help exec", [], ["help", "exec"], ["help", "exec"]),
+            ("exec\t-", ["exec"], ["-"], ["-"]),
+            ('exec "a\tb"', ["exec"], ['"a\tb"'], ["a\tb"]),
+            ("exec ;x y", ["exec"], ["x", "y"], [";x", "y"]),
+            (";x y", ["x"], ["y"], ["y"]),
+            ("exec review x", ["exec", "review"], ["x"], ["x"]),
+            ("exec fork abc", ["exec", "fork"], ["abc"], ["abc"]),
+            ("-m x exec", [], ["-m", "x", "exec"], ["-m", "x", "exec"]),
+            ("exec --json resume abc", ["exec"], ["--json", "resume", "abc"], ["--json", "resume", "abc"]),
+            (r'exec "say \"hi there\""', ["exec"], [r'"say \"hi', r'there\""'], ['say "hi there"']),
+            ('exec fi"x y"', ["exec"], ['fi"x y"'], ["fix y"]),
+            ('exec "a  b" last', ["exec"], ['"a  b"', "last"], ["a  b", "last"]),
+            ("exec,resume abc", ["exec", "resume"], ["abc"], ["abc"]),
+            ("exec;resume abc", ["exec", "resume"], ["abc"], ["abc"]),
+            ("exec=resume abc", ["exec", "resume"], ["abc"], ["abc"]),
+        ):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    f'cmd.exe /d /c ""{launcher}" {arguments}"',
+                    env=environment, capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("codex via the proxy pool", result.stderr)
+                self.assertEqual(result.stdout.splitlines().count(self.key), 1)
+                self.assertEqual(result.stdout.splitlines(), prefix + overrides + remainder + [self.key])
+                native_prefix = {
+                    ";x y": [";x"], "exec,resume abc": ["exec,resume"],
+                    "exec;resume abc": ["exec;resume"], "exec=resume abc": ["exec=resume"],
+                }.get(arguments, prefix)
+                self.assertEqual(json.loads(native_output.read_text()), native_prefix + native_overrides + native_remainder)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows cmd.exe")
+    def test_claude_cmd_launcher_returns_from_probe_shim(self):
+        self.machine["os"] = "windows"
+        binary = self.home / "real claude.cmd"
+        self.machine["proxy"]["claude_command"] = str(binary)
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        binary.write_text('@echo off\necho %ANTHROPIC_BASE_URL%\necho %ANTHROPIC_AUTH_TOKEN%\n', encoding="utf-8", newline="\r\n")
+        environment = self._probe_environment("curl.cmd", "@exit /b 0\n")
+        launcher = self.home / ".claude/local/bin/claude.cmd"
+        result = subprocess.run(
+            f'cmd.exe /d /c ""{launcher}""',
+            env=environment, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("claude via the proxy pool", result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["http://127.0.0.1:8317", self.key])
+
+    def test_key_rejects_characters_outside_plain_key_alphabet(self):
+        path = self.home / "client.key"
+        for character in ("&", "|", "<", ">", "%", "^", '"', " ", "\t", "\n", "\x00", "\u00e9"):
+            with self.subTest(character=character):
+                path.write_text(self.key + character + "bad\n", encoding="utf-8")
+                result, output = self.run_proxy_install()
+                self.assertEqual(result, 2, output)
+                self.assertIn(f"install refused: proxy key file holds characters outside letters, digits, dash and underscore: {path}", output)
+                self.assertFalse((self.home / ".claude").exists())
+        path.write_text("abc_123-XYZ\n", encoding="utf-8")
+        self.assertEqual(self.run_proxy_install()[0], 0)
+
+    def test_commands_expand_home_environment_and_relative_paths(self):
+        self.machine["os"] = "windows"
+        self.machine["proxy"].update({
+            "claude_command": "~/.local/share/claude/claude",
+            "codex_command": "$PROXY_TEST_COMMANDS/codex.cmd",
+        })
+        with mock.patch.dict(os.environ, {
+            "HOME": str(self.home), "USERPROFILE": str(self.home), "PROXY_TEST_COMMANDS": "real commands",
+        }):
+            self.assertEqual(self.run_proxy_install()[0], 0)
+        for name, expected in (
+            ("claude", self.home / ".local/share/claude/claude"),
+            ("codex", self.home / "real commands/codex.cmd"),
+        ):
+            directory = self.home / ".claude/local/bin"
+            self.assertIn(expected.as_posix(), (directory / name).read_text())
+            self.assertIn(f'set "real={expected}"', (directory / (name + ".cmd")).read_text())
+
+    def test_custom_paths_commands_and_https(self):
+        self.machine["proxy"].update({
+            "bin_dir": "custom bin", "claude_command": "/opt/real cli/claude",
+            "codex_command": "/opt/real cli/codex", "scheme": "https", "port": 443,
+            "key_file": str(self.home / "client.key"),
+        })
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        self.assertIn("https://127.0.0.1:443", (self.home / ".claude-proxy/settings.json").read_text())
+        for name in ("claude", "codex"):
+            content = (self.home / "custom bin" / name).read_text()
+            expected = self.module.proxy_path(f"/opt/real cli/{name}", self.home).as_posix()
+            self.assertIn(f"real='{expected}'", content)
+        self.assertEqual(self.module.proxy_path("~/key", self.home), Path("~/key").expanduser().resolve())
+
+    def test_launchers_have_bypass_probe_overrides_and_force_aliases(self):
+        self.assertEqual(self.run_proxy_install()[0], 0)
+        directory = self.home / ".claude/local/bin"
+        for name in ("claude", "codex"):
+            content = (directory / name).read_text()
+            self.assertIn("curl -sf -m 2", content)
+            self.assertIn("Authorization: Bearer $tok", content)
+            self.assertIn("http://127.0.0.1:8317/v1/models", content)
+            self.assertIn('if [ "$HARNESS_PROXY" = "off" ]', content)
+            self.assertIn('echo "proxy unreachable" >&2', content)
+            self.assertIn(f"proxy down, {name} on this device's own login", content)
+            self.assertIn(f"{name}: real binary not found on PATH", content)
+            self.assertIn('HARNESS_PROXY=force exec "$(dirname "$0")/' + name, (directory / (name + "-proxy")).read_text())
+        claude = (directory / "claude").read_text()
+        codex = (directory / "codex").read_text()
+        self.assertIn("ANTHROPIC_BASE_URL+x", claude)
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", claude)
+        self.assertIn("CODEX_HOME+x", codex)
+        self.assertIn("OPENAI_BASE_URL+x", codex)
+        self.assertNotIn("CODEX_HOME=", codex)
+        for key in ("name", "base_url", "model_catalog_url", "wire_api", "requires_openai_auth", "supports_websockets", "env_key"):
+            self.assertIn("model_providers.cliproxyapi." + key, codex)
+
+    def test_bundle_instructions_only_with_proxy(self):
+        plain = self.module.bundle_install_text("probe", "date", "commit", "gate")
+        self.assertNotIn("client key", plain)
+        self.assertEqual(re.findall(r"^(\d+)\. (\w+)", plain, re.MULTILINE), [
+            ("1", "Unpack"), ("2", "Dry"), ("3", "Real"), ("4", "Restart"),
+        ])
+        self.machine["proxy"]["key_file"] = "~/client.key"
+        text = self.module.bundle_install_text("probe", "date", "commit", "gate", machine=self.machine)
+        self.assertIn("~/client.key", text)
+        self.assertIn("Before running install.py", text)
+        self.assertIn(".claude/local/bin", text)
+        self.assertIn("must precede the real binaries on PATH", text)
+        self.assertEqual(re.findall(r"^(\d+)\. (\w+)", text, re.MULTILINE), [
+            ("1", "Unpack"), ("2", "Before"), ("3", "Dry"), ("4", "Real"), ("5", "Restart"),
+        ])
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle gate requires the source repository")
+    def test_bundle_merges_proxy_and_gate_refuses_key(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-repo")
+        local = copied / "machines" / f"{TEST_MACHINE}.local.json"
+        local.write_text(json.dumps({"os": "linux", "proxy": {"host": "127.0.0.1", "key_file": "~/client.key"}}))
+        output = self.base / "bundle.zip"
+        result = self.run_bundle(copied, output)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with zipfile.ZipFile(output) as bundle:
+            self.assertIn("~/client.key", bundle.read("INSTALL.md").decode())
+            self.assertFalse(any(name.endswith("client.key") for name in bundle.namelist()))
+        (copied / "claude/CLAUDE.md").write_text(self.key)
+        result = self.run_bundle(copied, self.base / "refused.zip")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("GATE claude/CLAUDE.md", result.stdout)
+        self.assertFalse((self.base / "refused.zip").exists())
+
+
 class CommitMsgGuardTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.home = Path(self.temporary.name)
+        self.home = Path(self.temporary.name).resolve()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -5231,10 +6848,119 @@ class CommitMsgGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class GhCredentialHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.bin = self.base / "bin"
+        self.bin.mkdir()
+        self.log = self.base / "argv.jsonl"
+        self.script = self.bin / "fake_gh.py"
+        self.script.write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['GH_TEST_LOG'], 'a') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:4] == ['auth', 'token', '--user'] and sys.argv[4] == 'known' and sys.argv[-1] == 'github.com':\n"
+            "    print('TEST_TOKEN_PLACEHOLDER')\n"
+            "else:\n"
+            "    print('TEST_ERROR_PLACEHOLDER', file=sys.stderr)\n"
+            "    sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        launcher = self.bin / ("gh.bat" if os.name == "nt" else "gh")
+        if os.name == "nt":
+            launcher.write_text(f'@echo off\n"{sys.executable}" "{self.script}" %*\n', encoding="utf-8")
+        else:
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{self.script}" "$@"\n', encoding="utf-8")
+            launcher.chmod(0o755)
+        self.environment = dict(os.environ, PATH=str(self.bin), GH_TEST_LOG=str(self.log))
+
+    def invoke(self, operation="get", username="known", host="github.com"):
+        request = f"protocol=https\nhost={host}\n"
+        if username is not None:
+            request += f"username={username}\n"
+        return subprocess.run(
+            [sys.executable, "-I", str(HOOK_DIR / "gh_credential_helper.py"), operation],
+            input=request + "\n", env=self.environment, capture_output=True, text=True, timeout=10,
+        )
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def test_git_credential_fill_uses_installed_helper(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        home = self.base / "home with spaces"
+        home.mkdir()
+        installer = module.Installer(home, REPO, False)
+        installer.copy_file(HOOK_DIR / "gh_credential_helper.py", home / ".claude/hooks/gh_credential_helper.py")
+        installer.write_bytes(home / ".gitconfig", b'[credential "https://github.com"]\n\thelper = !echo password=WRONG_TEST_PLACEHOLDER\n')
+        system_config = home / "system.gitconfig"
+        installer.write_bytes(system_config, b"[credential]\n\thelper = !echo password=WRONG_TEST_PLACEHOLDER\n")
+        module.install_gh_credentials(installer, {"gh_account": "known"})
+        environment = {key: value for key, value in self.environment.items() if not key.startswith("GIT_CONFIG")}
+        environment.update(HOME=str(home), GIT_CONFIG_SYSTEM=str(system_config), GIT_CONFIG_GLOBAL=str(home / ".gitconfig"), GIT_TERMINAL_PROMPT="0")
+        environment["PATH"] += os.pathsep + os.environ.get("PATH", "")
+        result = subprocess.run([shutil.which("git"), "credential", "fill"], cwd=home, input="protocol=https\nhost=github.com\n\n", env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("username=known\npassword=TEST_TOKEN_PLACEHOLDER\n", result.stdout)
+        self.assertEqual(self.calls(), [["auth", "token", "--user", "known", "--hostname", "github.com"]])
+
+    def test_username_returns_credentials(self):
+        for host in ("github.com", "gist.github.com"):
+            with self.subTest(host=host):
+                result = self.invoke(host=host)
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                self.assertEqual(result.stdout, "username=known\npassword=TEST_TOKEN_PLACEHOLDER\n\n")
+                self.assertEqual(self.calls()[-1], ["auth", "token", "--user", "known", "--hostname", "github.com"])
+
+    def test_unknown_login_is_silent(self):
+        result = self.invoke(username="unknown")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_gh_failure_is_silent(self):
+        self.script.write_text("import sys\nprint('TEST_SECRET_PLACEHOLDER')\nprint('TEST_SECRET_PLACEHOLDER', file=sys.stderr)\nsys.exit(1)\n", encoding="utf-8")
+        result = self.invoke()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_no_username_is_silent(self):
+        result = self.invoke(username=None)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_no_gh_is_silent(self):
+        self.environment["PATH"] = ""
+        result = self.invoke()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_store_and_erase_are_silent(self):
+        for operation in ("store", "erase"):
+            result = self.invoke(operation)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_other_host_is_silent(self):
+        result = self.invoke(host="example.invalid")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_timeout_is_silent(self):
+        spec = importlib.util.spec_from_file_location("gh_credential_helper", HOOK_DIR / "gh_credential_helper.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.object(module.sys, "argv", ["helper", "get"]), mock.patch.object(module.sys, "stdin", io.StringIO("host=github.com\nusername=known\n\n")), mock.patch.object(module.shutil, "which", return_value="gh"), mock.patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 10)) as run, contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(module.main(), 0)
+            self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", ""))
+            self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+
 class GitHooksInstallTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.home = self.base / "home"
         self.home.mkdir()
         self.repo = self.base / "repo"
@@ -5325,7 +7051,7 @@ class CheckWritingTests(unittest.TestCase):
         if not (REPO / "checkers" / "check_writing.py").is_file():
             self.skipTest("writing checker is absent from the repository")
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -5406,7 +7132,7 @@ class HardWrapTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
 
     def test_wrapped_paragraph_is_reported_once(self):
         self.assertEqual(

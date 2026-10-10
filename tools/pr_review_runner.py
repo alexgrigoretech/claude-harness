@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from claude.hooks._common import hooks_home
+from tools.remote_prompt import local_environment
 
 
 PROMPT_FILE_NOTE = (
@@ -47,6 +48,7 @@ DEFAULT_REVIEWERS = [
         ),
         "stdin": True,
     },
+    {"name": "haiku", "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True},
     {"name": "kimi", "cmd": 'kimi -p "{prompt}"', "stdin": False},
 ]
 SEVERITIES = {"high", "medium", "low"}
@@ -358,9 +360,9 @@ def configured_codex_model(home=None):
         with machine_path.open(encoding="utf-8-sig") as handle:
             machine = json.load(handle)
     except (OSError, ValueError, TypeError):
-        return "gpt-5.6-sol"
+        return "gpt-6.1-sol"
     model = machine.get("codex_model") if isinstance(machine, dict) else None
-    return model.strip() if isinstance(model, str) and model.strip() else "gpt-5.6-sol"
+    return model.strip() if isinstance(model, str) and model.strip() else "gpt-6.1-sol"
 
 
 def resolve_reviewer_executable(executable):
@@ -437,6 +439,7 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
             completed = subprocess.run(
                 command,
                 input=prompt if config.get("stdin", True) else None,
+                env=local_environment(),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

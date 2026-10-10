@@ -26,11 +26,12 @@ Run these first so the questions carry defaults instead of blanks:
 git config --global user.name; git config --global user.email
 gh auth status
 codex --version
-codex exec --skip-git-repo-check -m gpt-6-astra "reply with the single word ok" < /dev/null
+codex exec --skip-git-repo-check -m gpt-6.1-sol "reply with the single word ok" < /dev/null
+codex exec --skip-git-repo-check -m gpt-5.6-sol "reply with the single word ok" < /dev/null
 python --version
 ```
 
-Run the Codex probe through the Bash tool (Git Bash), not PowerShell, because PowerShell 5.1 rejects the `< /dev/null` redirection; the `--skip-git-repo-check` flag is there because a first-run session is usually not inside a git repository. The banner prints a `model:` line. Repeat with `gpt-5.6-sol` only when the error text names the model as unknown or unavailable to this login; any other failure (login, network, shell) is reported as such and no model is recorded. Read the interpreter that runs the hooks from the hook commands in `~/.claude/settings.json`; that is the interpreter install.py must run with.
+Run the Codex probe through the Bash tool (Git Bash), not PowerShell, because PowerShell 5.1 rejects the `< /dev/null` redirection; the `--skip-git-repo-check` flag is there because a first-run session is usually not inside a git repository. Run the gpt-6.1-sol probe first and run the gpt-5.6-sol probe only if the first returns an unknown model error; record whichever answers as `codex_model` in the local json and confirm it with the provider line of the exec header. When neither answers, record no model and set `codex_first` false; report login, network or shell failures as such rather than trying the fallback. Read the interpreter that runs the hooks from the hook commands in `~/.claude/settings.json`; that is the interpreter install.py must run with.
 
 ## 3. Ask
 
@@ -61,7 +62,9 @@ Show both before writing; they are short. When the local markdown already exists
 }
 ```
 
-`codex_first` is true when Codex answered the probe and false when Codex is not used on this machine; omit `codex_model` in the false case. install.py reads the merged value: true installs the Codex-first guard hook, false leaves it out of the hook entries (the hook file is still copied). Add `"context_save_at": <tokens>` only when the person gave one. The commit-msg guard and the session context hook read `identities` from the installed `machine.json`; install.py merges this file into it.
+`codex_effort` and `claude_effort` are optional: `codex_effort` defaults to high and `claude_effort` defaults to claude-fable-5-1 medium, claude-opus-5-5 high, claude-sonnet-5-5 medium and claude-haiku-5-5 medium; set them in the local json only to override the committed machine file.
+
+`codex_first` is true when Codex answered the probe and false when Codex is not used on this machine; omit `codex_model` in the false case. install.py reads the merged `codex_first` value: true installs the Codex-first guard hook, false leaves it out of the hook entries (the hook file is still copied). The values for `codex_effort` are minimal, low, medium, high or xhigh; values in `claude_effort` are low, medium, high or xhigh. Add `"context_save_at": <tokens>` only when the person gave one. The commit-msg guard and the session context hook read `identities` from the installed `machine.json`; install.py merges this file into it.
 
 ## 5. Apply
 

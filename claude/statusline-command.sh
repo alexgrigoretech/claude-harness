@@ -46,6 +46,20 @@ done <<< "$(awk '
   }
 ' <<< "$input")"
 
+if [ -z "${ANTHROPIC_BASE_URL:-}" ] && { { [ -n "$fh_pct" ] && [ "$fh_pct" != "null" ]; } || { [ -n "$wk_pct" ] && [ "$wk_pct" != "null" ]; }; }; then
+  (
+    payload=$(printf '{"captured_at": 0, "five_hour": {"used_percentage": %s, "resets_at": %s}, "seven_day": {"used_percentage": %s, "resets_at": %s}}' \
+      "${fh_pct:-null}" "${fh_reset:-null}" "${wk_pct:-null}" "${wk_reset:-null}")
+    previous=$(sed 's/"captured_at": [0-9]*/"captured_at": 0/' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/usage-claude.json")
+    [ "$payload" = "$previous" ] && exit 0
+    mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local" &&
+    snapshot=$(mktemp "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/usage-claude.json.XXXXXX") &&
+    printf '{"captured_at": %s, "five_hour": {"used_percentage": %s, "resets_at": %s}, "seven_day": {"used_percentage": %s, "resets_at": %s}}\n' \
+      "$(date +%s)" "${fh_pct:-null}" "${fh_reset:-null}" "${wk_pct:-null}" "${wk_reset:-null}" > "$snapshot" &&
+    mv "$snapshot" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/usage-claude.json"
+  ) 2>/dev/null || true
+fi
+
 [ -n "${STATUSLINE_DEBUG:-}" ] && echo "$input" > "${HOME}/.claude/statusline-input-debug.json"
 
 DIR_C='\033[1;38;5;75m'

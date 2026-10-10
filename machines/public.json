@@ -49,7 +49,7 @@
       "PowerShell(gh pr create *)"
     ],
     "env": {
-      "CLAUDE_CODE_SUBAGENT_MODEL": "opus"
+      "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
     },
     "cleanupPeriodDays": 90,
     "autoMode_environment": null,
