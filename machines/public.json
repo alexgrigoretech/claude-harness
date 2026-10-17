@@ -40,6 +40,7 @@
       "Read(~/.ssh/id_*)",
       "Read(~/.aws/credentials)",
       "Read(~/.codex/auth.json)",
+      "Read(~/.config/muse/auth.json)",
       "Read(~/.claude/.credentials.json)"
     ],
     "permissions_ask": [

@@ -3315,6 +3315,40 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(sorted(home.rglob("*")), paths)
                 self.assertEqual({str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}, before)
 
+    def test_muse_effort_invalid_values_refused(self):
+        copied = self.copy_repo_without_local_machine_files("muse-effort-invalid-repo")
+        for index, value in enumerate(("ultra", "", [], {}, 123, False)):
+            with self.subTest(value=value):
+                home = self.new_home(f"muse-effort-invalid-{index}-home")
+                local = home / ".claude" / "local" / "machine.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(json.dumps({"muse_effort": value}), encoding="utf-8")
+                before = {str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}
+                paths = sorted(home.rglob("*"))
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(f"{local}: muse_effort must be minimal, low, medium, high, xhigh, max or null", result.stdout)
+                self.assertNotIn("ACTION ", result.stdout)
+                self.assertEqual(sorted(home.rglob("*")), paths)
+                self.assertEqual({str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}, before)
+
+    def test_muse_model_invalid_values_refused(self):
+        copied = self.copy_repo_without_local_machine_files("muse-model-invalid-repo")
+        for index, value in enumerate(("", " ", [], {}, 123, False, "muse&echo", "muse|echo", "-muse", "muse\n", "muse/model")):
+            with self.subTest(value=value):
+                home = self.new_home(f"muse-model-invalid-{index}-home")
+                local = home / ".claude" / "local" / "machine.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(json.dumps({"muse_model": value}), encoding="utf-8")
+                before = {str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}
+                paths = sorted(home.rglob("*"))
+                result = self.run_install(home, copied)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(f"{local}: muse_model must match [A-Za-z0-9][A-Za-z0-9._-]* or be null", result.stdout)
+                self.assertNotIn("ACTION ", result.stdout)
+                self.assertEqual(sorted(home.rglob("*")), paths)
+                self.assertEqual({str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}, before)
+
     def test_effort_null_disables_changes(self):
         home = self.new_home("effort-null-home")
         copied = self.copy_codex_effort_repo("effort-null-repo")
@@ -4426,7 +4460,7 @@ class InstallerTests(unittest.TestCase):
                             self.assertNotIn(name, archive.namelist())
                     instructions = archive.read("INSTALL.md").decode("utf-8")
                 first = (f"1. Clone the repository as the harness install folder named in machines/{TEST_MACHINE}.md, or unpack this folder there. Update it later with git pull; a release replaces the shared files and never touches your local files."
-                         if value else f"1. Unpack this folder as the harness install folder named in machines/{TEST_MACHINE}.md. Replace the previous folder entirely; keep nothing from it.")
+                         if value else f"1. On a first install, unpack the zip as the harness install folder named in machines/{TEST_MACHINE}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing). If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one.")
                 steps = [line for line in instructions.splitlines() if re.match(r"[1-4]\. ", line)]
                 self.assertEqual(steps[0], first)
                 self.assertIn("Bundle gate applied:", result.stdout)
@@ -4486,7 +4520,7 @@ class InstallerTests(unittest.TestCase):
                             restart += " Memories travel back with `python harvest.py --export <folder>`."
                         self.assertEqual(text, (
                             f"{header} from {commit}\n\n{record}\n\n"
-                            f"1. Unpack this folder as the harness install folder named in machines/{TEST_MACHINE}.md. Replace the previous folder entirely; keep nothing from it.\n"
+                            f"1. On a first install, unpack the zip as the harness install folder named in machines/{TEST_MACHINE}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing). If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one.\n"
                             f"2. Dry run and read every line: `python install.py --machine {TEST_MACHINE} --dry-run` (use the interpreter the machine file names; where the permission classifier blocks config edits, run the real install with the ! prefix).\n"
                             f"3. Real run: `python install.py --machine {TEST_MACHINE}`. The hook tests run last and all must pass.\n"
                             f"{restart}\n"
@@ -5546,6 +5580,488 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertFalse(bundle.exists())
 
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_zip_carries_manifest(self):
+        copied = self.copy_repo_without_local_machine_files("manifest-bundle-repo")
+        bundle = self.base / "manifest-bundle.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(bundle) as archive:
+            names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
+            manifest = archive.read("MANIFEST.txt")
+        self.assertEqual(manifest, ("\n".join(names) + "\n").encode("utf-8"))
+        directory = self.base / "manifest-bundle-directory"
+        result = self.run_bundle(copied, directory)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual((directory / "MANIFEST.txt").read_bytes(), manifest)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_has_no_manifest(self):
+        copied = self.copy_repo_without_local_machine_files("manifest-publish-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine.update(publish=True, harvest=False, plan_tools=False)
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
+            result = self.run_bundle(copied, output)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertIn("(64 files)", result.stdout)
+            if output.suffix == ".zip":
+                with zipfile.ZipFile(output) as archive:
+                    self.assertNotIn("MANIFEST.txt", archive.namelist())
+            else:
+                self.assertFalse((output / "MANIFEST.txt").exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_addon_zip_carries_manifest(self):
+        copied = self.copy_repo_without_local_machine_files("manifest-addon-repo")
+        addon = self.base / "manifest-addon.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(addon) as archive:
+            names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
+            manifest = archive.read("MANIFEST-addon-daily.txt")
+        self.assertEqual(len(names), 5)
+        self.assertEqual(manifest, ("\n".join(names) + "\n").encode("utf-8"))
+        directory = self.base / "manifest-addon-directory"
+        result = self.run_addon(copied, directory)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual((directory / "MANIFEST-addon-daily.txt").read_bytes(), manifest)
+
+    def unpack_fixture(self, name):
+        copied = self.copy_repo_without_local_machine_files(name + "-repo")
+        local_relative = f"machines/{TEST_MACHINE}.local.md"
+        (copied / local_relative).write_text("Release local fixture.\n", encoding="utf-8")
+        skill = copied / "claude" / "skills" / "unpack-probe"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("Release skill fixture.\n", encoding="utf-8")
+        first = self.base / (name + "-first.zip")
+        result = self.run_bundle(copied, first)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        target = self.base / (name + "-target")
+        with zipfile.ZipFile(first) as archive:
+            archive.extractall(target)
+            previous = archive.read("MANIFEST.txt").decode("utf-8").splitlines()
+        users = {
+            "HANDOFF-2026-01-01-x.md": b"User handoff.\n",
+            ".scratch/note.txt": b"User scratch.\n",
+            "bundles/old.zip": b"User bundle.\n",
+            "inbox/x.md": b"User inbox.\n",
+        }
+        for relative, content in users.items():
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        (target / local_relative).write_bytes(b"Edited local marker.\n")
+        shutil.rmtree(skill)
+        second = self.base / (name + "-second.zip")
+        result = self.run_bundle(copied, second)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        return target, first, second, previous, users, local_relative
+
+    def run_unpack(self, archive, target, extra=None):
+        return subprocess.run(
+            [sys.executable, str(REPO / "install.py"), "--unpack", str(archive), "--repo", str(target), *(extra or [])],
+            capture_output=True, text=True, check=False,
+        )
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_replaces_release_and_keeps_user_files(self):
+        target, first, second, previous, users, local_relative = self.unpack_fixture("unpack-release")
+        before = {relative: (target / relative).read_bytes() for relative in previous}
+        result = self.run_unpack(second, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(second) as archive:
+            manifest = archive.read("MANIFEST.txt")
+            current = manifest.decode("utf-8").splitlines()
+            local_content = archive.read(local_relative)
+            unchanged = sum(before.get(relative) == archive.read(relative) for relative in current)
+        removed = set(previous) - set(current)
+        for relative in removed:
+            self.assertFalse((target / relative).exists(), relative)
+        self.assertFalse((target / "claude/skills/unpack-probe").exists())
+        for relative, content in users.items():
+            self.assertEqual((target / relative).read_bytes(), content)
+        self.assertEqual((target / local_relative).read_bytes(), local_content)
+        backups = list((target / ".scratch").glob("unpack-backup-*/" + local_relative))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"Edited local marker.\n")
+        self.assertEqual((target / "MANIFEST.txt").read_bytes(), manifest)
+        backed_up = sum(relative.casefold().endswith(".local.md") for relative in current)
+        self.assertEqual(result.stdout.splitlines()[-1], f"unpacked {second} into {target}: {len(current) - unchanged} written, {unchanged} unchanged, {len(removed)} removed, {backed_up} backed up; next: python install.py --machine {TEST_MACHINE}")
+        others = sum(relative.split("/")[0] not in {".scratch", "bundles", "inbox"} for relative in users)
+        self.assertIn(f"kept {others} other files outside the user folders", result.stdout)
+        actions = [line for line in result.stdout.splitlines() if line.startswith("ACTION")]
+        self.assertIn(str(target / "MANIFEST.txt"), actions[-1])
+        removal_index = next(index for index, line in enumerate(actions) if "(removed)" in line)
+        self.assertFalse(any("(written)" in line for line in actions[removal_index:-1]))
+        local_mtime = (target / local_relative).stat().st_mtime_ns
+        mtimes = {relative: (target / relative).stat().st_mtime_ns for relative in current}
+        repeated = self.run_unpack(second, target)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr or repeated.stdout)
+        self.assertIn(str(target / local_relative) + "  (unchanged)", repeated.stdout)
+        self.assertIn(f"0 written, {len(current)} unchanged, 0 removed, 0 backed up", repeated.stdout.splitlines()[-1])
+        self.assertEqual((target / local_relative).stat().st_mtime_ns, local_mtime)
+        self.assertEqual({relative: (target / relative).stat().st_mtime_ns for relative in current}, mtimes)
+        self.assertEqual(list((target / ".scratch").glob("unpack-backup-*/" + local_relative)), backups)
+        repeated_dry = self.run_unpack(second, target, ["--dry-run"])
+        self.assertEqual(repeated_dry.returncode, 0, repeated_dry.stderr or repeated_dry.stdout)
+        self.assertIn("(would leave unchanged)", repeated_dry.stdout)
+        self.assertIn(f"0 written, {len(current)} unchanged, 0 removed, 0 backed up", repeated_dry.stdout.splitlines()[-1])
+        self.assertEqual({relative: (target / relative).stat().st_mtime_ns for relative in current}, mtimes)
+        protected = (
+            ".SCRATCH/retired.txt", "BuNdLeS/retired.txt", "inbox/retired.txt",
+            "transcripts/retired.txt", "data/retired.txt", "daily/retired.txt",
+            "evals/retired.txt", ".claude/retired.txt", "nested/__pycache__/retired.txt",
+            "machines/probe.local.md", "machines/probe.local.json", "nested/probe.local.json",
+            "nested/HANDOFF-retired.md", "nested/pr-review-findings.json", "auto-trail.tsv", "nested/retired.PYC",
+        )
+        dropped = ("evals/README.md", "nested/ordinary.local.md")
+        for relative in (*protected, *dropped):
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"Retired fixture.\n")
+        addon_manifest = "MANIFEST-addon-fixture.txt"
+        (target / addon_manifest).write_text("\n".join(sorted([addon_manifest, *protected, *dropped])) + "\n", encoding="utf-8")
+        addon = self.base / "unpack-protected-addon.zip"
+        with zipfile.ZipFile(addon, "w") as archive:
+            archive.writestr("ADDON.md", "Addon fixture.\n")
+            archive.writestr(addon_manifest, "ADDON.md\n" + addon_manifest + "\n")
+        result = self.run_unpack(addon, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        for relative in protected:
+            with self.subTest(protected=relative):
+                self.assertEqual((target / relative).read_bytes(), b"Retired fixture.\n")
+        for relative in dropped:
+            self.assertFalse((target / relative).exists())
+        self.assertEqual(result.stdout.count("(kept (user file))"), len(protected))
+        self.assertIn(f"{len(dropped)} removed, 0 backed up", result.stdout.splitlines()[-1])
+        self.assertEqual(list((target / ".scratch").glob("unpack-backup-*/" + local_relative)), backups)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_dry_run_writes_nothing(self):
+        target, first, second, previous, users, local_relative = self.unpack_fixture("unpack-dry")
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        for relative in ("claude/CLAUDE.md", "claude/keybindings.json"):
+            (target / relative).write_bytes(b"Old release interruption fixture.\n")
+        before = installer.tree_snapshot(target)
+        result = self.run_unpack(second, target, ["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(installer.tree_snapshot(target), before)
+        self.assertIn("(would remove)", result.stdout)
+        self.assertIn("(would back up)", result.stdout)
+        self.assertIn("(would write)", result.stdout)
+        self.assertFalse(list((target / ".scratch").glob("unpack-backup-*")))
+        visited = []
+        original_walk = os.walk
+
+        def observed_walk(root):
+            for record in original_walk(root):
+                visited.append(Path(record[0]).relative_to(target).parts)
+                yield record
+
+        with mock.patch.object(installer.os, "walk", side_effect=observed_walk), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(installer.main(["--unpack", str(second), "--repo", str(target), "--dry-run"]), 0)
+        excluded = {".git", ".scratch", "bundles", "inbox", "transcripts", "data", "daily", "__pycache__"}
+        self.assertFalse(any(parts and parts[0].casefold() in excluded for parts in visited))
+        self.assertFalse(any(part.casefold() in {".git", "__pycache__"} for parts in visited for part in parts))
+        self.assertEqual(installer.tree_snapshot(target), before)
+        replacements = []
+        original_replace = os.replace
+
+        def interrupted_replace(source, destination):
+            replacements.append(Path(destination))
+            if len(replacements) == 2:
+                raise OSError("Interrupted replacement fixture")
+            return original_replace(source, destination)
+
+        old_manifest = (target / "MANIFEST.txt").read_bytes()
+        with mock.patch.object(installer.os, "replace", side_effect=interrupted_replace), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(installer.main(["--unpack", str(second), "--repo", str(target)]), 2)
+        self.assertEqual(len(replacements), 2)
+        self.assertEqual(replacements[1].read_bytes(), before[replacements[1].relative_to(target).as_posix()])
+        self.assertEqual((target / "MANIFEST.txt").read_bytes(), old_manifest)
+        self.assertTrue((target / "claude/skills/unpack-probe/SKILL.md").is_file())
+        self.assertFalse(list(target.rglob("*.tmp")))
+        recovered = self.run_unpack(second, target)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr or recovered.stdout)
+        self.assertFalse((target / "claude/skills/unpack-probe").exists())
+
+    def test_unpack_write_file_mode_policy(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        cases = (
+            ("posix", True, 0o751, 0o100666, 0o751),
+            ("posix", True, 0o640, 0o100777, 0o640),
+            ("posix", False, 0, 0o100100, 0o751),
+            ("posix", False, 0, 0o100001, 0o751),
+            ("posix", False, 0, 0o100666, None),
+            ("posix", False, 0, 0, None),
+            ("nt", True, 0o751, 0o100777, None),
+        )
+        for platform, exists, current_mode, zip_mode, expected in cases:
+            with self.subTest(platform=platform, exists=exists, current_mode=current_mode, zip_mode=zip_mode):
+                destination = mock.Mock()
+                destination.name = "mode-fixture.txt"
+                destination.exists.return_value = exists
+                destination.stat.return_value = mock.Mock(st_mode=0o100000 | current_mode)
+                temporary = destination.with_name.return_value
+                temporary.stat.return_value = mock.Mock(st_mode=0o100640)
+                with mock.patch.object(installer.os, "name", platform), mock.patch.object(installer.os, "replace") as replace:
+                    installer.unpack_write_file(destination, b"Mode fixture.\n", zip_mode)
+                    replace.assert_called_once_with(temporary, destination)
+                temporary.write_bytes.assert_called_once_with(b"Mode fixture.\n")
+                if expected is None:
+                    temporary.chmod.assert_not_called()
+                else:
+                    temporary.chmod.assert_called_once_with(expected)
+                temporary.unlink.assert_called_once_with(missing_ok=True)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_manifest_metadata_is_lenient(self):
+        target, first, second, previous, users, local_relative = self.unpack_fixture("unpack-metadata")
+        owner = "MaNiFeSt-AdDoN-FiXtUrE.TxT"
+        owned_relative = "ordinary-owned.txt"
+        (target / owned_relative).write_bytes(b"Owned fixture.\n")
+        previous_path = target / "MANIFEST.txt"
+        previous_path.write_bytes(("\n".join([*previous, "", "../escape-previous.txt", owned_relative]) + "\n").encode("utf-8"))
+        (target / owner).write_bytes(("\n".join(["", "../escape-owner.txt", owned_relative, owned_relative, owner]) + "\n").encode("utf-8"))
+        unknown = {**users, "manifest-notes.txt": b"claude/skills/unpack-probe/SKILL.md\n"}
+        for directory in (".scratch", "bundles", "inbox", "transcripts", "data", "daily"):
+            unknown[f"{directory}/count-probe.txt"] = b"Top level user folder.\n"
+            unknown[f"project/{directory}/count-probe.txt"] = b"Nested ordinary folder.\n"
+        for relative in ("project/.git/count-probe.txt", "project/cache/__pycache__/count-probe.txt", "__pycache__/count-probe.txt"):
+            unknown[relative] = b"Excluded at every depth.\n"
+        for relative, content in unknown.items():
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        before = installer.tree_snapshot(target)
+        dry = self.run_unpack(second, target, ["--dry-run"])
+        self.assertEqual(dry.returncode, 0, dry.stderr or dry.stdout)
+        self.assertEqual(installer.tree_snapshot(target), before)
+        self.assertIn("(would read other manifest)", dry.stdout)
+        self.assertEqual(dry.stdout.count("ignoring line"), 4)
+        result = self.run_unpack(second, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        for line_number in (len(previous) + 1, len(previous) + 2):
+            self.assertIn(f"note: {previous_path}: ignoring line {line_number}", result.stdout)
+        for line_number in (1, 2):
+            self.assertIn(f"note: {target / owner}: ignoring line {line_number}", result.stdout)
+        self.assertEqual(result.stdout.count("ignoring line"), 4)
+        self.assertNotIn(str(target / "manifest-notes.txt"), result.stdout)
+        self.assertIn(f"(kept (owned by {owner}))", result.stdout)
+        self.assertEqual((target / owned_relative).read_bytes(), b"Owned fixture.\n")
+        self.assertFalse((target / "claude/skills/unpack-probe").exists())
+        for relative, content in unknown.items():
+            self.assertEqual((target / relative).read_bytes(), content)
+        excluded = {".git", ".scratch", "bundles", "inbox", "transcripts", "data", "daily", "__pycache__"}
+        others = sum(
+            relative.split("/")[0].casefold() not in excluded
+            and not any(part.casefold() in {".git", "__pycache__"} for part in relative.split("/")[:-1])
+            for relative in unknown
+        )
+        self.assertIn(f"kept {others} other files outside the user folders", result.stdout)
+        strict = self.base / "unpack-strict-manifest.zip"
+        manifest = "MANIFEST-addon-strict.txt"
+        with zipfile.ZipFile(strict, "w") as archive:
+            archive.writestr("ADDON.md", b"Addon fixture.\n")
+            archive.writestr(manifest, "\n".join(["ADDON.md", manifest, "", "../escape-zip.txt"]) + "\n")
+        before = installer.tree_snapshot(target)
+        result = self.run_unpack(strict, target)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("path outside the install folder", result.stdout)
+        self.assertEqual(installer.tree_snapshot(target), before)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    @unittest.skipIf(os.name == "nt", "executable permissions require a non Windows platform")
+    def test_unpack_preserves_posix_modes(self):
+        target = self.base / "unpack-modes-target"
+        target.mkdir()
+        (target / "install.py").write_bytes(b"Install fixture.\n")
+        existing = {"claude/statusline-command.sh": 0o751, "templates/launchd-codex-launcher.sh": 0o700}
+        for relative, mode in existing.items():
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"Old executable fixture.\n")
+            path.chmod(mode)
+        modes = {
+            "claude/statusline-command.sh": 0o100666,
+            "templates/launchd-codex-launcher.sh": 0o100777,
+            "new-executable.sh": 0o100100,
+            "new-ordinary.txt": 0o100666,
+        }
+        addon = self.base / "unpack-modes.zip"
+        manifest = "MANIFEST-addon-modes.txt"
+        with zipfile.ZipFile(addon, "w") as archive:
+            for relative, mode in modes.items():
+                info = zipfile.ZipInfo(relative)
+                info.external_attr = mode << 16
+                archive.writestr(info, b"New mode fixture.\n")
+            archive.writestr("ADDON.md", b"Addon fixture.\n")
+            archive.writestr(manifest, "\n".join(sorted([*modes, "ADDON.md", manifest])) + "\n")
+        previous_umask = os.umask(0o027)
+        try:
+            result = self.run_unpack(addon, target)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        expected = {**existing, "new-executable.sh": 0o751, "new-ordinary.txt": 0o640}
+        for relative, mode in expected.items():
+            self.assertEqual((target / relative).stat().st_mode & 0o777, mode)
+            self.assertEqual((target / relative).read_bytes(), b"New mode fixture.\n")
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_keeps_files_owned_by_addon_manifest(self):
+        copied = self.copy_repo_without_local_machine_files("unpack-owned-repo")
+        first = self.base / "unpack-owned-first.zip"
+        result = self.run_bundle(copied, first)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        addon = self.base / "unpack-owned-addon.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        target = self.base / "unpack-owned-target"
+        for bundle in (first, addon):
+            with zipfile.ZipFile(bundle) as archive:
+                archive.extractall(target)
+        relative = "tools/daily_collect.py"
+        content = (target / relative).read_bytes()
+        (copied / relative).unlink()
+        second = self.base / "unpack-owned-second.zip"
+        result = self.run_bundle(copied, second)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        result = self.run_unpack(second, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual((target / relative).read_bytes(), content)
+        self.assertIn(str(target / relative) + "  (kept (owned by MANIFEST-addon-daily.txt))", result.stdout)
+        self.assertIn("0 removed, 0 backed up", result.stdout.splitlines()[-1])
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    @unittest.skipIf(os.name == "nt", "unsafe file names require a non Windows platform")
+    def test_bundle_refuses_names_unpack_cannot_accept(self):
+        for index, filename in enumerate(("unsafe:name.md", "unsafe-name.md.")):
+            with self.subTest(filename=filename):
+                copied = self.copy_repo_without_local_machine_files(f"unpack-invalid-{index}-repo")
+                relative = "claude/skills/daily/" + filename
+                (copied / relative).write_text("Unsafe name fixture.\n", encoding="utf-8")
+                for kind, build in (("bundle", self.run_bundle), ("addon", self.run_addon)):
+                    output = self.base / f"unpack-invalid-{index}-{kind}.zip"
+                    result = build(copied, output)
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertIn(f"{relative}: name would be refused by --unpack", result.stdout)
+                    self.assertFalse(output.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_refuses_clone_zip_slip_and_missing_manifest(self):
+        target, first, second, previous, users, local_relative = self.unpack_fixture("unpack-refusal")
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        (target / ".git").mkdir()
+        before = installer.tree_snapshot(target)
+        result = self.run_unpack(second, target)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("is a git clone; update it with git pull", result.stdout)
+        self.assertEqual(installer.tree_snapshot(target), before)
+        copied = self.copy_repo_without_local_machine_files("unpack-addon-clone-repo")
+        addon = self.base / "unpack-addon-clone.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        result = self.run_unpack(addon, target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertTrue((target / "MANIFEST-addon-daily.txt").is_file())
+        self.assertTrue((target / ".git").is_dir())
+        self.assertEqual((target / "MANIFEST.txt").read_text(encoding="utf-8").splitlines(), previous)
+        self.assertTrue(result.stdout.rstrip().endswith("next: python install.py"))
+        before = installer.tree_snapshot(target)
+        for index, path in enumerate(("../escape.txt", "/escape.txt", "C:/escape.txt", r"nested\..\escape.txt", "unlisted.txt")):
+            with self.subTest(path=path):
+                unsafe = self.base / f"unpack-unsafe-{index}.zip"
+                with zipfile.ZipFile(unsafe, "w") as archive:
+                    archive.writestr("MANIFEST.txt", "MANIFEST.txt\n")
+                    archive.writestr(path, "Unsafe fixture.\n")
+                result = self.run_unpack(unsafe, target)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                message = "not in the manifest" if path == "unlisted.txt" else "path outside the install folder"
+                with zipfile.ZipFile(unsafe) as archive:
+                    entry_name = archive.infolist()[-1].filename
+                self.assertIn(f"{entry_name}: {message}", result.stdout)
+                self.assertEqual(installer.tree_snapshot(target), before)
+                self.assertFalse((target.parent / "escape.txt").exists())
+        missing = self.base / "unpack-missing.zip"
+        with zipfile.ZipFile(missing, "w") as archive:
+            archive.writestr("fixture.txt", "Legacy fixture.\n")
+        result = self.run_unpack(missing, target)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("carries no manifest; it predates the unpack step", result.stdout)
+        self.assertEqual(installer.tree_snapshot(target), before)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_unpack_without_previous_manifest_notes_and_removes_nothing(self):
+        target, first, second, previous, users, local_relative = self.unpack_fixture("unpack-legacy")
+        legacy = self.base / "unpack-legacy.zip"
+        with zipfile.ZipFile(first) as source, zipfile.ZipFile(legacy, "w") as archive:
+            for info in source.infolist():
+                if info.filename != "MANIFEST.txt":
+                    archive.writestr(info, source.read(info))
+        legacy_target = self.base / "unpack-legacy-target-no-manifest"
+        with zipfile.ZipFile(legacy) as archive:
+            archive.extractall(legacy_target)
+        result = self.run_unpack(second, legacy_target)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn(f"note: no previous manifest in {legacy_target}; files the previous release shipped and this one does not cannot be detected and stay in place", result.stdout)
+        self.assertTrue((legacy_target / "claude/skills/unpack-probe/SKILL.md").is_file())
+        self.assertIn("0 removed", result.stdout.splitlines()[-1])
+        self.assertTrue((legacy_target / "MANIFEST.txt").is_file())
+
+    def test_unpack_option_combinations_are_refused(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        for option in ("machine", "bundle", "addon", "out", "git-hooks"):
+            with self.subTest(option=option):
+                with self.assertRaisesRegex(ValueError, f"--unpack cannot be combined with --{option}"):
+                    installer.parse_args(["--unpack", "x.zip", "--" + option, "m"])
+        with self.assertRaisesRegex(ValueError, "missing value for --unpack"):
+            installer.parse_args(["--unpack"])
+        options = installer.parse_args(["--unpack", "x.zip", "--repo", str(self.base), "--dry-run"])
+        self.assertEqual(options["repo"], self.base)
+        self.assertTrue(options["dry_run"])
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_install_text_names_unpack(self):
+        copied = self.copy_repo_without_local_machine_files("unpack-text-repo")
+        bootstrap = "If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one."
+        bundle = self.base / "unpack-text-bundle.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(bundle) as archive:
+            self.assertIn("install.py --unpack", archive.read("INSTALL.md").decode("utf-8"))
+            self.assertIn(bootstrap, archive.read("INSTALL.md").decode("utf-8"))
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine["publish"] = True
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        published = self.base / "unpack-text-published.zip"
+        result = self.run_bundle(copied, published)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(published) as archive:
+            self.assertNotIn("install.py --unpack", archive.read("INSTALL.md").decode("utf-8"))
+            self.assertNotIn(bootstrap, archive.read("INSTALL.md").decode("utf-8"))
+        addon = self.base / "unpack-text-addon.zip"
+        result = self.run_addon(copied, addon)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(addon) as archive:
+            self.assertIn("install.py --unpack", archive.read("ADDON.md").decode("utf-8"))
+            self.assertNotIn(bootstrap, archive.read("ADDON.md").decode("utf-8"))
+            self.assertIn("If the install folder's install.py does not know `--unpack` yet, unzip this addon by hand this once; a harness bundle brings the newer install.py.", archive.read("ADDON.md").decode("utf-8"))
+
     def run_addon(self, copied, output, name="daily", extra=None):
         command = [
             sys.executable, str(REPO / "install.py"), "--addon", name,
@@ -5563,11 +6079,11 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("addon gate:", result.stdout)
         self.assertIn("addon written", result.stdout)
-        self.assertIn("(4 files)", result.stdout)
+        self.assertIn("(5 files)", result.stdout)
         with zipfile.ZipFile(addon) as archive:
             names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
             instructions = archive.read("ADDON.md").decode("utf-8")
-        self.assertEqual(names, ["ADDON.md", "claude/skills/daily/SKILL.md", "tools/daily_collect.py", "tools/daily_collect_test.py"])
+        self.assertEqual(names, ["ADDON.md", "MANIFEST-addon-daily.txt", "claude/skills/daily/SKILL.md", "tools/daily_collect.py", "tools/daily_collect_test.py"])
         self.assertTrue(instructions.startswith("# Daily addon\n\nBuilt "))
         self.assertIn("from an uncommitted tree.", instructions)
         fingerprint = hashlib.sha256(self.bundle_terms_file(copied).read_bytes()).hexdigest()[:8]
@@ -5576,7 +6092,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(step, instructions)
         self.assertIn('"daily": {"output": "<folder for the summaries>"}', instructions)
         self.assertIn("~/.claude/local/machine.json", instructions)
-        self.assertIn("Update: unzip a newer addon", instructions)
+        self.assertIn("Update: run `python install.py --unpack <zip>`", instructions)
         self.assertIn("Only the files listed above and this ADDON.md are written.", instructions)
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
@@ -5587,12 +6103,13 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("addon gate:", result.stdout)
         self.assertIn("addon written", result.stdout)
-        self.assertIn("(9 files)", result.stdout)
+        self.assertIn("(10 files)", result.stdout)
         with zipfile.ZipFile(addon) as archive:
             names = sorted(info.filename for info in archive.infolist() if not info.is_dir())
             instructions = archive.read("ADDON.md").decode("utf-8")
         self.assertEqual(names, sorted([
             "ADDON.md",
+            "MANIFEST-addon-usage.txt",
             "monitor/local.py",
             "monitor/local.html",
             "monitor/heartbeat.py",
@@ -5614,7 +6131,7 @@ class InstallerTests(unittest.TestCase):
         addon = self.base / "addon-dry-parent" / "addon.zip"
         result = self.run_addon(copied, addon, extra=["--dry-run"])
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertIn("addon would write {} (4 files)".format(addon), result.stdout)
+        self.assertIn("addon would write {} (5 files)".format(addon), result.stdout)
         self.assertFalse(addon.parent.exists())
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
@@ -5787,7 +6304,7 @@ class InstallerTests(unittest.TestCase):
         addon = self.base / "addon-tree"
         result = self.run_addon(copied, addon)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertEqual(len([path for path in addon.rglob("*") if path.is_file()]), 4)
+        self.assertEqual(len([path for path in addon.rglob("*") if path.is_file()]), 5)
         (skill / "bundle-terms.txt").write_text("refuse", encoding="utf-8")
         refused = self.base / "addon-tree-refused"
         result = self.run_addon(copied, refused)
@@ -6732,7 +7249,7 @@ echo %CLIPROXY_API_KEY%
         plain = self.module.bundle_install_text("probe", "date", "commit", "gate")
         self.assertNotIn("client key", plain)
         self.assertEqual(re.findall(r"^(\d+)\. (\w+)", plain, re.MULTILINE), [
-            ("1", "Unpack"), ("2", "Dry"), ("3", "Real"), ("4", "Restart"),
+            ("1", "On"), ("2", "Dry"), ("3", "Real"), ("4", "Restart"),
         ])
         self.machine["proxy"]["key_file"] = "~/client.key"
         text = self.module.bundle_install_text("probe", "date", "commit", "gate", machine=self.machine)
@@ -6741,7 +7258,7 @@ echo %CLIPROXY_API_KEY%
         self.assertIn(".claude/local/bin", text)
         self.assertIn("must precede the real binaries on PATH", text)
         self.assertEqual(re.findall(r"^(\d+)\. (\w+)", text, re.MULTILINE), [
-            ("1", "Unpack"), ("2", "Before"), ("3", "Dry"), ("4", "Real"), ("5", "Restart"),
+            ("1", "On"), ("2", "Before"), ("3", "Dry"), ("4", "Real"), ("5", "Restart"),
         ])
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle gate requires the source repository")

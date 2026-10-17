@@ -27,7 +27,7 @@ from claude.hooks._common import nudge_disabled
 USAGE = (
     "usage: python install.py [--machine NAME] [--home PATH] [--repo PATH] "
     "[--dry-run] [--no-tests] [--git-hooks REPO] [--gitleaks PATH] "
-    "[--bundle NAME] [--addon NAME] [--out PATH]"
+    "[--bundle NAME] [--addon NAME] [--out PATH] [--unpack ZIP]"
 )
 
 
@@ -42,6 +42,7 @@ def parse_args(arguments):
         "gitleaks": None,
         "bundle": None,
         "addon": None,
+        "unpack": None,
         "out": None,
     }
     index = 0
@@ -59,6 +60,7 @@ def parse_args(arguments):
             "--gitleaks",
             "--bundle",
             "--addon",
+            "--unpack",
             "--out",
         }:
             if index + 1 >= len(arguments):
@@ -72,6 +74,11 @@ def parse_args(arguments):
     options["repo"] = Path(options["repo"]).expanduser().resolve()
     if options["out"] is not None:
         options["out"] = Path(options["out"]).expanduser().resolve()
+    if options["unpack"] is not None:
+        options["unpack"] = Path(options["unpack"]).expanduser().resolve()
+        for key in ("machine", "bundle", "addon", "out", "git_hooks"):
+            if options[key] is not None:
+                raise ValueError("--unpack cannot be combined with --" + key.replace("_", "-"))
     if options["bundle"] is not None and options["git_hooks"] is not None:
         raise ValueError("--bundle cannot be combined with --git-hooks")
     if options["addon"] is not None:
@@ -134,6 +141,12 @@ def validate_gh_accounts(machine, source_for_key):
 
 
 def validate_machine_efforts(machine, source_for_key):
+    muse_effort = machine.get("muse_effort")
+    if muse_effort is not None and muse_effort not in ("minimal", "low", "medium", "high", "xhigh", "max"):
+        raise ValueError(f"{source_for_key('muse_effort')}: muse_effort must be minimal, low, medium, high, xhigh, max or null")
+    muse_model = machine.get("muse_model")
+    if muse_model is not None and (not isinstance(muse_model, str) or re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", muse_model) is None):
+        raise ValueError(f"{source_for_key('muse_model')}: muse_model must match [A-Za-z0-9][A-Za-z0-9._-]* or be null")
     allowed = ("low", "medium", "high", "xhigh")
     codex = machine.get("codex_effort")
     if codex is not None and codex not in ("minimal", "low", "medium", "high", "xhigh"):
@@ -1523,7 +1536,8 @@ def all_bundle_terms(home, repo=None, report=None, *, details=None):
 
 def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publish=False, machine=None):
     heading = f"# Harness bundle for {name}, built {date} from {commit}\n\n{gate_record}\n\n"
-    first = f"1. Unpack this folder as the harness install folder named in machines/{name}.md. Replace the previous folder entirely; keep nothing from it."
+    first = f"1. On a first install, unpack the zip as the harness install folder named in machines/{name}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing)."
+    first += " If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one."
     restart = "4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files."
     if publish:
         heading = f"# Harness bundle for {name}, built {date}\n\n"
@@ -1627,7 +1641,9 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
             add(source, Path("machines") / source.name)
     commit = bundle_commit(repo)
     entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, publish=publish, machine=machine).encode("utf-8")
-    return sorted(entries.items())
+    if not publish:
+        entries["MANIFEST.txt"] = ("\n".join(sorted([*entries, "MANIFEST.txt"])) + "\n").encode("utf-8")
+    return unpack_build_entries(entries, repo)
 
 
 def gate_fragment(value):
@@ -1896,14 +1912,17 @@ def build_bundle(options):
 
 def addon_install_text(name, date, commit, gate_record):
     addon = ADDONS[name]
+    steps = list(addon["steps"])
+    steps[0] += " On every later update, run `python install.py --unpack <zip>` from the install folder, which also works on a clone of the public repository, writes the shipped files, removes files the previous addon shipped and this one does not, and keeps everything else (local machine files are backed up under `.scratch/` before replacing)."
+    steps[0] += " If the install folder's install.py does not know `--unpack` yet, unzip this addon by hand this once; a harness bundle brings the newer install.py."
     return (
         "# {} addon\n\n".format(name.title())
         + "Built {} from {}. {}\n\n".format(date, commit, addon["description"])
-        + "Files:\n{}\n\n".format("\n".join(addon["paths"]))
+        + "Files:\n{}\n\n".format("\n".join([*addon["paths"], "MANIFEST-addon-{}.txt".format(name)]))
         + gate_record + "\n\n"
         + "Install, on a machine that already runs the harness (a bundle install or a clone of the public repository):\n\n"
-        + "\n".join(addon["steps"]) + "\n\n"
-        + "Update: unzip a newer addon over the same folder and run install.py again. Remove: delete the listed files from the install folder and `~/.claude/skills/{}/`.\n".format(name)
+        + "\n".join(steps) + "\n\n"
+        + "Update: run `python install.py --unpack <zip>` from the install folder and run install.py again. Remove: delete the listed files from the install folder and `~/.claude/skills/{}/`.\n".format(name)
     )
 
 
@@ -1939,7 +1958,9 @@ def build_addon(options):
             else:
                 add(source, relative)
         entries["ADDON.md"] = addon_install_text(name, date, bundle_commit(options["repo"]), gate_record).encode("utf-8")
-        entries = sorted(entries.items())
+        manifest = "MANIFEST-addon-{}.txt".format(name)
+        entries[manifest] = ("\n".join(sorted([*entries, manifest])) + "\n").encode("utf-8")
+        entries = unpack_build_entries(entries, options["repo"])
     except (OSError, ValueError) as exc:
         print("addon refused: {}".format(exc))
         return 2
@@ -2253,10 +2274,269 @@ def install(options):
     return 0
 
 
+def unpack_build_entries(entries, repo):
+    result = sorted(entries.items())
+    for relative, content in result:
+        try:
+            unpack_relative(relative, repo.resolve())
+        except BundleRefusal as exc:
+            raise BundleRefusal(f"{relative}: name would be refused by --unpack") from exc
+    return result
+
+
+def unpack_relative(name, target):
+    from tools.project_bundle import check_ancestors, safe_relative
+
+    try:
+        relative = safe_relative(name.replace("\\", "/"))
+        destination = target / relative
+        check_ancestors(destination, root=target)
+    except ValueError as exc:
+        raise BundleRefusal(f"{name}: path outside the install folder") from exc
+    if not destination.resolve().is_relative_to(target):
+        raise BundleRefusal(f"{name}: path outside the install folder")
+    return relative.as_posix()
+
+
+def unpack_manifest_name(name):
+    return re.fullmatch(r"MANIFEST(?:-addon-[^/]+)?[.]txt", name.replace("\\", "/"), re.IGNORECASE)
+
+
+def unpack_manifest(content, target, *, source=None, dry_run=False):
+    paths = {}
+    for line_number, line in enumerate(content.splitlines(), 1):
+        try:
+            relative = unpack_relative(line, target)
+        except BundleRefusal:
+            if source is None:
+                raise
+            print(("would " if dry_run else "") + f"note: {source}: ignoring line {line_number}")
+            continue
+        key = relative.casefold()
+        if key in paths and source is None:
+            raise BundleRefusal(f"{relative}: duplicate path in the manifest")
+        paths[key] = relative
+    return paths
+
+
+def unpack_user_file(relative):
+    normalized = relative.casefold()
+    parts = normalized.split("/")
+    filename = parts[-1]
+    return (
+        parts[0] in {".scratch", "bundles", "inbox", "transcripts", "data", "daily", ".claude"}
+        or (parts[0] == "evals" and normalized != "evals/readme.md")
+        or "__pycache__" in parts[:-1]
+        or (len(parts) == 2 and parts[0] == "machines" and filename.endswith(".local.md"))
+        or filename.endswith((".local.json", ".pyc"))
+        or (filename.startswith("handoff-") and filename.endswith(".md"))
+        or filename in {"pr-review-findings.json", "auto-trail.tsv"}
+    )
+
+
+def unpack_write_file(destination, content, mode):
+    existing_mode = stat.S_IMODE(destination.stat().st_mode) if os.name != "nt" and destination.exists() else None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + "." + str(os.getpid()) + ".tmp")
+    try:
+        temporary.write_bytes(content)
+        if os.name != "nt":
+            if existing_mode is not None:
+                temporary.chmod(existing_mode)
+            elif mode & 0o111:
+                temporary.chmod(stat.S_IMODE(temporary.stat().st_mode) | 0o111)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def unpack_release_files(installer, entries, previous, manifest, archive_path, next_command, action):
+    target = installer.repo
+    dry_run = installer.dry_run
+    owners = {}
+    for path in sorted(target.iterdir()):
+        filename = path.name.casefold()
+        if unpack_manifest_name(path.name) and filename != manifest.casefold() and path.is_file():
+            owned = unpack_manifest(path.read_text(encoding="utf-8"), target, source=path, dry_run=dry_run)
+            for key in owned:
+                owners.setdefault(key, path.name)
+            action(path, "read other manifest")
+    known = set(entries) | set(previous) | set(owners)
+    others = 0
+    excluded = {".git", ".scratch", "bundles", "inbox", "transcripts", "data", "daily", "__pycache__"}
+    for directory, dirnames, filenames in os.walk(target):
+        dirnames[:] = [
+            name for name in dirnames if name.casefold() not in {".git", "__pycache__"}
+            and (Path(directory) / name).relative_to(target).parts[0].casefold() not in excluded
+        ]
+        for filename in filenames:
+            path = Path(directory) / filename
+            if path.is_file() and path.relative_to(target).as_posix().casefold() not in known:
+                others += 1
+    removals = []
+    kept = []
+    for key in sorted(set(previous) - set(entries)):
+        relative = previous[key]
+        destination = target / relative
+        if key in owners:
+            kept.append((destination, f"kept (owned by {owners[key]})"))
+        elif unpack_user_file(relative):
+            kept.append((destination, "kept (user file)"))
+        elif destination.exists():
+            if not destination.is_file():
+                raise BundleRefusal(f"{relative}: previous manifest path is not a file")
+            removals.append(destination)
+    backups = []
+    unchanged = set()
+    for key, (relative, content, mode) in entries.items():
+        destination = target / relative
+        if destination.exists() and not destination.is_file():
+            raise BundleRefusal(f"{relative}: destination is not a file")
+        for parent in destination.parents:
+            if parent == target:
+                break
+            if parent.is_file() or parent.relative_to(target).as_posix().casefold() in entries:
+                raise BundleRefusal(f"{relative}: parent is not a directory")
+        if destination.is_file():
+            if destination.read_bytes() == content:
+                unchanged.add(key)
+            elif unpack_user_file(relative):
+                backups.append(relative)
+    stamp = datetime.datetime.now()
+    backup_root = target / ".scratch" / ("unpack-backup-" + stamp.strftime("%Y%m%d-%H%M%S"))
+    while backup_root.exists():
+        stamp += datetime.timedelta(seconds=1)
+        backup_root = target / ".scratch" / ("unpack-backup-" + stamp.strftime("%Y%m%d-%H%M%S"))
+    for relative in backups:
+        unpack_relative((backup_root.relative_to(target) / relative).as_posix(), target)
+        if (target / ".scratch").is_file():
+            raise BundleRefusal(".scratch: backup parent is not a directory")
+    def write_entry(key):
+        relative, content, mode = entries[key]
+        destination = target / relative
+        if key in unchanged:
+            action(destination, "unchanged")
+            return
+        if relative in backups:
+            backup = backup_root / relative
+            action(destination, "backed up", str(backup))
+            if not dry_run:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destination, backup)
+        if not dry_run:
+            unpack_write_file(destination, content, mode)
+        action(destination, "written")
+
+    for key in sorted(set(entries) - {manifest.casefold()}):
+        write_entry(key)
+    for destination, status in kept:
+        action(destination, status)
+    for destination in removals:
+        action(destination, "removed")
+        if not dry_run:
+            destination.unlink()
+    parents = {parent for path in removals for parent in path.parents if parent != target and parent.is_relative_to(target)}
+    removed_paths = set(removals)
+    for parent in sorted(parents, key=lambda path: (-len(path.parts), str(path))):
+        if any((target / entry[0]).is_relative_to(parent) for entry in entries.values()):
+            continue
+        if parent.is_dir() and all(child in removed_paths for child in parent.iterdir()):
+            action(parent, "removed empty directory")
+            if not dry_run:
+                parent.rmdir()
+            removed_paths.add(parent)
+    print(("would keep" if dry_run else "kept") + f" {others} other files outside the user folders")
+    write_entry(manifest.casefold())
+    print(("would unpack" if dry_run else "unpacked") + f" {archive_path} into {target}: {len(entries) - len(unchanged)} written, {len(unchanged)} unchanged, {len(removals)} removed, {len(backups)} backed up; next: {next_command}")
+    return 0
+
+
+def unpack_bundle(options):
+    import zipfile
+
+    archive_path = options["unpack"]
+    target = options["repo"]
+    dry_run = options["dry_run"]
+    installer = Installer(target, target, dry_run)
+
+    def action(path, status, detail=None):
+        if dry_run:
+            if status.startswith("kept (owned by "):
+                status = "keep" + status[4:]
+            status = "would " + {
+                "validated": "validate", "checked": "check", "written": "write",
+                "removed": "remove", "removed empty directory": "remove empty directory",
+                "backed up": "back up", "kept (user file)": "keep (user file)",
+                "unchanged": "leave unchanged", "read other manifest": "read other manifest",
+            }.get(status, status)
+        installer.action(path, status, detail)
+
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            manifests = [
+                info for info in archive.infolist()
+                if not info.is_dir() and unpack_manifest_name(info.filename)
+            ]
+            if len(manifests) != 1:
+                raise BundleRefusal(f"{archive_path} carries no manifest; it predates the unpack step, unzip it by hand once and later updates can use --unpack")
+            manifest = unpack_relative(manifests[0].filename, target)
+            current = unpack_manifest(archive.read(manifests[0]).decode("utf-8"), target)
+            entries = {}
+            for info in archive.infolist():
+                directory = info.is_dir() or info.filename.endswith("\\")
+                relative = unpack_relative(info.filename[:-1] if directory else info.filename, target)
+                key = relative.casefold()
+                if directory:
+                    if not any(path.startswith(key + "/") for path in current):
+                        raise BundleRefusal(f"{info.filename}: not in the manifest")
+                    continue
+                if key not in current:
+                    raise BundleRefusal(f"{info.filename}: not in the manifest")
+                if key in entries:
+                    raise BundleRefusal(f"{info.filename}: duplicate path in the zip")
+                entries[key] = (relative, archive.read(info), info.external_attr >> 16)
+            if set(entries) != set(current):
+                missing = sorted(set(current) - set(entries))[0]
+                raise BundleRefusal(f"{current[missing]}: not in the zip")
+        action(archive_path, "validated")
+        bundle = manifest.casefold() == "manifest.txt"
+        if bundle and (target / ".git").exists():
+            raise BundleRefusal(f"{target} is a git clone; update it with git pull")
+        if not (target / "install.py").is_file():
+            raise BundleRefusal(f"{target} holds no install.py; a first install unzips the bundle by hand")
+        if bundle and not (target / "INSTALL.md").is_file():
+            raise BundleRefusal(f"{target} holds no INSTALL.md; a first install unzips the bundle by hand")
+        next_command = "python install.py"
+        if bundle:
+            instructions = entries.get("install.md")
+            heading = re.match(r"# Harness bundle for ([^,\r\n]+), built ", instructions[1].decode("utf-8")) if instructions else None
+            if heading is None:
+                raise BundleRefusal("INSTALL.md: missing bundle heading")
+            next_command += " --machine " + heading.group(1)
+        action(target, "checked")
+        previous_path = target / manifest
+        if previous_path.is_file():
+            previous = unpack_manifest(previous_path.read_text(encoding="utf-8"), target, source=previous_path, dry_run=dry_run)
+            action(previous_path, "read previous manifest")
+        else:
+            previous = {}
+            print(("would " if dry_run else "") + f"note: no previous manifest in {target}; files the previous release shipped and this one does not cannot be detected and stay in place")
+        return unpack_release_files(installer, entries, previous, manifest, archive_path, next_command, action)
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+        if isinstance(exc, BundleRefusal):
+            raise
+        raise BundleRefusal(f"{archive_path}: {exc}") from exc
+
+
 def main(arguments=None):
     try:
         options = parse_args(sys.argv[1:] if arguments is None else arguments)
+        if options["unpack"] is not None:
+            return unpack_bundle(options)
         return install(options)
+    except BundleRefusal as exc:
+        print(f"unpack refused: {exc}")
+        return 2
     except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         print(USAGE, file=sys.stderr)

@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from claude.hooks._common import hooks_home
+from tools.muse_llm import MUSE_EFFORTS, MUSE_MODEL_PATTERN, find_muse
 from tools.remote_prompt import local_environment
 
 
@@ -50,6 +51,20 @@ DEFAULT_REVIEWERS = [
     },
     {"name": "haiku", "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True},
     {"name": "kimi", "cmd": 'kimi -p "{prompt}"', "stdin": False},
+    {
+        "name": "muse",
+        "cmd": subprocess.list2cmdline(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("muse_llm.py")),
+                "--model",
+                "{muse_model}",
+                "--effort",
+                "{muse_effort}",
+            ]
+        ),
+        "stdin": True,
+    },
 ]
 SEVERITIES = {"high", "medium", "low"}
 
@@ -110,15 +125,20 @@ def load_reviewer_configs(overrides=None, home=None):
     base = Path(home) if home is not None else hooks_home()
     machine_path = base / ".claude" / "local" / "machine.json"
     configured = None
+    client = False
+    unreadable = False
     if machine_path.is_file():
         try:
             with machine_path.open(encoding="utf-8-sig") as handle:
                 machine = json.load(handle)
             value = machine.get("pr_review_reviewers") if isinstance(machine, dict) else None
+            client = isinstance(machine, dict) and machine.get("client") is True
             if isinstance(value, list) and value:
                 configured = value
         except (OSError, ValueError, TypeError):
             configured = None
+            client = True
+            unreadable = True
 
     source = configured if configured is not None else DEFAULT_REVIEWERS
     reviewers = {}
@@ -136,6 +156,21 @@ def load_reviewer_configs(overrides=None, home=None):
         }
     for item in overrides or []:
         reviewers[item["name"]] = dict(item)
+    if configured is None and "muse" in reviewers and not any(
+        item["name"] == "muse" for item in overrides or []
+    ):
+        message = None
+        if client:
+            message = (
+                "pr-review: muse skipped (machine.json unreadable)"
+                if unreadable
+                else "pr-review: muse skipped (client machine, no diff leaves the machine)"
+            )
+        elif not find_muse():
+            message = "pr-review: muse skipped (Muse Code not installed)"
+        if message is not None:
+            reviewers.pop("muse")
+            print(message, file=sys.stderr)
     return reviewers
 
 
@@ -353,16 +388,35 @@ def extract_findings(text):
     raise ValueError("reviewer output does not contain a JSON findings array")
 
 
-def configured_codex_model(home=None):
+def configured_machine_value(key, default, home=None):
     base = Path(home) if home is not None else hooks_home()
     machine_path = base / ".claude" / "local" / "machine.json"
     try:
         with machine_path.open(encoding="utf-8-sig") as handle:
             machine = json.load(handle)
     except (OSError, ValueError, TypeError):
-        return "gpt-6.1-sol"
-    model = machine.get("codex_model") if isinstance(machine, dict) else None
-    return model.strip() if isinstance(model, str) and model.strip() else "gpt-6.1-sol"
+        return default
+    value = machine.get(key) if isinstance(machine, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return default
+    if key == "muse_model" and re.fullmatch(MUSE_MODEL_PATTERN, value) is None:
+        return default
+    value = value.strip()
+    if key == "muse_effort" and value not in MUSE_EFFORTS:
+        return default
+    return value
+
+
+def configured_codex_model(home=None):
+    return configured_machine_value("codex_model", "gpt-6.1-sol", home)
+
+
+def configured_muse_model(home=None):
+    return configured_machine_value("muse_model", "muse-wonder-full-1.0", home)
+
+
+def configured_muse_effort(home=None):
+    return configured_machine_value("muse_effort", "medium", home)
 
 
 def resolve_reviewer_executable(executable):
@@ -404,10 +458,14 @@ def prepare_command(config, prompt, repo=None, home=None, output_file=None):
         Path(output_file).resolve().as_posix() if output_file is not None else "{output_file}"
     )
     codex_model = configured_codex_model(home) if "{codex_model}" in config["cmd"] else ""
+    muse_model = configured_muse_model(home) if "{muse_model}" in config["cmd"] else ""
+    muse_effort = configured_muse_effort(home) if "{muse_effort}" in config["cmd"] else ""
     prepared = [
         token.replace("{prompt_file_note}", PROMPT_FILE_NOTE)
         .replace("{repo}", repo_path)
         .replace("{codex_model}", codex_model)
+        .replace("{muse_model}", muse_model)
+        .replace("{muse_effort}", muse_effort)
         .replace("{output_file}", output_path)
         .replace("{prompt}", prompt)
         for token in tokens
