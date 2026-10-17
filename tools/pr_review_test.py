@@ -1,18 +1,22 @@
 import contextlib
+import csv
 import datetime
 import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import agy_llm
+import kimi_llm
 import muse_llm
 import pr_review_runner as runner
 import pr_review_score as scorer
@@ -52,6 +56,9 @@ class PRReviewTest(unittest.TestCase):
         muse_lookup = mock.patch.object(runner, "find_muse", return_value="muse")
         muse_lookup.start()
         self.addCleanup(muse_lookup.stop)
+        kimi_lookup = mock.patch.object(runner, "find_kimi", return_value="kimi")
+        kimi_lookup.start()
+        self.addCleanup(kimi_lookup.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.home = self.root / "home"
@@ -198,6 +205,90 @@ class PRReviewTest(unittest.TestCase):
             launcher.chmod(0o755)
         return launcher
 
+    def write_fake_kimi(self, mode, lines, exit_code=0, delay=0, sessions=(), stderr=""):
+        capture = self.root / f"{mode}.argv.json"
+        script = self.write_fake(
+            f"{mode}.py",
+            textwrap.dedent(
+                f"""
+                import json
+                import os
+                import sys
+                import time
+                from pathlib import Path
+
+                with open({str(capture)!r}, "w", encoding="utf-8") as handle:
+                    json.dump({{
+                        "arguments": sys.argv[1:],
+                        "cwd": os.getcwd(),
+                        "entries": os.listdir(),
+                        "prompt": Path("review.txt").read_text(encoding="utf-8"),
+                        "agent": Path("agent.md").read_text(encoding="utf-8"),
+                    }}, handle)
+                for entry in {list(sessions)!r}:
+                    if entry["workDir"] is None:
+                        entry["workDir"] = os.getcwd()
+                    session = Path(entry["sessionDir"])
+                    session.mkdir(parents=True, exist_ok=True)
+                    (session / "wire.jsonl").write_text("private prompt", encoding="utf-8")
+                    index = Path(os.environ["CLAUDE_HOOKS_HOME"]) / ".kimi-code" / "session_index.jsonl"
+                    with index.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(entry) + "\\n")
+                print({stderr!r}, file=sys.stderr)
+                time.sleep({delay!r})
+                for line in {list(lines)!r}:
+                    print(line)
+                raise SystemExit({exit_code!r})
+                """
+            ).lstrip(),
+        )
+        if os.name == "nt":
+            launcher = self.root / f"{mode}.cmd"
+            command = subprocess.list2cmdline([sys.executable, str(script)])
+            launcher.write_text(f"@echo off\n{command} %*\n", encoding="utf-8")
+        else:
+            launcher = self.root / f"{mode}.sh"
+            command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+            launcher.write_text(f"#!/bin/sh\nexec {command} \"$@\"\n", encoding="utf-8")
+            launcher.chmod(0o755)
+        return launcher
+
+    def write_hanging_reviewer(self, mode, pid_file):
+        script = self.write_fake(
+            f"{mode}.py",
+            textwrap.dedent(
+                f"""
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+                Path({str(pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
+                time.sleep(60)
+                """
+            ).lstrip(),
+        )
+        if os.name == "nt":
+            launcher = self.root / f"{mode}.cmd"
+            command = subprocess.list2cmdline([sys.executable, str(script)])
+            launcher.write_text(f"@echo off\n{command} %*\n", encoding="utf-8")
+        else:
+            launcher = self.root / f"{mode}.sh"
+            command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+            launcher.write_text(f"#!/bin/sh\nexec {command} \"$@\"\n", encoding="utf-8")
+            launcher.chmod(0o755)
+        return launcher
+
+    def run_kimi(self, fake, prompt="Review this: caf\u00e9", *arguments):
+        stdin = io.StringIO(prompt)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_HOOKS_HOME": str(self.home)}), mock.patch.object(sys, "stdin", stdin):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = kimi_llm.main(["--kimi", str(fake), *arguments])
+        return code, stdout.getvalue(), stderr.getvalue()
+
     def run_muse(self, fake, prompt="Review this: caf\u00e9", *arguments):
         stdin = io.StringIO(prompt)
         stdout = io.StringIO()
@@ -242,6 +333,54 @@ class PRReviewTest(unittest.TestCase):
         if include_failure:
             arguments.extend(["--reviewer", f"failed={self.command(self.failed)}"])
         return arguments
+
+    def test_runner_timeout_flag_is_a_positive_integer(self):
+        self.assertEqual(runner.build_parser().parse_args([]).timeout, 600)
+        self.assertEqual(runner.build_parser().parse_args(["--timeout", "123"]).timeout, 123)
+        for value in ("0", "-1", "1.5", "invalid"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    runner.build_parser().parse_args(["--timeout", value])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_runner_passes_timeout_to_reviewers(self):
+        for value, expected in ((None, 600), (123, 123)):
+            with self.subTest(value=value):
+                arguments = [
+                    "--repo", str(self.root), "--diff", str(self.diff),
+                    "--reviewers", "plain", *self.reviewer_arguments(False),
+                ]
+                if value is not None:
+                    arguments.extend(["--timeout", str(value)])
+                result = runner.ReviewerRun("plain", "ok", 0.0, [])
+                with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+                    with mock.patch.object(runner, "read_body", return_value=""):
+                        code, _, stderr = self.run_main(runner.main, arguments)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(run.call_args.kwargs["timeout"], expected)
+
+    def test_prepare_command_passes_reviewer_timeout_with_headroom(self):
+        for name in ("kimi", "muse"):
+            config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == name)
+            for timeout, expected in ((600, "570"), (40, "30"), (30, "30"), (1, "30")):
+                with self.subTest(name=name, timeout=timeout):
+                    command = runner.prepare_command(config, "prompt", home=self.home, timeout=timeout)
+                    self.assertEqual(command[command.index("--timeout") + 1], expected)
+            command = runner.prepare_command(config, "prompt", home=self.home)
+            self.assertEqual(command[command.index("--timeout") + 1], "270")
+
+    def test_run_reviewer_passes_timeout_to_wrapper_command(self):
+        for name in ("kimi", "muse"):
+            config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == name)
+            for timeout, expected in ((600, "570"), (40, "30")):
+                with self.subTest(name=name, timeout=timeout):
+                    completed = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+                    with mock.patch.object(runner.subprocess, "run", return_value=completed) as run:
+                        result = runner.run_reviewer(config, "prompt", timeout=timeout, home=self.home)
+                    self.assertEqual(result.status, "ok", result.error)
+                    command = run.call_args.args[0]
+                    self.assertEqual(command[command.index("--timeout") + 1], expected)
+                    self.assertEqual(run.call_args.kwargs["timeout"], timeout)
 
     def test_runner_dedupes_wrapped_and_plain_findings(self):
         output = self.root / "findings.json"
@@ -568,7 +707,7 @@ class PRReviewTest(unittest.TestCase):
         )
 
     def test_prepare_command_substitutes_prompt_last(self):
-        prompt = "keep {repo}, {codex_model}, and {output_file} unchanged"
+        prompt = "keep {repo}, {codex_model}, {output_file}, and {reviewer_timeout} unchanged"
         config = {"cmd": self.command(self.plain) + ' "{prompt}"'}
         command = runner.prepare_command(config, prompt, repo=self.root)
         self.assertEqual(command[-1], prompt)
@@ -850,12 +989,619 @@ class PRReviewTest(unittest.TestCase):
         self.assertIn("agy timed out after 0.01 s", stderr)
 
 
+    def test_default_kimi_reviewer(self):
+        config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "kimi")
+        self.assertTrue(config["stdin"])
+        self.assertEqual(runner.command_tokens(config["cmd"]), [
+            sys.executable, str(Path(runner.__file__).with_name("kimi_llm.py")),
+            "--model", "{kimi_model}", "--timeout", "{reviewer_timeout}",
+        ])
+        self.assertEqual([item["name"] for item in runner.DEFAULT_REVIEWERS], ["agy", "codex", "haiku", "kimi", "muse"])
+
+    def test_kimi_wrapper_reuses_muse_helpers(self):
+        from tools import muse_llm as shared_muse
+
+        for name in ("_find_on_path", "is_client_machine", "run_prompt"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(kimi_llm, name), getattr(shared_muse, name))
+
+    def test_kimi_wrapper_runs_as_script_from_tools_directory(self):
+        fake = self.write_fake_kimi("kimi_tools_directory", ['{"role":"assistant","content":"PONG"}'])
+        script = Path(kimi_llm.__file__).resolve()
+        result = subprocess.run(
+            [sys.executable, str(script), "--kimi", str(fake), "--raw"],
+            cwd=script.parent,
+            env={**os.environ, "CLAUDE_HOOKS_HOME": str(self.home), "PYTHONPATH": ""},
+            input="Reply with PONG.",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "PONG")
+        self.assertEqual(result.stderr, "")
+
+    def test_prepare_command_uses_configured_kimi_model(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        path = local / "machine.json"
+        config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "kimi")
+        self.assertEqual(runner.configured_kimi_model(self.home), "kimi-code/kimi-for-coding")
+        for value in ("kimi-code/another-model", "Model_1.0-test", "0"):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"kimi_model": value}), encoding="utf-8")
+                command = runner.prepare_command(config, "prompt", home=self.home)
+                self.assertEqual(command[command.index("--model") + 1], value)
+        for value in (None, [], 123, "", " ", "kimi&echo", "-kimi", "kimi\n", " kimi"):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"kimi_model": value}), encoding="utf-8")
+                self.assertEqual(runner.configured_kimi_model(self.home), "kimi-code/kimi-for-coding")
+        with mock.patch.object(runner, "configured_kimi_model") as model:
+            runner.prepare_command({"cmd": self.command(self.plain)}, "{kimi_model}", home=self.home)
+        model.assert_not_called()
+
+    def test_client_machine_skips_default_kimi_reviewer(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        (local / "machine.json").write_text(json.dumps({"client": True}), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(runner, "find_kimi") as find, contextlib.redirect_stderr(stderr):
+            configs = runner.load_reviewer_configs(home=self.home)
+        self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+        self.assertIn("pr-review: kimi skipped (client machine, no diff leaves the machine)", stderr.getvalue())
+        find.assert_not_called()
+
+    def test_explicit_kimi_reviewer_bypasses_default_gate(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        override = runner.parse_override(f"kimi={self.command(self.plain)}")
+        for machine, overrides in (
+            ({"client": True}, [override]),
+            ({"client": True, "pr_review_reviewers": [override]}, []),
+        ):
+            with self.subTest(machine=machine):
+                (local / "machine.json").write_text(json.dumps(machine), encoding="utf-8")
+                with mock.patch.object(runner, "find_kimi", return_value=None) as find:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        configs = runner.load_reviewer_configs(overrides, home=self.home)
+                self.assertEqual(configs["kimi"], override)
+                find.assert_not_called()
+
+    def test_missing_kimi_executable_skips_default_reviewer(self):
+        environment = {"PATH": "", "APPDATA": str(self.root / "empty-app-data")}
+        stderr = io.StringIO()
+        with mock.patch.object(runner, "find_kimi", side_effect=kimi_llm.find_kimi):
+            with mock.patch.dict(os.environ, environment), contextlib.redirect_stderr(stderr):
+                configs = runner.load_reviewer_configs(home=self.home)
+        self.assertEqual(list(configs), ["agy", "codex", "haiku", "muse"])
+        self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (Kimi Code not installed)\n")
+
+    def test_kimi_prices_are_zero(self):
+        self.assertEqual(scorer.DEFAULT_PRICES["kimi"], (0.0, 0.0))
+        self.assertEqual(scorer.review_cost(None, scorer.DEFAULT_PRICES["kimi"]), 0.0)
+
+    def test_kimi_wrapper_writes_prompt_file_and_read_only_agent(self):
+        prompt = "Review this: caf\u00e9\n" + "private prompt " * 5000
+        fake = self.write_fake_kimi("kimi_files", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, prompt)
+        self.assertEqual(code, 0, stderr)
+        envelope = json.loads(stdout)
+        self.assertEqual(envelope["response"], "PONG")
+        self.assertEqual(envelope["usage"], {})
+        self.assertEqual(envelope["model"], "kimi-code/kimi-for-coding")
+        self.assertGreaterEqual(envelope["duration_seconds"], 0)
+        runtime = json.loads((self.root / "kimi_files.argv.json").read_text(encoding="utf-8"))
+        self.assertEqual(runtime["arguments"], [
+            "--agent-file", "agent.md", "-m", "kimi-code/kimi-for-coding", "-p",
+            "Read review.txt in the current directory and follow its instructions. Reply with the answer only.",
+            "--output-format", "stream-json",
+        ])
+        self.assertEqual(set(runtime["entries"]), {"review.txt", "agent.md"})
+        self.assertEqual(runtime["prompt"], prompt)
+        self.assertEqual(runtime["agent"], "---\nname: review-reader\ndescription: Read-only reviewer\ntools:\n  - Read\n---\nYou have one tool, Read. Read the file named in the prompt, then answer with exactly the output format that file asks for and nothing else.\n")
+        self.assertFalse({"--yolo", "--auto", "--plan"}.intersection(runtime["arguments"]))
+        self.assertNotIn(prompt, runtime["arguments"])
+        self.assertNotEqual(Path(runtime["cwd"]), Path.cwd())
+        self.assertFalse(Path(runtime["cwd"]).exists())
+        self.assertEqual(stderr, "")
+
+    def test_kimi_wrapper_envelope_parses_into_findings(self):
+        lines = [json.dumps({"role": "assistant", "content": json.dumps(FINDINGS)})]
+        fake = self.write_fake_kimi("kimi_findings", lines)
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "test/model")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["model"], "test/model")
+        findings, usage = runner.extract_findings(stdout)
+        self.assertEqual(findings, FINDINGS)
+        self.assertIsNone(usage)
+        config = {
+            "name": "kimi", "stdin": True,
+            "cmd": self.command(Path(kimi_llm.__file__)) + " --kimi " + subprocess.list2cmdline([str(fake)]),
+        }
+        with mock.patch.dict(os.environ, {"CLAUDE_HOOKS_HOME": str(self.home)}):
+            result = runner.run_reviewer(config, "prompt", home=self.home)
+        self.assertEqual(result.status, "ok", result.error)
+        self.assertEqual(result.findings, FINDINGS)
+
+    def test_kimi_wrapper_reports_missing_assistant_line(self):
+        lines = [
+            '{"role":"meta","type":"system.version","version":"2.2.0"}',
+            '{"role":"user","content":"PRIVATE_PROMPT_TEST_MARKER"}',
+            '{"role":"assistant","content":"","tool_calls":[{"name":"Read"}]}',
+            'error: PRIVATE_PROMPT_TEST_MARKER',
+        ]
+        for exit_code in (0, 1):
+            with self.subTest(exit_code=exit_code):
+                fake = self.write_fake_kimi("kimi_missing", lines, exit_code=exit_code, stderr="failure " + "x" * 500)
+                code, stdout, stderr = self.run_kimi(fake)
+                self.assertEqual(code, 5)
+                self.assertEqual(stdout, "")
+                self.assertIn("kimi returned no assistant line", stderr)
+                self.assertIn('roles: ["assistant", "meta", "user"]', stderr)
+                self.assertIn('types: ["system.version"]', stderr)
+                self.assertIn("stderr: failure " + "x" * 392, stderr)
+                self.assertNotIn("x" * 393, stderr)
+                self.assertNotIn("PRIVATE_PROMPT_TEST_MARKER", stderr)
+
+    def test_kimi_wrapper_reports_nonzero_exit_after_answer(self):
+        fake = self.write_fake_kimi("kimi_nonzero", ['{"role":"assistant","content":"PONG"}'], exit_code=9)
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 7)
+        self.assertEqual(stdout, "")
+        self.assertIn("kimi exited with code 9", stderr)
+
+    def test_kimi_wrapper_times_out(self):
+        fake = self.write_fake_kimi("kimi_timeout", [], delay=0.2)
+        with mock.patch.object(kimi_llm, "cleanup_sessions") as cleanup:
+            code, stdout, stderr = self.run_kimi(fake, "prompt", "--timeout", "0.01")
+        self.assertEqual(code, 4)
+        self.assertEqual(stdout, "")
+        self.assertIn("kimi timed out after 0.01 s", stderr)
+        cleanup.assert_called_once()
+
+    def test_wrapper_timeouts_kill_sleeping_children(self):
+        if os.name == "nt":
+            probe = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {os.getpid()}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, errors="replace", timeout=5, check=False,
+            )
+            if probe.returncode != 0:
+                self.skipTest(f"tasklist is unavailable: {probe.stderr.strip()}")
+
+        def child_is_running(pid):
+            if os.name == "nt":
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, errors="replace", timeout=5, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return any(len(row) > 1 and row[1] == str(pid) for row in csv.reader(result.stdout.splitlines()))
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        for name, run_wrapper in (("kimi", self.run_kimi), ("muse", self.run_muse)):
+            with self.subTest(wrapper=name):
+                pid_file = self.root / f"{name}-child.pid"
+                fake = self.write_hanging_reviewer(f"{name}_child_timeout", pid_file)
+                try:
+                    started = time.monotonic()
+                    code, stdout, stderr = run_wrapper(fake, "prompt", "--timeout", "1")
+                    duration = time.monotonic() - started
+                    self.assertEqual(code, 4, stderr)
+                    self.assertEqual(stdout, "")
+                    self.assertIn(f"{name} timed out after 1 s", stderr)
+                    self.assertLess(duration, 6)
+                    self.assertTrue(pid_file.is_file(), "the fake must spawn a child before timing out")
+                    child_pid = int(pid_file.read_text(encoding="utf-8"))
+                    deadline = time.monotonic() + 3
+                    while child_is_running(child_pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertFalse(child_is_running(child_pid), f"child {child_pid} survived the timeout")
+                    if os.name != "nt":
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(child_pid, 0)
+                finally:
+                    if pid_file.is_file():
+                        child_pid = int(pid_file.read_text(encoding="utf-8"))
+                        if child_is_running(child_pid):
+                            if os.name == "nt":
+                                subprocess.run(
+                                    ["taskkill", "/T", "/F", "/PID", str(child_pid)],
+                                    capture_output=True, timeout=10, check=False,
+                                )
+                            else:
+                                try:
+                                    os.kill(child_pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+
+    def test_wrapper_timeout_survives_cleanup_and_drain_failures(self):
+        for name, run_wrapper in (("kimi", self.run_kimi), ("muse", self.run_muse)):
+            with self.subTest(wrapper=name):
+                process = mock.Mock(pid=12345)
+                process.communicate.side_effect = subprocess.TimeoutExpired("fake", 1)
+                fake = self.write_fake_muse(f"{name}_drain_timeout", [])
+                with mock.patch.object(muse_llm.subprocess, "Popen", return_value=process):
+                    with mock.patch.object(muse_llm.subprocess, "run", side_effect=OSError("kill failed")) as kill:
+                        with mock.patch.object(os, "getpgid", return_value=12345, create=True):
+                            with mock.patch.object(os, "killpg", side_effect=OSError("kill failed"), create=True):
+                                code, stdout, stderr = run_wrapper(fake, "prompt", "--timeout", "1")
+                self.assertEqual((code, stdout), (4, ""))
+                self.assertEqual(stderr, f"{name} timed out after 1 s\n")
+                self.assertEqual(process.communicate.call_args_list, [mock.call(timeout=1), mock.call(timeout=10)])
+                if os.name == "nt":
+                    kill.assert_called_once_with(
+                        ["taskkill", "/T", "/F", "/PID", "12345"],
+                        capture_output=True, check=False, timeout=10,
+                    )
+
+    def test_run_prompt_kills_posix_process_group(self):
+        process = mock.Mock(pid=12345, returncode=-9)
+        process.communicate.side_effect = [subprocess.TimeoutExpired("fake", 1), ("", "")]
+        with mock.patch.object(muse_llm.subprocess, "Popen", return_value=process) as launch:
+            with mock.patch.object(os, "getpgid", return_value=12345, create=True) as group:
+                with mock.patch.object(os, "killpg", create=True) as kill:
+                    with mock.patch.object(signal, "SIGKILL", 9, create=True):
+                        with mock.patch.object(os, "name", "posix"):
+                            with self.assertRaises(subprocess.TimeoutExpired):
+                                muse_llm.run_prompt(["fake"], 1, "fake-directory")
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+        group.assert_called_once_with(12345)
+        kill.assert_called_once_with(12345, 9)
+        self.assertEqual(process.communicate.call_args_list, [mock.call(timeout=1), mock.call(timeout=10)])
+
+    def test_kimi_wrapper_preserves_answer_before_trailing_empty_messages(self):
+        lines = [
+            '{"role":"assistant","content":"PONG"}',
+            '{"role":"assistant","content":"","tool_calls":[{}]}',
+            '{"role":"assistant","content":""}',
+        ]
+        fake = self.write_fake_kimi("kimi_trailing_empty", lines)
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--raw")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "PONG")
+        self.assertEqual(kimi_llm.parse_events("\n".join(lines))[0], "PONG")
+
+    def test_kimi_wrapper_raw_output_and_no_preamble(self):
+        fake = self.write_fake_kimi("kimi_raw", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--raw", "--no-preamble")
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, "PONG")
+        self.assertIn("no-preamble is ignored", stderr)
+
+    def test_kimi_wrapper_reports_empty_response(self):
+        for content in ("", " \n"):
+            with self.subTest(content=content):
+                fake = self.write_fake_kimi("kimi_empty", [json.dumps({"role": "assistant", "content": content})])
+                code, stdout, stderr = self.run_kimi(fake)
+                self.assertEqual(code, 6)
+                self.assertEqual(stdout, "")
+                self.assertIn("kimi returned an empty response", stderr)
+
+    def test_kimi_events_use_last_answer_and_resume_hint(self):
+        lines = ["not json", "[]", "null", '{"role":"assistant","content":17}',
+                 '{"role":"assistant","content":"first"}',
+                 '{"role":"assistant","content":"last"}',
+                 '{"role":"assistant","content":"","tool_calls":[{}]}',
+                 '{"role":"assistant","content":"","tool_calls":[]}',
+                 '{"role":"meta","type":"session.resume_hint","session_id":"test-session"}']
+        response, session_id, roles, types = kimi_llm.parse_events("\n".join(lines))
+        self.assertEqual(response, "last")
+        self.assertEqual(session_id, "test-session")
+        self.assertEqual(roles, {"assistant", "meta"})
+        self.assertEqual(types, {"session.resume_hint"})
+
+    def test_kimi_wrapper_client_gate(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        path = local / "machine.json"
+        fake = self.write_fake_kimi("kimi_gate", ['{"role":"assistant","content":"PONG"}'])
+        for content, reason in ((json.dumps({"client": True}), "client machine"),
+                                ("not json", "machine.json unreadable"),
+                                ("[]", "machine.json unreadable")):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                with mock.patch.object(kimi_llm, "find_kimi") as find:
+                    code, stdout, stderr = self.run_kimi(fake)
+                self.assertEqual(code, 8)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, f"kimi refused: {reason}, nothing leaves this machine\n")
+                find.assert_not_called()
+                code, stdout, stderr = self.run_kimi(fake, "prompt", "--allow-client", "--raw")
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(stdout, "PONG")
+        with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+            code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 8)
+        self.assertIn("machine.json unreadable", stderr)
+
+    def test_kimi_wrapper_missing_and_non_client_machine_proceed(self):
+        fake = self.write_fake_kimi("kimi_personal", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        for machine in ({}, {"client": False}, {"client": "true"}):
+            with self.subTest(machine=machine):
+                (local / "machine.json").write_text(json.dumps(machine), encoding="utf-8")
+                code, stdout, stderr = self.run_kimi(fake)
+                self.assertEqual(code, 0, stderr)
+
+    def test_kimi_wrapper_reports_empty_stdin_and_missing_executable(self):
+        missing = self.root / "missing-kimi"
+        code, stdout, stderr = self.run_kimi(missing, "")
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "prompt on stdin is empty\n")
+        code, stdout, stderr = self.run_kimi(missing)
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "kimi was not found. Install it with: npm install -g @moonshot-ai/kimi-code\n")
+
+    def test_kimi_wrapper_reports_start_failure(self):
+        fake = self.write_fake_kimi("kimi_start", [])
+        with mock.patch.object(kimi_llm.subprocess, "Popen", side_effect=OSError("cannot start")):
+            code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 5)
+        self.assertEqual(stdout, "")
+        self.assertIn("kimi could not be started: cannot start", stderr)
+
+    def test_kimi_wrapper_defaults_and_model_validation(self):
+        args = kimi_llm.parser().parse_args([])
+        self.assertEqual(args.timeout, 540)
+        self.assertEqual(args.model, "kimi-code/kimi-for-coding")
+        self.assertFalse(hasattr(args, "effort"))
+        for value in ("kimi-code/kimi-for-coding", "Model_1.0-test", "0"):
+            self.assertEqual(kimi_llm.parser().parse_args(["--model", value]).model, value)
+        for value in ("", "kimi&echo", "kimi|echo", "kimi model", "-kimi", "kimi\n", " kimi"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    kimi_llm.parser().parse_args(["--model", value])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_kimi_wrapper_removes_own_session(self):
+        sessions = self.home / ".kimi-code" / "sessions"
+        own = sessions / "wd_own" / "own-session"
+        hinted = sessions / "wd_hinted" / "hinted-session"
+        other = sessions / "wd_other" / "other-session"
+        retained = {"sessionId": "other-session", "sessionDir": str(other), "workDir": str(self.root / "other")}
+        records = [
+            {"sessionId": "own-session", "sessionDir": str(own), "workDir": None},
+            {"sessionId": "hinted-session", "sessionDir": str(hinted), "workDir": str(self.root / "alias")},
+            retained,
+        ]
+        lines = ['{"role":"assistant","content":"PONG"}',
+                 '{"role":"meta","type":"session.resume_hint","session_id":"hinted-session"}']
+        fake = self.write_fake_kimi("kimi_sessions", lines, sessions=records)
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertFalse(own.parent.exists())
+        self.assertFalse(hinted.parent.exists())
+        self.assertTrue((other / "wire.jsonl").exists())
+        index = self.home / ".kimi-code" / "session_index.jsonl"
+        self.assertEqual(index.read_text(encoding="utf-8"), json.dumps(retained) + "\n")
+        self.assertEqual(sorted(item.name for item in index.parent.iterdir()), ["session_index.jsonl", "sessions"])
+
+    def test_kimi_wrapper_skips_index_rewrite_when_lock_is_held(self):
+        base = self.home / ".kimi-code"
+        base.mkdir()
+        lock = base / "session_index.jsonl.lock"
+        lock.write_text("held", encoding="utf-8")
+        session = base / "sessions" / "wd_locked" / "locked-session"
+        records = [{"sessionId": "locked-session", "sessionDir": str(session), "workDir": None}]
+        fake = self.write_fake_kimi("kimi_held_lock", ['{"role":"assistant","content":"PONG"}'], sessions=records)
+        with mock.patch.object(kimi_llm.os, "replace") as replace:
+            code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertFalse(session.parent.exists())
+        self.assertEqual(lock.read_text(encoding="utf-8"), "held")
+        entries = (base / "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(json.loads(entries[0])["sessionId"], "locked-session")
+        self.assertEqual(stderr.count("kimi session cleanup warning:"), 1)
+        self.assertIn("index rewrite skipped", stderr)
+        replace.assert_not_called()
+
+    def test_kimi_wrapper_takes_stale_session_index_lock(self):
+        base = self.home / ".kimi-code"
+        base.mkdir()
+        lock = base / "session_index.jsonl.lock"
+        lock.write_text("stale", encoding="utf-8")
+        stale = time.time() - 90
+        os.utime(lock, (stale, stale))
+        session = base / "sessions" / "wd_stale" / "stale-session"
+        records = [{"sessionId": "stale-session", "sessionDir": str(session), "workDir": None}]
+        fake = self.write_fake_kimi("kimi_stale_lock", ['{"role":"assistant","content":"PONG"}'], sessions=records)
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertEqual(stderr, "")
+        self.assertFalse(session.parent.exists())
+        self.assertFalse(lock.exists())
+        self.assertEqual((base / "session_index.jsonl").read_bytes(), b"")
+
+    def test_kimi_session_index_lock_retries_at_point_two_seconds(self):
+        lock = self.root / "session_index.jsonl.lock"
+        lock.write_text("held", encoding="utf-8")
+        with mock.patch.object(kimi_llm.time, "monotonic", side_effect=[0, 0, 5]):
+            with mock.patch.object(kimi_llm.time, "sleep") as sleep:
+                with self.assertRaises(TimeoutError):
+                    kimi_llm._acquire_session_lock(lock)
+        sleep.assert_called_once_with(0.2)
+        self.assertEqual(lock.read_text(encoding="utf-8"), "held")
+
+    def test_kimi_wrapper_preserves_malformed_index_lines(self):
+        base = self.home / ".kimi-code"
+        session = base / "sessions" / "wd_garbage" / "test-session"
+        session.mkdir(parents=True)
+        outside = self.root / "outside-session"
+        outside.mkdir()
+        index = base / "session_index.jsonl"
+        prefix = 'garbage before\r\n[]\nnull\r\n{"sessionId":"test-session"}\n'
+        suffix = '\r\nfalse\n{"sessionId":"test-session","sessionDir":null}\r\n'
+        suffix += json.dumps({"sessionId": "test-session", "sessionDir": "bad\x00path"}) + "\n"
+        suffix += json.dumps({"sessionId": "test-session", "sessionDir": str(outside)}) + "\n"
+        suffix += "garbage after\r\n"
+        entry = {"sessionId": "test-session", "sessionDir": str(session), "workDir": str(self.root)}
+        index.write_bytes((prefix + json.dumps(entry) + "\n" + suffix).encode("utf-8"))
+        lines = ['{"role":"assistant","content":"PONG"}',
+                 '{"role":"meta","type":"session.resume_hint","session_id":"test-session"}']
+        fake = self.write_fake_kimi("kimi_garbage_index", lines)
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertEqual(stderr, "")
+        self.assertFalse(session.parent.exists())
+        self.assertTrue(outside.is_dir())
+        self.assertEqual(index.read_bytes(), (prefix + suffix).encode("utf-8"))
+        self.assertFalse(index.with_name(index.name + ".lock").exists())
+
+    def test_kimi_wrapper_cleans_temp_and_lock_after_replace_failure(self):
+        base = self.home / ".kimi-code"
+        session = base / "sessions" / "wd_replace" / "test-session"
+        session.mkdir(parents=True)
+        index = base / "session_index.jsonl"
+        lock = base / "session_index.jsonl.lock"
+        entry = {"sessionId": "test-session", "sessionDir": str(session), "workDir": str(self.root)}
+        original = (json.dumps(entry) + "\n").encode("utf-8")
+        index.write_bytes(original)
+        lines = ['{"role":"assistant","content":"PONG"}',
+                 '{"role":"meta","type":"session.resume_hint","session_id":"test-session"}']
+        fake = self.write_fake_kimi("kimi_replace_failure", lines)
+
+        def fail_replace(source, destination):
+            self.assertTrue(lock.is_file())
+            self.assertEqual(Path(source).parent, base)
+            self.assertEqual(destination, index)
+            raise PermissionError("index is held open")
+
+        with mock.patch.object(kimi_llm.os, "replace", side_effect=fail_replace) as replace:
+            code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertFalse(session.parent.exists())
+        self.assertEqual(index.read_bytes(), original)
+        self.assertEqual(stderr.count("kimi session cleanup warning:"), 1)
+        self.assertIn("index is held open", stderr)
+        self.assertFalse(Path(replace.call_args.args[0]).exists())
+        self.assertEqual(sorted(path.name for path in base.iterdir()), ["session_index.jsonl", "sessions"])
+
+    def test_kimi_events_accept_text_parts_and_ignore_empty_parts(self):
+        parts = [
+            {"type": "text", "text": "PO"},
+            {"type": "image", "text": "ignored"},
+            {"type": "text", "text": 17},
+            {"text": "ignored"},
+            "ignored",
+            None,
+            {"type": "text", "text": "NG"},
+        ]
+        lines = [json.dumps({"role": "assistant", "content": parts}),
+                 json.dumps({"role": "assistant", "content": [{"type": "image"}]}),
+                 json.dumps({"role": "assistant", "content": []}),
+                 '{"role":"assistant","content":""}']
+        self.assertEqual(kimi_llm.parse_events("\n".join(lines))[0], "PONG")
+        fake = self.write_fake_kimi("kimi_text_parts", lines)
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--raw")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "PONG")
+
+    def test_kimi_wrapper_tolerates_unreadable_session_index(self):
+        index = self.home / ".kimi-code" / "session_index.jsonl"
+        index.mkdir(parents=True)
+        for lines, expected in ((['{"role":"assistant","content":"PONG"}'], 0), ([], 5)):
+            with self.subTest(expected=expected):
+                fake = self.write_fake_kimi("kimi_bad_index", lines)
+                code, stdout, stderr = self.run_kimi(fake)
+                self.assertEqual(code, expected)
+                self.assertEqual(stderr.count("kimi session cleanup warning:"), 1)
+        index.rmdir()
+        index.write_text("not json\n", encoding="utf-8")
+        code, stdout, stderr = self.run_kimi(fake)
+        self.assertEqual(code, 5)
+        self.assertEqual(stderr.count("kimi session cleanup warning:"), 0)
+
+    @unittest.skipUnless(os.name == "nt", "Windows session path comparison")
+    def test_kimi_session_cleanup_compares_resolved_windows_paths(self):
+        session = self.home / ".kimi-code" / "sessions" / "wd_case" / "session"
+        session.mkdir(parents=True)
+        index = self.home / ".kimi-code" / "session_index.jsonl"
+        entry = {"sessionId": "case-session", "sessionDir": str(session), "workDir": str(self.root).upper()}
+        index.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"CLAUDE_HOOKS_HOME": str(self.home)}):
+            kimi_llm.cleanup_sessions(self.root / "child" / "..")
+        self.assertFalse(session.parent.exists())
+        self.assertEqual(index.read_text(encoding="utf-8"), "")
+
+    def test_unreadable_machine_drops_both_default_subscription_reviewers(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        path = local / "machine.json"
+        for content in ("not json", "[]", "null"):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    configs = runner.load_reviewer_configs(home=self.home)
+                self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+                self.assertEqual(stderr.getvalue().count("machine.json unreadable"), 2)
+        stderr = io.StringIO()
+        with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+            with contextlib.redirect_stderr(stderr):
+                configs = runner.load_reviewer_configs(home=self.home)
+        self.assertNotIn("kimi", configs)
+        self.assertNotIn("muse", configs)
+        self.assertEqual(stderr.getvalue().count("machine.json unreadable"), 2)
+
+    def test_find_kimi_skips_current_directory_and_honours_path(self):
+        current = self.root / "current"
+        directory = self.root / "path"
+        current.mkdir()
+        directory.mkdir()
+        name = "kimi.cmd" if os.name == "nt" else "kimi"
+        for parent in (current, directory):
+            executable = parent / name
+            executable.write_text("", encoding="utf-8")
+            executable.chmod(0o755)
+        previous = Path.cwd()
+        try:
+            os.chdir(current)
+            environment = {
+                "PATH": os.pathsep.join([".", str(current), str(directory)]),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "APPDATA": str(self.root / "no-app-data"),
+            }
+            with mock.patch.dict(os.environ, environment):
+                self.assertEqual(Path(kimi_llm.find_kimi()), directory / name)
+                self.assertEqual(Path(kimi_llm.find_kimi("kimi")), directory / name)
+                self.assertEqual(Path(kimi_llm.find_kimi("./" + name)), current / name)
+                self.assertIsNone(kimi_llm.find_kimi(str(current / "missing")))
+        finally:
+            os.chdir(previous)
+
+    @unittest.skipUnless(os.name == "nt", "Windows install fallback")
+    def test_find_kimi_uses_windows_install_fallback(self):
+        app_data = self.root / "app-data"
+        executable = app_data / "npm" / "kimi.cmd"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"PATH": "", "APPDATA": str(app_data)}):
+            self.assertEqual(Path(kimi_llm.find_kimi()), executable)
+            self.assertIsNone(kimi_llm.find_kimi("missing-kimi"))
+
     def test_default_muse_reviewer(self):
         config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "muse")
         self.assertTrue(config["stdin"])
         self.assertEqual(runner.command_tokens(config["cmd"]), [
             sys.executable, str(Path(runner.__file__).with_name("muse_llm.py")),
             "--model", "{muse_model}", "--effort", "{muse_effort}",
+            "--timeout", "{reviewer_timeout}",
         ])
         self.assertEqual(runner.DEFAULT_REVIEWERS[-1], config)
 
@@ -931,8 +1677,8 @@ class PRReviewTest(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             configs = runner.load_reviewer_configs(home=self.home)
-        self.assertEqual(list(configs), ["agy", "codex", "haiku", "kimi"])
-        self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (client machine, no diff leaves the machine)\n")
+        self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+        self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (client machine, no diff leaves the machine)\npr-review: kimi skipped (client machine, no diff leaves the machine)\n")
 
     def test_client_machine_keeps_explicit_muse_reviewer(self):
         local = self.home / ".claude" / "local"
@@ -949,7 +1695,7 @@ class PRReviewTest(unittest.TestCase):
                 with contextlib.redirect_stderr(stderr):
                     configs = runner.load_reviewer_configs(overrides, home=self.home)
                 self.assertEqual(configs["muse"], override)
-                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (client machine, no diff leaves the machine)\n" if overrides else "")
 
     def test_unreadable_machine_skips_default_muse_reviewer(self):
         local = self.home / ".claude" / "local"
@@ -961,14 +1707,14 @@ class PRReviewTest(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     configs = runner.load_reviewer_configs(home=self.home)
-                self.assertEqual(list(configs), ["agy", "codex", "haiku", "kimi"])
-                self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (machine.json unreadable)\n")
+                self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+                self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (machine.json unreadable)\npr-review: kimi skipped (machine.json unreadable)\n")
         override = runner.parse_override(f"muse={self.command(self.plain)}")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             configs = runner.load_reviewer_configs([override], home=self.home)
         self.assertEqual(configs["muse"], override)
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (machine.json unreadable)\n")
 
     def test_missing_machine_keeps_default_muse_reviewer(self):
         stderr = io.StringIO()
@@ -1004,7 +1750,7 @@ class PRReviewTest(unittest.TestCase):
     def test_muse_skip_message_requires_removed_entry(self):
         local = self.home / ".claude" / "local"
         local.mkdir(parents=True)
-        defaults = [item for item in runner.DEFAULT_REVIEWERS if item["name"] != "muse"]
+        defaults = [item for item in runner.DEFAULT_REVIEWERS if item["name"] not in {"muse", "kimi"}]
         for client in (True, False):
             with self.subTest(client=client):
                 (local / "machine.json").write_text(json.dumps({"client": client}), encoding="utf-8")
@@ -1199,11 +1945,19 @@ class PRReviewTest(unittest.TestCase):
         choices = next(action.choices for action in muse_llm.parser()._actions if action.dest == "effort")
         self.assertIs(choices, muse_llm.MUSE_EFFORTS)
         fake = self.write_fake_muse("muse_default_timeout", MUSE_FIXTURE_LINES)
-        completed = subprocess.CompletedProcess([], 0, stdout="\n".join(MUSE_FIXTURE_LINES), stderr="")
-        with mock.patch.object(muse_llm.subprocess, "run", return_value=completed) as run:
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("\n".join(MUSE_FIXTURE_LINES), "")
+        with mock.patch.object(muse_llm.subprocess, "Popen", return_value=process) as launch:
             code, _, stderr = self.run_muse(fake)
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(run.call_args.kwargs["timeout"], 240)
+        process.communicate.assert_called_once_with(timeout=240)
+        self.assertEqual(launch.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(launch.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.PIPE)
+        if os.name == "nt":
+            self.assertEqual(launch.call_args.kwargs["creationflags"], subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            self.assertTrue(launch.call_args.kwargs["start_new_session"])
 
     def test_muse_wrapper_rejects_invalid_model_ids(self):
         fake = self.write_fake_muse("muse_invalid_model", MUSE_FIXTURE_LINES)
@@ -1308,7 +2062,7 @@ class PRReviewTest(unittest.TestCase):
 
     def test_muse_wrapper_reports_start_failure(self):
         fake = self.write_fake_muse("muse_start_failure", MUSE_FIXTURE_LINES)
-        with mock.patch.object(muse_llm.subprocess, "run", side_effect=OSError("cannot start")):
+        with mock.patch.object(muse_llm.subprocess, "Popen", side_effect=OSError("cannot start")):
             code, stdout, stderr = self.run_muse(fake)
         self.assertEqual((code, stdout), (5, ""))
         self.assertIn("muse could not be started: cannot start", stderr)

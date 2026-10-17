@@ -41,6 +41,7 @@
       "Read(~/.aws/credentials)",
       "Read(~/.codex/auth.json)",
       "Read(~/.config/muse/auth.json)",
+      "Read(~/.kimi-code/credentials/*)",
       "Read(~/.claude/.credentials.json)"
     ],
     "permissions_ask": [

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -101,6 +102,46 @@ def parse_events(stdout):
         elif isinstance(payload_type, str) and payload_type.startswith("run.terminal."):
             terminal = payload
     return model, "".join(chunks), terminal, payload_types
+
+
+def run_prompt(command, timeout, work_directory):
+    options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=work_directory,
+        **options,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            process.communicate(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def is_client_machine():
@@ -210,17 +251,7 @@ def main(argv=None):
                 str(prompt_file),
             ]
             started = time.monotonic()
-            completed = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=args.timeout,
-                cwd=work_directory,
-            )
+            completed = run_prompt(command, args.timeout, work_directory)
             duration = time.monotonic() - started
     except subprocess.TimeoutExpired:
         print(f"muse timed out after {args.timeout:g} s", file=sys.stderr)

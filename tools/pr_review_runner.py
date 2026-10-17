@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from claude.hooks._common import hooks_home
+from tools.kimi_llm import KIMI_MODEL_PATTERN, find_kimi
 from tools.muse_llm import MUSE_EFFORTS, MUSE_MODEL_PATTERN, find_muse
 from tools.remote_prompt import local_environment
 
@@ -50,7 +51,20 @@ DEFAULT_REVIEWERS = [
         "stdin": True,
     },
     {"name": "haiku", "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True},
-    {"name": "kimi", "cmd": 'kimi -p "{prompt}"', "stdin": False},
+    {
+        "name": "kimi",
+        "cmd": subprocess.list2cmdline(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("kimi_llm.py")),
+                "--model",
+                "{kimi_model}",
+                "--timeout",
+                "{reviewer_timeout}",
+            ]
+        ),
+        "stdin": True,
+    },
     {
         "name": "muse",
         "cmd": subprocess.list2cmdline(
@@ -61,6 +75,8 @@ DEFAULT_REVIEWERS = [
                 "{muse_model}",
                 "--effort",
                 "{muse_effort}",
+                "--timeout",
+                "{reviewer_timeout}",
             ]
         ),
         "stdin": True,
@@ -127,18 +143,20 @@ def load_reviewer_configs(overrides=None, home=None):
     configured = None
     client = False
     unreadable = False
-    if machine_path.is_file():
-        try:
-            with machine_path.open(encoding="utf-8-sig") as handle:
-                machine = json.load(handle)
-            value = machine.get("pr_review_reviewers") if isinstance(machine, dict) else None
-            client = isinstance(machine, dict) and machine.get("client") is True
-            if isinstance(value, list) and value:
-                configured = value
-        except (OSError, ValueError, TypeError):
-            configured = None
-            client = True
-            unreadable = True
+    try:
+        with machine_path.open(encoding="utf-8-sig") as handle:
+            machine = json.load(handle)
+        if not isinstance(machine, dict):
+            raise ValueError("machine.json unreadable")
+        value = machine.get("pr_review_reviewers")
+        client = machine.get("client") is True
+        if isinstance(value, list) and value:
+            configured = value
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        client = True
+        unreadable = True
 
     source = configured if configured is not None else DEFAULT_REVIEWERS
     reviewers = {}
@@ -156,20 +174,25 @@ def load_reviewer_configs(overrides=None, home=None):
         }
     for item in overrides or []:
         reviewers[item["name"]] = dict(item)
-    if configured is None and "muse" in reviewers and not any(
-        item["name"] == "muse" for item in overrides or []
+    for name, find_executable, cli_name in (
+        ("muse", find_muse, "Muse Code"),
+        ("kimi", find_kimi, "Kimi Code"),
     ):
+        if configured is not None or name not in reviewers or any(
+            item["name"] == name for item in overrides or []
+        ):
+            continue
         message = None
         if client:
             message = (
-                "pr-review: muse skipped (machine.json unreadable)"
+                f"pr-review: {name} skipped (machine.json unreadable)"
                 if unreadable
-                else "pr-review: muse skipped (client machine, no diff leaves the machine)"
+                else f"pr-review: {name} skipped (client machine, no diff leaves the machine)"
             )
-        elif not find_muse():
-            message = "pr-review: muse skipped (Muse Code not installed)"
+        elif not find_executable():
+            message = f"pr-review: {name} skipped ({cli_name} not installed)"
         if message is not None:
-            reviewers.pop("muse")
+            reviewers.pop(name)
             print(message, file=sys.stderr)
     return reviewers
 
@@ -401,6 +424,8 @@ def configured_machine_value(key, default, home=None):
         return default
     if key == "muse_model" and re.fullmatch(MUSE_MODEL_PATTERN, value) is None:
         return default
+    if key == "kimi_model" and re.fullmatch(KIMI_MODEL_PATTERN, value) is None:
+        return default
     value = value.strip()
     if key == "muse_effort" and value not in MUSE_EFFORTS:
         return default
@@ -417,6 +442,10 @@ def configured_muse_model(home=None):
 
 def configured_muse_effort(home=None):
     return configured_machine_value("muse_effort", "medium", home)
+
+
+def configured_kimi_model(home=None):
+    return configured_machine_value("kimi_model", "kimi-code/kimi-for-coding", home)
 
 
 def resolve_reviewer_executable(executable):
@@ -451,7 +480,7 @@ def resolve_reviewer_executable(executable):
     return None
 
 
-def prepare_command(config, prompt, repo=None, home=None, output_file=None):
+def prepare_command(config, prompt, repo=None, home=None, output_file=None, timeout=300):
     tokens = command_tokens(config["cmd"])
     repo_path = Path(repo if repo is not None else ".").resolve().as_posix()
     output_path = (
@@ -459,13 +488,16 @@ def prepare_command(config, prompt, repo=None, home=None, output_file=None):
     )
     codex_model = configured_codex_model(home) if "{codex_model}" in config["cmd"] else ""
     muse_model = configured_muse_model(home) if "{muse_model}" in config["cmd"] else ""
+    kimi_model = configured_kimi_model(home) if "{kimi_model}" in config["cmd"] else ""
     muse_effort = configured_muse_effort(home) if "{muse_effort}" in config["cmd"] else ""
     prepared = [
         token.replace("{prompt_file_note}", PROMPT_FILE_NOTE)
         .replace("{repo}", repo_path)
         .replace("{codex_model}", codex_model)
         .replace("{muse_model}", muse_model)
+        .replace("{kimi_model}", kimi_model)
         .replace("{muse_effort}", muse_effort)
+        .replace("{reviewer_timeout}", str(max(30, timeout - 30)))
         .replace("{output_file}", output_path)
         .replace("{prompt}", prompt)
         for token in tokens
@@ -481,7 +513,7 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
             output_directory = stack.enter_context(tempfile.TemporaryDirectory())
             output_file = Path(output_directory) / "last-message.txt"
         command = prepare_command(
-            config, prompt, repo=repo, home=home, output_file=output_file
+            config, prompt, repo=repo, home=home, output_file=output_file, timeout=timeout
         )
         if command[0] is None:
             executable = command_tokens(config["cmd"])[0]
@@ -634,6 +666,7 @@ def build_parser():
     parser.add_argument("--reviewers")
     parser.add_argument("--reviewer", action="append", default=[], type=parse_override)
     parser.add_argument("--out")
+    parser.add_argument("--timeout", type=positive_integer, default=600)
     parser.add_argument("--max-diff-bytes", type=positive_integer, default=400000)
     return parser
 
@@ -661,7 +694,7 @@ def main(argv=None):
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"PR review failed: could not build the prompt: {exc}", file=sys.stderr)
             return 1
-        runs.extend(run_reviewers(prompt, selected, repo=repo))
+        runs.extend(run_reviewers(prompt, selected, timeout=args.timeout, repo=repo))
     document = result_document(args.base, runs)
     output = Path(args.out) if args.out else repo / "pr-review-findings.json"
     if not output.is_absolute():

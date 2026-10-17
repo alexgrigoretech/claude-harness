@@ -3349,6 +3349,18 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(sorted(home.rglob("*")), paths)
                 self.assertEqual({str(path.relative_to(home)): path.read_bytes() for path in home.rglob("*") if path.is_file()}, before)
 
+    def test_kimi_model_validation(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            source = home / ".claude" / "local" / "machine.local.json"
+            for value in (None, "kimi-code/kimi-for-coding", "Model_1.0-test", "0"):
+                with self.subTest(value=value):
+                    module.validate_machine_efforts({"kimi_model": value}, lambda key: source)
+            for value in ("", " ", [], {}, 123, False, "kimi&echo", "kimi|echo", "-kimi", "kimi\n", " kimi"):
+                with self.subTest(value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        module.validate_machine_efforts({"kimi_model": value}, lambda key: source)
+                    self.assertEqual(str(caught.exception), f"{source}: kimi_model must match [A-Za-z0-9][A-Za-z0-9._/-]* or be null")
+
     def test_effort_null_disables_changes(self):
         home = self.new_home("effort-null-home")
         copied = self.copy_codex_effort_repo("effort-null-repo")
@@ -5605,7 +5617,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(64 files)", result.stdout)
+            self.assertIn("(65 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())
