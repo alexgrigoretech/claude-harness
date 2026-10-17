@@ -13,9 +13,12 @@ else:
 REPO_ROOT = getattr(runner, "REPO_ROOT", Path(__file__).resolve().parents[1])
 # Agy and Codex run on subscription logins with zero marginal cost. List prices for
 # a per-token comparison are recorded in the pr-review plan, not here.
+# Haiku is opt-in since 2026-10-17 and absent from default runs, so a missing Haiku result is not a reviewer failure.
+# Sonnet first party rates per million input and output tokens come from the claude-api skill table cached 2026-10-06.
 DEFAULT_PRICES = {
     "agy": (0.0, 0.0),
     "codex": (0.0, 0.0),
+    "sonnet": (2.00, 10.00),
     "haiku": (0.10, 0.50),
     "kimi": (0.0, 0.0),
     "muse": (0.0, 0.0),
@@ -191,6 +194,10 @@ def main(argv=None):
     prices.update(dict(args.price))
     configs_by_name = runner.load_reviewer_configs(args.reviewer)
     configs, missing = runner.select_reviewers(configs_by_name, args.reviewers)
+    if args.reviewers is None:
+        notice = runner.optional_reviewer_notice(configs_by_name, configs)
+        if notice is not None:
+            print(notice, file=sys.stderr)
     if missing:
         print(f"Scoring failed: reviewers are not configured: {', '.join(missing)}", file=sys.stderr)
         return 1

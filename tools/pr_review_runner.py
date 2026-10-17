@@ -50,7 +50,8 @@ DEFAULT_REVIEWERS = [
         ),
         "stdin": True,
     },
-    {"name": "haiku", "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True},
+    {"name": "sonnet", "cmd": 'claude -p --model claude-sonnet-5-5 --effort medium --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True},
+    {"name": "haiku", "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."', "stdin": True, "optional": True},
     {
         "name": "kimi",
         "cmd": subprocess.list2cmdline(
@@ -171,9 +172,14 @@ def load_reviewer_configs(overrides=None, home=None):
             "name": name,
             "cmd": command,
             "stdin": bool(item.get("stdin", "{prompt}" not in command)),
+            "optional": bool(item.get("optional", False)),
         }
     for item in overrides or []:
-        reviewers[item["name"]] = dict(item)
+        override = dict(item)
+        existing = reviewers.get(item["name"], {})
+        if "optional" in existing:
+            override.setdefault("optional", existing["optional"])
+        reviewers[item["name"]] = override
     for name, find_executable, cli_name in (
         ("muse", find_muse, "Muse Code"),
         ("kimi", find_kimi, "Kimi Code"),
@@ -199,7 +205,7 @@ def load_reviewer_configs(overrides=None, home=None):
 
 def select_reviewers(configs, names=None):
     if names is None:
-        return list(configs.values()), []
+        return [config for config in configs.values() if not config.get("optional", False)], []
     requested = [name.strip() for name in names.split(",") if name.strip()]
     if len(requested) == 1 and requested[0].lower() == "none":
         return [], []
@@ -211,6 +217,17 @@ def select_reviewers(configs, names=None):
         else:
             missing.append(name)
     return selected, missing
+
+
+def optional_reviewer_notice(configs, selected):
+    selected_names = [config["name"] for config in selected]
+    optional_names = [config["name"] for config in configs.values() if config.get("optional", False) and config["name"] not in selected_names]
+    if not optional_names:
+        return None
+    skipped_names = ", ".join(optional_names)
+    included_names = ",".join([*selected_names, *optional_names])
+    pronoun = "it" if len(optional_names) == 1 else "them"
+    return f"pr-review: {skipped_names} skipped (opt-in, pass --reviewers {included_names} to include {pronoun})"
 
 
 def read_diff(repo, base, diff_file=None):
@@ -686,6 +703,10 @@ def main(argv=None):
     diff_text, _ = truncate_diff(diff_text, args.max_diff_bytes)
     configs = load_reviewer_configs(args.reviewer)
     selected, missing = select_reviewers(configs, args.reviewers)
+    if args.reviewers is None:
+        notice = optional_reviewer_notice(configs, selected)
+        if notice is not None:
+            print(notice, file=sys.stderr)
     runs = [ReviewerRun(name, "error", 0.0, [], error="reviewer is not configured") for name in missing]
     if selected:
         try:

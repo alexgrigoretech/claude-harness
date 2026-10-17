@@ -570,6 +570,40 @@ class PRReviewTest(unittest.TestCase):
         plain = next(item for item in document["cases"] if item["reviewer"] == "plain")
         self.assertIsNone(plain["cost"])
 
+    def test_scorer_default_selection_prints_optional_reviewer_notice(self):
+        cases = self.root / "default-cases"
+        case = cases / "sample"
+        case.mkdir(parents=True)
+        (case / "diff.patch").write_text("diff text", encoding="utf-8")
+        (case / "expected.json").write_text("[]", encoding="utf-8")
+        result = runner.ReviewerRun("agy", "ok", 0.0, [])
+        with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+            code, _, stderr = self.run_main(scorer.main, ["--cases", str(cases), "--repo", str(self.root)])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([config["name"] for config in run.call_args.args[1]], ["agy", "codex", "sonnet", "kimi", "muse"])
+        self.assertEqual(stderr, "pr-review: haiku skipped (opt-in, pass --reviewers agy,codex,sonnet,kimi,muse,haiku to include it)\n")
+
+    def test_scorer_explicit_selection_keeps_optional_reviewers_silent(self):
+        cases = self.root / "explicit-cases"
+        case = cases / "sample"
+        case.mkdir(parents=True)
+        (case / "diff.patch").write_text("diff text", encoding="utf-8")
+        (case / "expected.json").write_text("[]", encoding="utf-8")
+        result = runner.ReviewerRun("agy", "ok", 0.0, [])
+        with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+            code, _, stderr = self.run_main(scorer.main, ["--cases", str(cases), "--reviewers", "agy"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([config["name"] for config in run.call_args.args[1]], ["agy"])
+        self.assertEqual(stderr, "")
+
+    def test_scorer_default_all_optional_prints_notice_before_no_reviewers(self):
+        configs = {"haiku": {"name": "haiku", "cmd": self.command(self.plain), "optional": True}}
+        with mock.patch.object(runner, "load_reviewer_configs", return_value=configs), mock.patch.object(runner, "run_reviewers") as run:
+            code, _, stderr = self.run_main(scorer.main, ["--cases", str(self.root)])
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "pr-review: haiku skipped (opt-in, pass --reviewers haiku to include it)\nScoring failed: no reviewers are configured or selected.\n")
+        run.assert_not_called()
+
     def test_scorer_passes_resolved_repo_to_reviewers(self):
         cases = self.root / "repo-cases"
         case = cases / "sample"
@@ -596,7 +630,42 @@ class PRReviewTest(unittest.TestCase):
         configs = runner.load_reviewer_configs([override], home=self.home)
         self.assertEqual(configs["agy"]["cmd"], self.command(self.plain))
         self.assertTrue(configs["agy"]["stdin"])
-        self.assertEqual(list(configs), ["agy", "codex", "haiku", "kimi", "muse"])
+        self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku", "kimi", "muse"])
+
+    def test_default_reviewer_order(self):
+        self.assertEqual([item["name"] for item in runner.DEFAULT_REVIEWERS], ["agy", "codex", "sonnet", "haiku", "kimi", "muse"])
+
+    def test_default_sonnet_reviewer(self):
+        config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "sonnet")
+        self.assertEqual(config, {
+            "name": "sonnet",
+            "cmd": 'claude -p --model claude-sonnet-5-5 --effort medium --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."',
+            "stdin": True,
+        })
+        tokens = runner.command_tokens(config["cmd"])
+        self.assertEqual(tokens[tokens.index("--model") + 1], "claude-sonnet-5-5")
+        self.assertEqual(tokens[tokens.index("--effort") + 1], "medium")
+        self.assertIn("--no-session-persistence", tokens)
+        self.assertEqual(tokens[tokens.index("--max-turns") + 1], "1")
+        self.assertEqual(tokens[tokens.index("--tools") + 1], "")
+        self.assertEqual(tokens[tokens.index("--append-system-prompt") + 1], "Reply with the JSON findings array only, no prose.")
+
+    def test_sonnet_price(self):
+        self.assertEqual(scorer.DEFAULT_PRICES["sonnet"], (2.00, 10.00))
+        self.assertAlmostEqual(scorer.review_cost(
+            {"input_tokens": 1_000_000, "output_tokens": 1_000_000}, scorer.DEFAULT_PRICES["sonnet"]
+        ), 12.00)
+
+    def test_client_default_selection_notice_includes_sonnet(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        (local / "machine.json").write_text(json.dumps({"client": True}), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            configs = runner.load_reviewer_configs(home=self.home)
+        selected, missing = runner.select_reviewers(configs)
+        self.assertEqual([config["name"] for config in selected], ["agy", "codex", "sonnet"])
+        self.assertEqual(missing, [])
+        self.assertEqual(runner.optional_reviewer_notice(configs, selected), "pr-review: haiku skipped (opt-in, pass --reviewers agy,codex,sonnet,haiku to include it)")
 
     def test_default_haiku_reviewer(self):
         config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "haiku")
@@ -604,11 +673,188 @@ class PRReviewTest(unittest.TestCase):
             "name": "haiku",
             "cmd": 'claude -p --model claude-haiku-5-5 --no-session-persistence --max-turns 1 --tools "" --append-system-prompt "Reply with the JSON findings array only, no prose."',
             "stdin": True,
+            "optional": True,
         })
         tokens = runner.command_tokens(config["cmd"])
         self.assertEqual(tokens[tokens.index("--max-turns") + 1], "1")
         self.assertEqual(tokens[tokens.index("--tools") + 1], "")
         self.assertEqual(tokens[tokens.index("--append-system-prompt") + 1], "Reply with the JSON findings array only, no prose.")
+
+    def test_default_selection_skips_optional_haiku_with_notice(self):
+        configs = runner.load_reviewer_configs(home=self.home)
+        selected, missing = runner.select_reviewers(configs)
+        self.assertEqual([config["name"] for config in selected], ["agy", "codex", "sonnet", "kimi", "muse"])
+        self.assertEqual(missing, [])
+        result = runner.ReviewerRun("agy", "ok", 0.0, [])
+        with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+            with mock.patch.object(runner, "read_body", return_value=""):
+                code, _, stderr = self.run_main(runner.main, [
+                    "--repo", str(self.root), "--diff", str(self.diff),
+                ])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(run.call_args.args[1], selected)
+        self.assertEqual(stderr, "pr-review: haiku skipped (opt-in, pass --reviewers agy,codex,sonnet,kimi,muse,haiku to include it)\n")
+
+    def test_explicit_selection_includes_optional_haiku_without_notice(self):
+        configs = runner.load_reviewer_configs(home=self.home)
+        selected, missing = runner.select_reviewers(configs, "agy,codex,haiku")
+        self.assertEqual([config["name"] for config in selected], ["agy", "codex", "haiku"])
+        self.assertEqual(missing, [])
+        result = runner.ReviewerRun("haiku", "ok", 0.0, [])
+        with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+            with mock.patch.object(runner, "read_body", return_value=""):
+                code, _, stderr = self.run_main(runner.main, [
+                    "--repo", str(self.root), "--diff", str(self.diff),
+                    "--reviewers", "agy,codex,haiku",
+                ])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(run.call_args.args[1], selected)
+        self.assertEqual(stderr, "")
+
+    def test_explicit_haiku_alone_runs_only_haiku(self):
+        result = runner.ReviewerRun("haiku", "ok", 0.0, [])
+        with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+            with mock.patch.object(runner, "read_body", return_value=""):
+                code, _, stderr = self.run_main(runner.main, [
+                    "--repo", str(self.root), "--diff", str(self.diff),
+                    "--reviewers", "haiku",
+                ])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual([config["name"] for config in run.call_args.args[1]], ["haiku"])
+        self.assertEqual(stderr, "")
+
+    def test_machine_optional_reviewers_follow_selection_and_notice_rules(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        reviewers = [
+            {"name": "plain", "cmd": self.command(self.plain)},
+            {"name": "wrapped", "cmd": self.command(self.plain), "optional": True},
+            {"name": "other", "cmd": self.command(self.plain), "optional": True},
+        ]
+        (local / "machine.json").write_text(json.dumps({"pr_review_reviewers": reviewers}), encoding="utf-8")
+        configs = runner.load_reviewer_configs(home=self.home)
+        self.assertTrue(configs["wrapped"]["optional"])
+        self.assertTrue(configs["other"]["optional"])
+        for names, expected, notice in (
+            (None, ["plain"], "pr-review: wrapped, other skipped (opt-in, pass --reviewers plain,wrapped,other to include them)\n"),
+            ("plain,wrapped", ["plain", "wrapped"], ""),
+        ):
+            with self.subTest(names=names):
+                selected, missing = runner.select_reviewers(configs, names)
+                self.assertEqual([config["name"] for config in selected], expected)
+                self.assertEqual(missing, [])
+                arguments = ["--repo", str(self.root), "--diff", str(self.diff)]
+                if names is not None:
+                    arguments.extend(["--reviewers", names])
+                result = runner.ReviewerRun("plain", "ok", 0.0, [])
+                with mock.patch.object(runner, "run_reviewers", return_value=[result]) as run:
+                    with mock.patch.object(runner, "read_body", return_value=""):
+                        code, _, stderr = self.run_main(runner.main, arguments)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(run.call_args.args[1], selected)
+                self.assertEqual(stderr, notice)
+
+    def test_reviewer_optional_defaults_to_false(self):
+        configs = runner.load_reviewer_configs(home=self.home)
+        for name in ("agy", "codex", "kimi", "muse"):
+            self.assertIs(configs[name]["optional"], False)
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        reviewers = [{"name": "plain", "cmd": self.command(self.plain)}]
+        (local / "machine.json").write_text(json.dumps({"pr_review_reviewers": reviewers}), encoding="utf-8")
+        configs = runner.load_reviewer_configs(home=self.home)
+        self.assertIs(configs["plain"]["optional"], False)
+        self.assertEqual(runner.select_reviewers(configs), ([configs["plain"]], []))
+
+    def test_reviewer_overrides_keep_optional_value(self):
+        for optional in (None, False, True):
+            with self.subTest(optional=optional):
+                override = runner.parse_override(f"haiku={self.command(self.plain)}")
+                if optional is not None:
+                    override["optional"] = optional
+                configs = runner.load_reviewer_configs([override], home=self.home)
+                expected = {**override, "optional": True if optional is None else optional}
+                self.assertEqual(configs["haiku"], expected)
+                selected, missing = runner.select_reviewers(configs)
+                self.assertEqual("haiku" in [config["name"] for config in selected], not expected["optional"])
+                self.assertEqual(missing, [])
+
+    def test_machine_reviewer_override_preserves_optional_unless_explicit(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        reviewers = [{"name": "plain", "cmd": self.command(self.plain), "optional": True}]
+        (local / "machine.json").write_text(json.dumps({"pr_review_reviewers": reviewers}), encoding="utf-8")
+        for optional in (None, False, True):
+            with self.subTest(optional=optional):
+                override = runner.parse_override(f"plain={self.command(self.wrapped)}")
+                if optional is not None:
+                    override["optional"] = optional
+                configs = runner.load_reviewer_configs([override], home=self.home)
+                self.assertEqual(configs["plain"]["cmd"], self.command(self.wrapped))
+                self.assertIs(configs["plain"]["optional"], True if optional is None else optional)
+                selected, missing = runner.select_reviewers(configs)
+                self.assertEqual([config["name"] for config in selected], ["plain"] if optional is False else [])
+                self.assertEqual(missing, [])
+
+    def test_all_optional_default_selection_prints_opt_in_notice_before_no_reviewers(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        reviewers = [
+            {"name": "haiku", "cmd": self.command(self.plain), "optional": True},
+            {"name": "other", "cmd": self.command(self.plain), "optional": True},
+        ]
+        for count in (1, 2):
+            with self.subTest(count=count):
+                (local / "machine.json").write_text(json.dumps({"pr_review_reviewers": reviewers[:count]}), encoding="utf-8")
+                with mock.patch.object(runner, "run_reviewers") as run:
+                    code, _, stderr = self.run_main(runner.main, [
+                        "--repo", str(self.root), "--diff", str(self.diff),
+                    ])
+                self.assertEqual(code, 1)
+                skipped = [reviewer["name"] for reviewer in reviewers[:count]]
+                pronoun = "it" if count == 1 else "them"
+                self.assertEqual(stderr, f"pr-review: {', '.join(skipped)} skipped (opt-in, pass --reviewers {','.join(skipped)} to include {pronoun})\nNo reviewers are configured or selected.\n")
+                run.assert_not_called()
+
+    def test_optional_notice_excludes_reviewer_made_non_optional_by_override(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        reviewers = [
+            {"name": "haiku", "cmd": self.command(self.plain), "optional": True},
+            {"name": "other", "cmd": self.command(self.plain), "optional": True},
+        ]
+        (local / "machine.json").write_text(json.dumps({"pr_review_reviewers": reviewers}), encoding="utf-8")
+        override = {**runner.parse_override(f"haiku={self.command(self.wrapped)}"), "optional": False}
+        configs = runner.load_reviewer_configs([override], home=self.home)
+        selected, missing = runner.select_reviewers(configs)
+        self.assertEqual([config["name"] for config in selected], ["haiku"])
+        self.assertEqual(missing, [])
+        notice = "pr-review: other skipped (opt-in, pass --reviewers haiku,other to include it)"
+        self.assertEqual(runner.optional_reviewer_notice(configs, selected), notice)
+        result = runner.ReviewerRun("haiku", "ok", 0.0, [])
+        with mock.patch.object(runner, "load_reviewer_configs", return_value=configs), mock.patch.object(runner, "run_reviewers", return_value=[result]), mock.patch.object(runner, "read_body", return_value=""):
+            code, _, stderr = self.run_main(runner.main, ["--repo", str(self.root), "--diff", str(self.diff)])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr, notice + "\n")
+
+    def test_optional_notice_returns_none_when_all_reviewers_selected(self):
+        configs = runner.load_reviewer_configs(home=self.home)
+        self.assertIsNone(runner.optional_reviewer_notice(configs, list(configs.values())))
+        self.assertIsNone(runner.optional_reviewer_notice({}, []))
+        override = {**runner.parse_override(f"haiku={self.command(self.plain)}"), "optional": False}
+        configs = runner.load_reviewer_configs([override], home=self.home)
+        self.assertIsNone(runner.optional_reviewer_notice(configs, runner.select_reviewers(configs)[0]))
+
+    def test_explicit_none_keeps_optional_reviewers_silent(self):
+        configs = runner.load_reviewer_configs(home=self.home)
+        self.assertEqual(runner.select_reviewers(configs, "none"), ([], []))
+        with mock.patch.object(runner, "run_reviewers") as run:
+            code, _, stderr = self.run_main(runner.main, [
+                "--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "none",
+            ])
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "No reviewers are configured or selected.\n")
+        run.assert_not_called()
 
     def test_reviewer_environment_removes_claude_session_markers(self):
         with mock.patch.dict(os.environ, {
@@ -996,7 +1242,7 @@ class PRReviewTest(unittest.TestCase):
             sys.executable, str(Path(runner.__file__).with_name("kimi_llm.py")),
             "--model", "{kimi_model}", "--timeout", "{reviewer_timeout}",
         ])
-        self.assertEqual([item["name"] for item in runner.DEFAULT_REVIEWERS], ["agy", "codex", "haiku", "kimi", "muse"])
+        self.assertEqual([item["name"] for item in runner.DEFAULT_REVIEWERS], ["agy", "codex", "sonnet", "haiku", "kimi", "muse"])
 
     def test_kimi_wrapper_reuses_muse_helpers(self):
         from tools import muse_llm as shared_muse
@@ -1048,7 +1294,7 @@ class PRReviewTest(unittest.TestCase):
         stderr = io.StringIO()
         with mock.patch.object(runner, "find_kimi") as find, contextlib.redirect_stderr(stderr):
             configs = runner.load_reviewer_configs(home=self.home)
-        self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+        self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku"])
         self.assertIn("pr-review: kimi skipped (client machine, no diff leaves the machine)", stderr.getvalue())
         find.assert_not_called()
 
@@ -1065,7 +1311,7 @@ class PRReviewTest(unittest.TestCase):
                 with mock.patch.object(runner, "find_kimi", return_value=None) as find:
                     with contextlib.redirect_stderr(io.StringIO()):
                         configs = runner.load_reviewer_configs(overrides, home=self.home)
-                self.assertEqual(configs["kimi"], override)
+                self.assertEqual(configs["kimi"], {**override, "optional": False})
                 find.assert_not_called()
 
     def test_missing_kimi_executable_skips_default_reviewer(self):
@@ -1074,7 +1320,7 @@ class PRReviewTest(unittest.TestCase):
         with mock.patch.object(runner, "find_kimi", side_effect=kimi_llm.find_kimi):
             with mock.patch.dict(os.environ, environment), contextlib.redirect_stderr(stderr):
                 configs = runner.load_reviewer_configs(home=self.home)
-        self.assertEqual(list(configs), ["agy", "codex", "haiku", "muse"])
+        self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku", "muse"])
         self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (Kimi Code not installed)\n")
 
     def test_kimi_prices_are_zero(self):
@@ -1549,7 +1795,7 @@ class PRReviewTest(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     configs = runner.load_reviewer_configs(home=self.home)
-                self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+                self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku"])
                 self.assertEqual(stderr.getvalue().count("machine.json unreadable"), 2)
         stderr = io.StringIO()
         with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
@@ -1677,7 +1923,7 @@ class PRReviewTest(unittest.TestCase):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             configs = runner.load_reviewer_configs(home=self.home)
-        self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+        self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku"])
         self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (client machine, no diff leaves the machine)\npr-review: kimi skipped (client machine, no diff leaves the machine)\n")
 
     def test_client_machine_keeps_explicit_muse_reviewer(self):
@@ -1694,7 +1940,7 @@ class PRReviewTest(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     configs = runner.load_reviewer_configs(overrides, home=self.home)
-                self.assertEqual(configs["muse"], override)
+                self.assertEqual(configs["muse"], {**override, "optional": False})
                 self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (client machine, no diff leaves the machine)\n" if overrides else "")
 
     def test_unreadable_machine_skips_default_muse_reviewer(self):
@@ -1707,13 +1953,13 @@ class PRReviewTest(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     configs = runner.load_reviewer_configs(home=self.home)
-                self.assertEqual(list(configs), ["agy", "codex", "haiku"])
+                self.assertEqual(list(configs), ["agy", "codex", "sonnet", "haiku"])
                 self.assertEqual(stderr.getvalue(), "pr-review: muse skipped (machine.json unreadable)\npr-review: kimi skipped (machine.json unreadable)\n")
         override = runner.parse_override(f"muse={self.command(self.plain)}")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             configs = runner.load_reviewer_configs([override], home=self.home)
-        self.assertEqual(configs["muse"], override)
+        self.assertEqual(configs["muse"], {**override, "optional": False})
         self.assertEqual(stderr.getvalue(), "pr-review: kimi skipped (machine.json unreadable)\n")
 
     def test_missing_machine_keeps_default_muse_reviewer(self):
@@ -1774,7 +2020,7 @@ class PRReviewTest(unittest.TestCase):
                 with mock.patch.object(runner, "find_muse", return_value=None) as find:
                     with contextlib.redirect_stderr(stderr):
                         configs = runner.load_reviewer_configs(overrides, home=self.home)
-                self.assertEqual(configs["muse"], override)
+                self.assertEqual(configs["muse"], {**override, "optional": False})
                 self.assertEqual(stderr.getvalue(), "")
                 find.assert_not_called()
 
