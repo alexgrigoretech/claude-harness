@@ -280,6 +280,17 @@ class PRReviewTest(unittest.TestCase):
             launcher.chmod(0o755)
         return launcher
 
+    def write_kimi_config(self, text=None):
+        path = self.home / ".kimi-code" / "config.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if text is None:
+            text = ('[models."kimi-code/kimi-for-coding"]\n'
+                    'provider = "managed:kimi-code"\n'
+                    'support_efforts = ["low", "high", "max"]\n'
+                    'default_effort = "max"\n')
+        path.write_bytes(text.encode("utf-8"))
+        return path
+
     def run_kimi(self, fake, prompt="Review this: caf\u00e9", *arguments):
         stdin = io.StringIO(prompt)
         stdout = io.StringIO()
@@ -1240,7 +1251,7 @@ class PRReviewTest(unittest.TestCase):
         self.assertTrue(config["stdin"])
         self.assertEqual(runner.command_tokens(config["cmd"]), [
             sys.executable, str(Path(runner.__file__).with_name("kimi_llm.py")),
-            "--model", "{kimi_model}", "--timeout", "{reviewer_timeout}",
+            "--model", "{kimi_model}", "--effort", "{kimi_effort}", "--timeout", "{reviewer_timeout}",
         ])
         self.assertEqual([item["name"] for item in runner.DEFAULT_REVIEWERS], ["agy", "codex", "sonnet", "haiku", "kimi", "muse"])
 
@@ -1286,6 +1297,31 @@ class PRReviewTest(unittest.TestCase):
         with mock.patch.object(runner, "configured_kimi_model") as model:
             runner.prepare_command({"cmd": self.command(self.plain)}, "{kimi_model}", home=self.home)
         model.assert_not_called()
+
+    def test_prepare_command_uses_configured_kimi_effort(self):
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        path = local / "machine.json"
+        config = next(item for item in runner.DEFAULT_REVIEWERS if item["name"] == "kimi")
+        self.assertEqual(runner.configured_kimi_effort(self.home), "")
+        command = runner.prepare_command(config, "prompt", home=self.home)
+        self.assertEqual(command[command.index("--effort") + 1], "")
+        for value in ("low", "high", "max"):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"kimi_model": "kimilow/kimi-for-coding", "kimi_effort": value}), encoding="utf-8")
+                self.assertEqual(runner.configured_kimi_effort(self.home), value)
+                command = runner.prepare_command(config, "prompt", home=self.home)
+                self.assertEqual(command[command.index("--model") + 1], "kimilow/kimi-for-coding")
+                self.assertEqual(command[command.index("--effort") + 1], value)
+        for value in (None, "", " ", "medium", "LOW", 1, [], {}):
+            with self.subTest(value=value):
+                path.write_text(json.dumps({"kimi_effort": value}), encoding="utf-8")
+                self.assertEqual(runner.configured_kimi_effort(self.home), "")
+                command = runner.prepare_command(config, "prompt", home=self.home)
+                self.assertEqual(command[command.index("--effort") + 1], "")
+        with mock.patch.object(runner, "configured_kimi_effort") as effort:
+            runner.prepare_command({"cmd": self.command(self.plain)}, "{kimi_effort}", home=self.home)
+        effort.assert_not_called()
 
     def test_client_machine_skips_default_kimi_reviewer(self):
         local = self.home / ".claude" / "local"
@@ -1600,7 +1636,14 @@ class PRReviewTest(unittest.TestCase):
         args = kimi_llm.parser().parse_args([])
         self.assertEqual(args.timeout, 540)
         self.assertEqual(args.model, "kimi-code/kimi-for-coding")
-        self.assertFalse(hasattr(args, "effort"))
+        self.assertEqual(args.effort, "")
+        for value in ("", "low", "high", "max"):
+            self.assertEqual(kimi_llm.parser().parse_args(["--effort", value]).effort, value)
+        for value in ("medium", "LOW", " "):
+            with self.subTest(effort=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    kimi_llm.parser().parse_args(["--effort", value])
+                self.assertEqual(caught.exception.code, 2)
         for value in ("kimi-code/kimi-for-coding", "Model_1.0-test", "0"):
             self.assertEqual(kimi_llm.parser().parse_args(["--model", value]).model, value)
         for value in ("", "kimi&echo", "kimi|echo", "kimi model", "-kimi", "kimi\n", " kimi"):
@@ -1608,6 +1651,288 @@ class PRReviewTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     kimi_llm.parser().parse_args(["--model", value])
                 self.assertEqual(caught.exception.code, 2)
+
+    def test_kimi_alias_already_present_preserves_bytes(self):
+        path = self.write_kimi_config('[models."kimilow/kimi-for-coding"]\r\ndefault_effort = "high"\r\n')
+        original = path.read_bytes()
+        fake = self.write_fake_kimi("kimi_existing_alias", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertEqual(stderr, "")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_created_atomically_with_daily_backup(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes() + b'\n[providers."managed:kimi-code"]\ntype = "kimi"\n'
+        path.write_bytes(original)
+        fake = self.write_fake_kimi("kimi_new_alias", ['{"role":"assistant","content":"PONG"}'])
+        with mock.patch.object(kimi_llm.os, "replace", wraps=os.replace) as replace:
+            code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["model"], "kimilow/kimi-for-coding")
+        self.assertEqual(stderr, f"kimi alias: re-created kimilow/kimi-for-coding from kimi-code/kimi-for-coding with default_effort low in {path}\n")
+        replace.assert_called_once()
+        self.assertEqual(Path(replace.call_args.args[0]).parent, path.parent)
+        self.assertEqual(replace.call_args.args[1], path)
+        self.assertTrue(path.read_bytes().startswith(original))
+        models = kimi_llm.tomllib.loads(path.read_text(encoding="utf-8"))["models"]
+        self.assertEqual(models["kimilow/kimi-for-coding"], dict(models["kimi-code/kimi-for-coding"], default_effort="low"))
+        backup = path.with_name(f"config.toml.bak-kimi-llm-{datetime.date.today().isoformat()}")
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertIn("re-created", kimi_llm.ensure_alias("kimihigh/kimi-for-coding", "high", path))
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(len(list(path.parent.glob("config.toml.bak-kimi-llm-*"))), 1)
+        self.assertEqual(set(path.parent.iterdir()), {path, backup})
+
+    def test_kimi_alias_appends_missing_default_effort(self):
+        path = self.write_kimi_config('[models."kimi-code/kimi-for-coding"]\nprovider = "managed:kimi-code"')
+        original = path.read_bytes()
+        message = kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path)
+        self.assertIn("re-created", message)
+        self.assertTrue(path.read_bytes().startswith(original + b"\n\n"))
+        self.assertEqual(kimi_llm.tomllib.loads(path.read_text(encoding="utf-8"))["models"]["kimilow/kimi-for-coding"]["default_effort"], "low")
+
+    def test_kimi_alias_preserves_crlf(self):
+        path = self.write_kimi_config('[models."kimi-code/kimi-for-coding"]\r\nprovider = "managed:kimi-code"\r\ndefault_effort = "max"\r\n\r\n')
+        original = path.read_bytes()
+        self.assertIn("re-created", kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+        result = path.read_bytes()
+        self.assertTrue(result.startswith(original))
+        self.assertNotIn(b"\n", result.replace(b"\r\n", b""))
+        self.assertTrue(result.endswith(b'default_effort = "low"\r\n'))
+
+    def test_kimi_alias_replaces_quoted_default_effort(self):
+        path = self.write_kimi_config('[models."kimi-code/kimi-for-coding"]\nprovider = "managed:kimi-code"\n"default_effort" = "max"\n')
+        original = path.read_bytes()
+        self.assertIn("re-created", kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+        self.assertTrue(path.read_bytes().startswith(original))
+        models = kimi_llm.tomllib.loads(path.read_text(encoding="utf-8"))["models"]
+        self.assertEqual(models["kimi-code/kimi-for-coding"]["default_effort"], "max")
+        self.assertEqual(models["kimilow/kimi-for-coding"]["default_effort"], "low")
+
+    def test_kimi_alias_refuses_invalid_rebuilt_block(self):
+        path = self.write_kimi_config('[models."kimi-code/kimi-for-coding"]\nprovider = "managed:kimi-code"\ndefault_effort = "max"\nmatrix = [\n[1, 2],\n[3, 4],\n]\n')
+        original = path.read_bytes()
+        kimi_llm.tomllib.loads(original.decode("utf-8"))
+        fake = self.write_fake_kimi("kimi_invalid_block", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertTrue(stderr.startswith(f"kimi alias: refusing to write {path}, the rebuilt block is not valid TOML: "))
+        self.assertEqual(stderr.count("kimi alias:"), 1)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_non_table_models_warns_and_review_continues(self):
+        fake = self.write_fake_kimi("kimi_non_table", ['{"role":"assistant","content":"PONG"}'])
+        for text in ('models = "not a table"\n', 'models = "kimilow/kimi-for-coding"\n', 'models = 1\n',
+                     '[models]\n"kimi-code/kimi-for-coding" = "not a table"\n',
+                     '[models]\n"kimi-code/kimi-for-coding" = []\n'):
+            with self.subTest(text=text):
+                path = self.write_kimi_config(text)
+                original = path.read_bytes()
+                code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(json.loads(stdout)["response"], "PONG")
+                self.assertTrue(stderr.startswith("kimi alias: "))
+                self.assertEqual(stderr.count("kimi alias:"), 1)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_invalid_utf8_warns_and_review_continues(self):
+        path = self.write_kimi_config()
+        original = b'\xff[models."kimi-code/kimi-for-coding"]\n'
+        path.write_bytes(original)
+        fake = self.write_fake_kimi("kimi_invalid_utf8", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertTrue(stderr.startswith("kimi alias: "))
+        self.assertIn("'utf-8' codec can't decode byte", stderr)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_backup_uses_private_exclusive_creation(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        backup = path.with_name(f"config.toml.bak-kimi-llm-{datetime.date.today().isoformat()}")
+        with mock.patch.object(kimi_llm.os, "open", wraps=os.open) as opened:
+            self.assertIn("re-created", kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+        opened.assert_any_call(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.assertEqual(backup.read_bytes(), original)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions and symlinks require a non Windows platform")
+    def test_kimi_alias_preserves_private_mode_and_symlink_target(self):
+        path = self.write_kimi_config()
+        path.chmod(0o600)
+        original = path.read_bytes()
+        link = self.home / "config-link.toml"
+        link.symlink_to(path)
+        previous_umask = os.umask(0)
+        try:
+            message = kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", link)
+        finally:
+            os.umask(previous_umask)
+        self.assertIn(f"default_effort low in {path}", message)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), str(path))
+        self.assertEqual(link.resolve(), path)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(link.read_bytes(), path.read_bytes())
+        self.assertTrue(path.read_bytes().startswith(original))
+        backup = path.with_name(f"config.toml.bak-kimi-llm-{datetime.date.today().isoformat()}")
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(backup.read_bytes(), original)
+
+    def test_kimi_alias_accepts_single_quoted_base_header(self):
+        path = self.write_kimi_config("[models.'kimi-code/kimi-for-coding']\nprovider = \"managed:kimi-code\"\ndefault_effort = \"max\"\n")
+        original = path.read_bytes()
+        self.assertIn("re-created", kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+        self.assertTrue(path.read_bytes().startswith(original))
+        models = kimi_llm.tomllib.loads(path.read_text(encoding="utf-8"))["models"]
+        self.assertEqual(models["kimilow/kimi-for-coding"], dict(models["kimi-code/kimi-for-coding"], default_effort="low"))
+
+    def test_kimi_alias_header_and_exact_final_newline(self):
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=newline):
+                text = newline.join(('[models."kimi-code/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'default_effort = "max"', "", "", ""))
+                path = self.write_kimi_config(text)
+                original = path.read_bytes()
+                self.assertIn("re-created", kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+                appended = newline.join(('[models."kimilow/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'default_effort = "low"', ""))
+                self.assertEqual(path.read_bytes(), original + appended.encode("utf-8"))
+                self.assertFalse(path.read_bytes().endswith((newline * 2).encode("utf-8")))
+
+    def test_kimi_alias_under_provider_prefix_warns(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        model = "kimi-code/low-alias"
+        self.assertEqual(kimi_llm.ensure_alias(model, "low", path), f"kimi alias: {model} sits under the kimi-code/ prefix, the Kimi CLI model refresh deletes such aliases, name it outside the prefix in kimi_model")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+        self.assertIsNone(kimi_llm.ensure_alias("kimi-code/kimi-for-coding", "low", path))
+
+    def test_kimi_alias_without_slash_warns(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        self.assertEqual(kimi_llm.ensure_alias("kimilow", "low", path), "kimi alias: kimilow has no kimi-code/ base to copy, running the model as configured")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_missing_base_warns(self):
+        path = self.write_kimi_config("[models]\n")
+        original = path.read_bytes()
+        self.assertEqual(kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path), f"kimi alias: base kimi-code/kimi-for-coding is missing from {path}, run kimi login, running the model as configured")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_unsupported_effort_warns(self):
+        path = self.write_kimi_config('[models."kimi-code/kimi-for-coding"]\nsupport_efforts = ["high", "max"]\n')
+        original = path.read_bytes()
+        self.assertEqual(kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path), "kimi alias: kimi-code/kimi-for-coding does not support effort low (supports: high, max)")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_missing_config_warns_and_review_continues(self):
+        path = self.home / ".kimi-code" / "config.toml"
+        fake = self.write_fake_kimi("kimi_missing_config", ['{"role":"assistant","content":"PONG"}'])
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertEqual(stderr, f"kimi alias: {path} not found, running the model as configured\n")
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_kimi_alias_empty_effort_never_reads_config(self):
+        path = self.home / ".kimi-code" / "config.toml"
+        original_open = Path.open
+        def guarded_open(candidate, *arguments, **keywords):
+            self.assertNotEqual(candidate, path)
+            return original_open(candidate, *arguments, **keywords)
+        fake = self.write_fake_kimi("kimi_no_effort", ['{"role":"assistant","content":"PONG"}'])
+        for arguments in ((), ("--effort", "")):
+            with self.subTest(arguments=arguments):
+                with mock.patch.object(Path, "open", guarded_open), mock.patch.object(kimi_llm, "ensure_alias") as ensure:
+                    code, stdout, stderr = self.run_kimi(fake, "prompt", *arguments)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(json.loads(stdout)["response"], "PONG")
+                self.assertEqual(stderr, "")
+                self.assertEqual(list(self.home.iterdir()), [])
+                ensure.assert_not_called()
+
+    def test_kimi_alias_effort_with_wrapper_options_and_client_gate(self):
+        path = self.write_kimi_config()
+        local = self.home / ".claude" / "local"
+        local.mkdir(parents=True)
+        (local / "machine.json").write_text(json.dumps({"client": True}), encoding="utf-8")
+        fake = self.write_fake_kimi("kimi_alias_options", ['{"role":"assistant","content":"PONG"}'])
+        with mock.patch.object(kimi_llm, "ensure_alias") as ensure:
+            code, stdout, stderr = self.run_kimi(fake, "prompt", "--effort", "low")
+        self.assertEqual(code, 8)
+        self.assertEqual(stdout, "")
+        self.assertIn("client machine", stderr)
+        ensure.assert_not_called()
+        code, stdout, stderr = self.run_kimi(fake, "prompt", "--allow-client", "--model", "kimilow/kimi-for-coding", "--effort", "low", "--raw", "--no-preamble")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "PONG")
+        self.assertIn(f"default_effort low in {path}", stderr)
+        self.assertIn("no-preamble is ignored", stderr)
+
+    def test_kimi_alias_lock_timeout_preserves_config(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        lock = path.with_name("config.toml.kimi-llm.lock")
+        lock.write_text("held", encoding="utf-8")
+        with mock.patch.object(kimi_llm.time, "monotonic", side_effect=[0, 5]):
+            message = kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path)
+        self.assertIn("kimi alias: config lock unavailable", message)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(lock.read_text(encoding="utf-8"), "held")
+        self.assertEqual(set(path.parent.iterdir()), {path, lock})
+
+    def test_kimi_alias_rechecks_config_after_lock(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        concurrent = original + b'\n[models."kimilow/kimi-for-coding"]\ndefault_effort = "high"\n'
+        acquire = kimi_llm._acquire_session_lock
+        def concurrent_alias(lock_path):
+            path.write_bytes(concurrent)
+            return acquire(lock_path)
+        with mock.patch.object(kimi_llm, "_acquire_session_lock", side_effect=concurrent_alias):
+            self.assertIsNone(kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path))
+        self.assertEqual(path.read_bytes(), concurrent)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_invalid_toml_warns_without_writing(self):
+        path = self.write_kimi_config("[models\n")
+        original = path.read_bytes()
+        message = kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path)
+        self.assertTrue(message.startswith("kimi alias: "))
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_read_failure_warns_without_writing(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        with mock.patch.object(Path, "open", side_effect=PermissionError("cannot read config")):
+            self.assertEqual(kimi_llm.ensure_alias("kimilow/kimi-for-coding", "low", path), "kimi alias: cannot read config")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_kimi_alias_replace_failure_preserves_config_and_review(self):
+        path = self.write_kimi_config()
+        original = path.read_bytes()
+        fake = self.write_fake_kimi("kimi_alias_failure", ['{"role":"assistant","content":"PONG"}'])
+        with mock.patch.object(kimi_llm.os, "replace", side_effect=OSError("cannot replace config")):
+            code, stdout, stderr = self.run_kimi(fake, "prompt", "--model", "kimilow/kimi-for-coding", "--effort", "low")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["response"], "PONG")
+        self.assertEqual(stderr, "kimi alias: cannot replace config\n")
+        self.assertEqual(path.read_bytes(), original)
+        backup = path.with_name(f"config.toml.bak-kimi-llm-{datetime.date.today().isoformat()}")
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(set(path.parent.iterdir()), {path, backup})
 
     def test_kimi_wrapper_removes_own_session(self):
         sessions = self.home / ".kimi-code" / "sessions"

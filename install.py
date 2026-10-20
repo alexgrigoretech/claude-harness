@@ -150,6 +150,9 @@ def validate_machine_efforts(machine, source_for_key):
     kimi_model = machine.get("kimi_model")
     if kimi_model is not None and (not isinstance(kimi_model, str) or re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$", kimi_model) is None):
         raise ValueError(f"{source_for_key('kimi_model')}: kimi_model must match [A-Za-z0-9][A-Za-z0-9._/-]* or be null")
+    kimi_effort = machine.get("kimi_effort")
+    if kimi_effort is not None and kimi_effort not in ("low", "high", "max"):
+        raise ValueError(f"{source_for_key('kimi_effort')}: kimi_effort must be low, high, max or null")
     allowed = ("low", "medium", "high", "xhigh")
     codex = machine.get("codex_effort")
     if codex is not None and codex not in ("minimal", "low", "medium", "high", "xhigh"):

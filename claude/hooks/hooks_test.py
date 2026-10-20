@@ -3361,6 +3361,18 @@ class InstallerTests(unittest.TestCase):
                         module.validate_machine_efforts({"kimi_model": value}, lambda key: source)
                     self.assertEqual(str(caught.exception), f"{source}: kimi_model must match [A-Za-z0-9][A-Za-z0-9._/-]* or be null")
 
+    def test_kimi_effort_validation(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            source = home / ".claude" / "local" / "machine.local.json"
+            for value in (None, "low", "high", "max"):
+                with self.subTest(value=value):
+                    module.validate_machine_efforts({"kimi_effort": value}, lambda key: source)
+            for value in ("", " ", "medium", "LOW", 1, [], {}):
+                with self.subTest(value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        module.validate_machine_efforts({"kimi_effort": value}, lambda key: source)
+                    self.assertEqual(str(caught.exception), f"{source}: kimi_effort must be low, high, max or null")
+
     def test_effort_null_disables_changes(self):
         home = self.new_home("effort-null-home")
         copied = self.copy_codex_effort_repo("effort-null-repo")

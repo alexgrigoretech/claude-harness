@@ -1,6 +1,8 @@
 """Adapt stdin prompts to the Kimi Code CLI event protocol."""
 
 import argparse
+import contextlib
+import datetime
 import json
 import os
 import re
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +103,85 @@ def _acquire_session_lock(lock_path):
             except FileNotFoundError:
                 continue
             time.sleep(min(0.2, remaining))
+
+
+def ensure_alias(model, effort, config_path):
+    try:
+        config_path = Path(config_path).resolve()
+        try:
+            with config_path.open(encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            return f"kimi alias: {config_path} not found, running the model as configured"
+        models = tomllib.loads(text).get("models", {})
+        if not isinstance(models, dict):
+            raise TypeError("models must be a table")
+        if model in models:
+            return None
+        if model.startswith("kimi-code/"):
+            return f"kimi alias: {model} sits under the kimi-code/ prefix, the Kimi CLI model refresh deletes such aliases, name it outside the prefix in kimi_model"
+        if "/" not in model:
+            return f"kimi alias: {model} has no kimi-code/ base to copy, running the model as configured"
+        base = "kimi-code/" + model.split("/", 1)[1]
+        with contextlib.ExitStack() as stack:
+            lock_path = config_path.with_name(config_path.name + ".kimi-llm.lock")
+            try:
+                descriptor = _acquire_session_lock(lock_path)
+            except OSError as exc:
+                return f"kimi alias: config lock unavailable, running the model as configured: {exc}"
+            stack.callback(lock_path.unlink, missing_ok=True)
+            stack.callback(os.close, descriptor)
+            with config_path.open(encoding="utf-8", newline="") as handle:
+                text = handle.read()
+            models = tomllib.loads(text).get("models", {})
+            if not isinstance(models, dict):
+                raise TypeError("models must be a table")
+            if model in models:
+                return None
+            if base not in models:
+                return f"kimi alias: base {base} is missing from {config_path}, run kimi login, running the model as configured"
+            supported = models[base].get("support_efforts")
+            if isinstance(supported, list) and effort not in supported:
+                return f"kimi alias: {base} does not support effort {effort} (supports: {', '.join(str(value) for value in supported)})"
+            lines = text.splitlines()
+            header = re.compile(rf"""\s*\[models\.(["']){re.escape(base)}\1\]\s*(?:#.*)?""")
+            start = next((index for index, line in enumerate(lines) if header.fullmatch(line)), None)
+            if start is None:
+                return f"kimi alias: base {base} has no table header in {config_path}, running the model as configured"
+            end = next((index for index in range(start + 1, len(lines)) if lines[index].lstrip().startswith("[")), len(lines))
+            block = lines[start:end]
+            while block and not block[-1].strip():
+                block.pop()
+            block[0] = f'[models."{model}"]'
+            effort_line = f'default_effort = "{effort}"'
+            position = next((index for index, line in enumerate(block) if re.match(r'\s*(?:default_effort|"default_effort")\s*=', line)), None)
+            if position is None:
+                block.append(effort_line)
+            else:
+                block[position] = effort_line
+            newline = "\r\n" if "\r\n" in text else "\n"
+            separator = "" if text.endswith(newline * 2) else newline if text.endswith(newline) else newline * 2
+            updated = text + separator + newline.join(block) + newline
+            try:
+                tomllib.loads(updated)
+            except tomllib.TOMLDecodeError as exc:
+                return f"kimi alias: refusing to write {config_path}, the rebuilt block is not valid TOML: {exc}"
+            backup = config_path.with_name(f"{config_path.name}.bak-kimi-llm-{datetime.date.today().isoformat()}")
+            try:
+                backup_descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(backup_descriptor, "wb") as handle:
+                    handle.write(text.encode("utf-8"))
+            except FileExistsError:
+                pass
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=config_path.parent, delete=False) as handle:
+                replacement = Path(handle.name)
+                stack.callback(replacement.unlink, missing_ok=True)
+                handle.write(updated)
+            shutil.copymode(config_path, replacement)
+            os.replace(replacement, config_path)
+            return f"kimi alias: re-created {model} from {base} with default_effort {effort} in {config_path}"
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return f"kimi alias: {exc}"
 
 
 def cleanup_sessions(work_directory, session_id=None):
@@ -200,6 +282,7 @@ def parser():
         description="Send a prompt from stdin through a Read-only Kimi Code agent."
     )
     argument_parser.add_argument("--model", type=model_id, default="kimi-code/kimi-for-coding")
+    argument_parser.add_argument("--effort", choices=("", "low", "high", "max"), default="")
     argument_parser.add_argument("--timeout", type=float, default=540)
     argument_parser.add_argument("--raw", action="store_true")
     argument_parser.add_argument("--kimi", help="path to the kimi executable")
@@ -234,6 +317,11 @@ def main(argv=None):
     if not executable:
         print("kimi was not found. Install it with: npm install -g @moonshot-ai/kimi-code", file=sys.stderr)
         return 3
+    if args.effort:
+        home = Path(os.environ.get("CLAUDE_HOOKS_HOME") or Path.home())
+        message = ensure_alias(args.model, args.effort, home / ".kimi-code" / "config.toml")
+        if message:
+            print(message, file=sys.stderr)
     if args.no_preamble:
         print("kimi: no-preamble is ignored, the Read-only agent needs Read", file=sys.stderr)
 

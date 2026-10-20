@@ -60,6 +60,8 @@ DEFAULT_REVIEWERS = [
                 str(Path(__file__).with_name("kimi_llm.py")),
                 "--model",
                 "{kimi_model}",
+                "--effort",
+                "{kimi_effort}",
                 "--timeout",
                 "{reviewer_timeout}",
             ]
@@ -446,6 +448,8 @@ def configured_machine_value(key, default, home=None):
     value = value.strip()
     if key == "muse_effort" and value not in MUSE_EFFORTS:
         return default
+    if key == "kimi_effort" and value not in ("low", "high", "max"):
+        return default
     return value
 
 
@@ -463,6 +467,10 @@ def configured_muse_effort(home=None):
 
 def configured_kimi_model(home=None):
     return configured_machine_value("kimi_model", "kimi-code/kimi-for-coding", home)
+
+
+def configured_kimi_effort(home=None):
+    return configured_machine_value("kimi_effort", "", home)
 
 
 def resolve_reviewer_executable(executable):
@@ -507,6 +515,7 @@ def prepare_command(config, prompt, repo=None, home=None, output_file=None, time
     muse_model = configured_muse_model(home) if "{muse_model}" in config["cmd"] else ""
     kimi_model = configured_kimi_model(home) if "{kimi_model}" in config["cmd"] else ""
     muse_effort = configured_muse_effort(home) if "{muse_effort}" in config["cmd"] else ""
+    kimi_effort = configured_kimi_effort(home) if "{kimi_effort}" in config["cmd"] else ""
     prepared = [
         token.replace("{prompt_file_note}", PROMPT_FILE_NOTE)
         .replace("{repo}", repo_path)
@@ -514,6 +523,7 @@ def prepare_command(config, prompt, repo=None, home=None, output_file=None, time
         .replace("{muse_model}", muse_model)
         .replace("{kimi_model}", kimi_model)
         .replace("{muse_effort}", muse_effort)
+        .replace("{kimi_effort}", kimi_effort)
         .replace("{reviewer_timeout}", str(max(30, timeout - 30)))
         .replace("{output_file}", output_path)
         .replace("{prompt}", prompt)
