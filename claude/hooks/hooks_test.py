@@ -6688,7 +6688,7 @@ class ProxyInstallerTests(unittest.TestCase):
         self.assertEqual(config["model_reasoning_effort"], "high")
         provider = config["model_providers"]["cliproxyapi"]
         self.assertEqual(provider["experimental_bearer_token"], self.key)
-        self.assertTrue(provider["requires_openai_auth"])
+        self.assertFalse(provider["requires_openai_auth"])
         self.assertEqual(provider["base_url"], "http://127.0.0.1:8317/v1")
         self.assertEqual(provider["model_catalog_url"], "http://127.0.0.1:8317/v1/models")
         self.assertNotIn("projects", config)
@@ -7012,12 +7012,13 @@ class ProxyInstallerTests(unittest.TestCase):
             self.assertIn("model_providers.cliproxyapi.requires_openai_auth=false", content)
             self.assertNotIn("model_providers.cliproxyapi.experimental_bearer_token=", content)
             self.assertIn("experimental_bearer_token", content)
+            self.assertEqual(content.count("codex_login=off"), 1)
             if suffix:
-                self.assertIn('endlocal & set "CLIPROXY_API_KEY=%tok%" & "%real%" %sub% -c ', content)
+                self.assertIn('endlocal & set "CLIPROXY_API_KEY=%tok%" & (if not defined RUST_LOG set "RUST_LOG=error,codex_login=off") & "%real%" %sub% -c ', content)
                 marker, token, own_args = '"%real%"', "%tok%", "%*"
                 env_key = r'env_key=\"CLIPROXY_API_KEY\"'
             else:
-                self.assertIn('CLIPROXY_API_KEY="$tok" exec "$real"', content)
+                self.assertIn('RUST_LOG="${RUST_LOG:-error,codex_login=off}" CLIPROXY_API_KEY="$tok" exec "$real"', content)
                 marker, token, own_args = 'exec "$real"', "$tok", '"$@"'
                 env_key = 'env_key="CLIPROXY_API_KEY"'
             pool_invocations = 0
@@ -7029,6 +7030,7 @@ class ProxyInstallerTests(unittest.TestCase):
                 if invocation == own_args:
                     self.assertNotIn("env_key", line)
                     self.assertNotIn(token, line)
+                    self.assertNotIn("RUST_LOG", line)
                 else:
                     self.assertIn(env_key, invocation)
                     pool_invocations += 1
@@ -7266,6 +7268,8 @@ echo %CLIPROXY_API_KEY%
         self.assertIn("CODEX_HOME+x", codex)
         self.assertIn("OPENAI_BASE_URL+x", codex)
         self.assertNotIn("CODEX_HOME=", codex)
+        self.assertIn('RUST_LOG="${RUST_LOG:-error,codex_login=off}"', codex)
+        self.assertEqual(codex.count("codex_login=off"), 1)
         for key in ("name", "base_url", "model_catalog_url", "wire_api", "requires_openai_auth", "supports_websockets", "env_key"):
             self.assertIn("model_providers.cliproxyapi." + key, codex)
 

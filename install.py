@@ -757,7 +757,7 @@ model_catalog_url = {catalog_url}
 experimental_bearer_token = {token}
 name = "OpenAI"
 wire_api = "responses"
-requires_openai_auth = true
+requires_openai_auth = false
 supports_websockets = true
 """
 
@@ -876,6 +876,9 @@ CODEX_PROXY_OVERRIDES = (
     'model_providers.cliproxyapi.env_key="CLIPROXY_API_KEY"',
 )
 
+# Hide stale ChatGPT login refresh errors on proxied runs, measured 26 to 0 on codex 0.160.0; keep error so other errors remain visible.
+PROXY_CODEX_RUST_LOG = "error,codex_login=off"
+
 
 def codex_proxy_overrides(base):
     return [value.format(base_url=json.dumps(base + "/v1"), catalog_url=json.dumps(base + "/v1/models")) for value in CODEX_PROXY_OVERRIDES]
@@ -917,7 +920,7 @@ def proxy_launchers(machine, home, base):
       fi
       ;;
   esac
-  CLIPROXY_API_KEY="$tok" exec "$real" ${{sub:+"$sub"}} ${{nested:+"$nested"}} {config_args} "$@"'''
+  RUST_LOG="${{RUST_LOG:-{PROXY_CODEX_RUST_LOG}}}" CLIPROXY_API_KEY="$tok" exec "$real" ${{sub:+"$sub"}} ${{nested:+"$nested"}} {config_args} "$@"'''
         files[bin_dir / name] = PROXY_SH.format(
             resolve=resolve, bypass=bypass, token=token, probe=shlex.quote(base + "/v1/models"),
             name=name, execute=execute.rstrip(),
@@ -992,7 +995,7 @@ set "sub="
 set rest=%*
 :proxy_execute
 '''
-            execute = f'endlocal & set "CLIPROXY_API_KEY=%tok%" & "%real%" %sub% {config_args} %rest%'
+            execute = f'endlocal & set "CLIPROXY_API_KEY=%tok%" & (if not defined RUST_LOG set "RUST_LOG={PROXY_CODEX_RUST_LOG}") & "%real%" %sub% {config_args} %rest%'
         files[bin_dir / (name + ".cmd")] = PROXY_CMD.format(
             resolve=resolve, bypass=bypass, token=token, base=base, name=name, prepare=prepare, execute=execute,
         ).replace("\n", "\r\n").encode("utf-8")
