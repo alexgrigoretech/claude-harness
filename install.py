@@ -13,6 +13,7 @@ import tempfile
 import traceback
 import unicodedata
 from pathlib import Path
+from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parent
 STATUSLINE_COMMAND = "bash ~/.claude/statusline-command.sh"
@@ -116,6 +117,65 @@ def validate_machine_flags(machine, defaults, source_for_key):
         if not isinstance(flags[key], bool):
             raise ValueError(f"{source_for_key(key)}: {key} must be true or false")
     return flags
+
+
+def validate_packs(machine, repo, source_for_key):
+    packs = machine.get("packs", [])
+    if not isinstance(packs, list) or any(not isinstance(pack, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", pack) for pack in packs):
+        raise ValueError(f"{source_for_key('packs')}: packs must be a list of pack folder names")
+    if len({pack.casefold() for pack in packs}) != len(packs):
+        raise ValueError(f"{source_for_key('packs')}: packs must not repeat a pack name")
+    for pack in packs:
+        if not (repo / "claude" / "packs" / pack).is_dir():
+            raise ValueError(f"pack folder missing: claude/packs/{pack}")
+    return packs
+
+
+def validate_bundle_exclude(machine, source_for_key):
+    excluded = machine.get("bundle_exclude", [])
+    if not isinstance(excluded, list) or any(not isinstance(item, str) or not item or item != item.strip() or ("/" in item and not item.endswith("/")) for item in excluded):
+        raise ValueError(f"{source_for_key('bundle_exclude')}: bundle_exclude must be a list of skill names or path prefixes ending with a slash")
+    return excluded
+
+
+def pack_skill_sources(repo, packs):
+    sources = {}
+    names = set()
+    base_skills = repo / "claude" / "skills"
+    base_names = {path.name.casefold() for path in base_skills.iterdir() if path.is_dir()} if base_skills.is_dir() else set()
+    for pack in packs:
+        skills = repo / "claude" / "packs" / pack / "skills"
+        if not skills.is_dir():
+            continue
+        for source in sorted(path for path in skills.iterdir() if path.is_dir()):
+            name = source.name
+            if name.casefold() in base_names:
+                raise ValueError(f"pack skill collides with a base skill: {name}")
+            if name.casefold() in names:
+                raise ValueError(f"pack skill collides with another pack: {name}")
+            names.add(name.casefold())
+            sources[name] = source
+    return sources
+
+
+def install_pack_skills(installer, sources):
+    record = installer.home / ".claude" / "local" / "pack-skills.json"
+    try:
+        previous = read_json(record)
+    except (OSError, ValueError):
+        previous = {}
+    previous = previous.get("skills", []) if isinstance(previous, dict) else []
+    if not isinstance(previous, list) or any(not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\\" in name or Path(name).drive for name in previous):
+        previous = []
+    retained = set(sources)
+    for name in sorted(set(previous) - sources.keys()):
+        if not (installer.repo / "claude" / "skills" / name).exists():
+            destination = installer.home / ".claude" / "skills" / name
+            if not installer.remove(destination) and os.path.lexists(destination):
+                retained.add(name)
+    for name, source in sorted(sources.items()):
+        installer.sync_directory(source, installer.home / ".claude" / "skills" / name)
+    installer.write_bytes(record, json_bytes({"skills": sorted(retained)}))
 
 
 def validate_gh_accounts(machine, source_for_key):
@@ -828,9 +888,10 @@ def remote_skill_conflicts(machine, home):
     return conflicts
 
 
-def check_remote_skills(machine, home, repo):
+def check_remote_skills(machine, home, repo, pack_skills=()):
+    pack_names = {name.casefold() for name in pack_skills}
     for name in machine.get("remote", {}):
-        if (Path(repo) / "claude" / "skills" / name).is_dir():
+        if (Path(repo) / "claude" / "skills" / name).is_dir() or name.casefold() in pack_names:
             raise ValueError(f"remote.{name} conflicts with a repository skill")
     conflicts = remote_skill_conflicts(machine, home)
     if conflicts:
@@ -1082,6 +1143,89 @@ def install_proxy(installer, machine, statusline_installed, key, conflicts=()):
             if not installer.dry_run and machine["os"] != "windows" and os.name != "nt":
                 os.chmod(destination, 0o600 if destination in profiles else 0o755)
     proxy_path_note(machine, home)
+
+
+def conditional_markdown_condition(condition, machine, repo):
+    negated = condition.startswith("!")
+    condition = condition[1:] if negated else condition
+    defaults = {"codex_first": True, "harvest": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", condition):
+        if condition not in defaults and condition not in machine:
+            raise ValueError(f"unknown condition: {condition}")
+        value = machine.get(condition, defaults.get(condition))
+        if not isinstance(value, bool):
+            raise ValueError(f"{condition} must be true or false")
+    elif re.fullmatch(r"skill:[A-Za-z0-9_-]+", condition):
+        name = condition.split(":", 1)[1]
+        packs = machine.get("packs", [])
+        if not isinstance(packs, list):
+            packs = []
+        value = (repo / "claude" / "skills" / name).is_dir() or any(
+            (repo / "claude" / "packs" / pack / "skills" / name).is_dir()
+            for pack in packs
+        )
+    elif re.fullmatch(r"reviewer:[A-Za-z0-9_-]+", condition):
+        name = condition.split(":", 1)[1]
+        configured = machine.get("pr_review_reviewers")
+        value = not (isinstance(configured, list) and configured) or any(
+            isinstance(reviewer, dict) and reviewer.get("name") == name
+            for reviewer in configured
+        )
+        if machine.get("client") is True and name in ("muse", "kimi"):
+            value = False
+    else:
+        raise ValueError(f"unknown condition: {condition}")
+    return not value if negated else value
+
+
+def render_conditional_markdown(text, machine, repo):
+    rendered = []
+    opening = None
+    taken = True
+    seen_else = False
+    fence = None
+    for line_number, line in enumerate((piece for piece in re.split(r"(?<=\n)", text) if piece), 1):
+        fence_marker = re.match(r"^[ \t]*(\x60{3,}|~{3,})", line)
+        if fence_marker:
+            if fence is None:
+                fence = fence_marker[1][0]
+            elif fence == fence_marker[1][0]:
+                fence = None
+            if taken:
+                rendered.append(line)
+            continue
+        if fence is not None or "<!-- harness:" not in line:
+            if taken:
+                rendered.append(line)
+            continue
+        marker = line.strip()
+        try:
+            match = re.fullmatch(r"<!-- harness:if ([^<>]+) -->", marker)
+            if match:
+                if opening is not None:
+                    raise ValueError("nested if")
+                taken = conditional_markdown_condition(match[1], machine, repo)
+                opening = (line_number, marker)
+                seen_else = False
+            elif marker == "<!-- harness:else -->":
+                if opening is None:
+                    raise ValueError("else without if")
+                if seen_else:
+                    raise ValueError("second else")
+                taken = not taken
+                seen_else = True
+            elif marker == "<!-- harness:end -->":
+                if opening is None:
+                    raise ValueError("end without if")
+                opening = None
+                taken = True
+            else:
+                raise ValueError("marker must be alone on its line")
+        except ValueError as exc:
+            raise ValueError(f"line {line_number}: {marker}: {exc}") from exc
+    if opening is not None:
+        raise ValueError(f"line {opening[0]}: {opening[1]}: unclosed block")
+    return "".join(rendered)
 
 
 def install_local_markdown(installer, source, destination):
@@ -1557,6 +1701,8 @@ def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publis
         restart = "4. Restart Claude Code and run /setup; it asks who you are, your git identities and gh account, and whether you use Codex CLI, and writes the local files."
     elif harvest:
         restart += " Memories travel back with `python harvest.py --export <folder>`."
+    if machine is not None and machine.get("bundle_exclude"):
+        heading += "Excluded by the machine file: " + ", ".join(machine["bundle_exclude"]) + "\n\n"
     proxy_step = ""
     dry_run_step = 2
     real_run_step = 3
@@ -1610,11 +1756,49 @@ def bundle_entry_adders(entries, *, plan_tools=True):
     return add, add_tree
 
 
-def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False, machine=None):
+def check_pack_links(repo, pack):
+    root = (repo / "claude" / "packs" / pack).resolve()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".md":
+            continue
+        content = path.read_text(encoding="utf-8-sig")
+        lines = []
+        fence = None
+        for line in content.splitlines():
+            marker = re.match(r"^[ \t]*(\x60{3,}|~{3,})", line)
+            if marker:
+                if fence is None:
+                    fence = marker[1][0]
+                elif fence == marker[1][0]:
+                    fence = None
+            elif fence is None:
+                lines.append(line)
+        content = re.sub(r"\x60[^\x60\n]*\x60", "", "\n".join(lines))
+        targets = re.findall(r"\]\(([^)\n]+)\)", content)
+        targets.extend(re.findall(r"^[ \t]*\[[^\]\n]+\]:[ \t]*(\S+)", content, re.MULTILINE))
+        for target in targets:
+            link = re.split(r"(?<!\\)[ \t]", target.strip(), maxsplit=1)[0]
+            if link.startswith("<") and link.endswith(">"):
+                link = link[1:-1]
+            link = unquote(link)
+            if link.casefold().startswith(("http://", "https://", "mailto:", "#")) or re.match(r"^[A-Za-z]:", link):
+                continue
+            if link.startswith(("/", "\\")) or not (path.parent / link.split("#", 1)[0]).resolve().is_relative_to(root):
+                relative = path.relative_to(repo).as_posix()
+                raise BundleRefusal(f"pack link outside the pack: {relative}: {target}")
+
+
+def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False, machine=None, packs=None, excluded=None):
+    machine_settings = machine or {}
+    if packs is None:
+        packs = validate_packs(machine_settings, repo, lambda key: f"machines/{name}.json")
+    if excluded is None:
+        excluded = validate_bundle_exclude(machine_settings, lambda key: f"machines/{name}.json")
     entries = {}
     add, add_tree = bundle_entry_adders(entries, plan_tools=plan_tools)
     add(repo / "install.py", "install.py")
     add(repo / "install-manifest.json", "install-manifest.json")
+    add(repo / ".claude" / "settings.json", ".claude/settings.json")
     add(repo / "claude" / "CLAUDE.md", "claude/CLAUDE.md")
     add(repo / "claude" / "keybindings.json", "claude/keybindings.json")
     add(repo / "claude" / "statusline-command.sh", "claude/statusline-command.sh")
@@ -1630,8 +1814,10 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
         "templates",
         excluded={"humanizer-install.md"},
     )
-    add(repo / "codex" / "AGENTS.md", "codex/AGENTS.md")
-    add(repo / "codex" / "config.template.toml", "codex/config.template.toml")
+    for filename in ("AGENTS.md", "config.template.toml"):
+        source = repo / "codex" / filename
+        if source.is_file():
+            add(source, "codex/" + filename)
     for source in sorted((repo / "audit").glob("*.py")):
         add(source, Path("audit") / source.name)
     for source in sorted((repo / "checkers").glob("*.py")):
@@ -1665,6 +1851,16 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
         source = repo / "machines" / f"{name}{suffix}"
         if source.is_file():
             add(source, Path("machines") / source.name)
+    for pack in packs:
+        add_tree(repo / "claude" / "packs" / pack, "claude/packs/" + pack)
+        check_pack_links(repo, pack)
+    for item in excluded:
+        prefix = (item if item.endswith("/") else f"claude/skills/{item}/").casefold()
+        matches = [relative for relative in entries if relative.casefold().startswith(prefix)]
+        if not matches:
+            print(f"bundle_exclude: no entry matched {item}")
+        for relative in matches:
+            del entries[relative]
     commit = bundle_commit(repo)
     entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, publish=publish, machine=machine).encode("utf-8")
     if not publish:
@@ -1916,9 +2112,11 @@ def build_bundle(options):
         validate_proxy(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         validate_remote(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         validate_gh_accounts(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
+        packs = validate_packs(machine, options["repo"], lambda key: local_relative if key in local_machine else f"machines/{name}.json")
+        bundle_excluded = validate_bundle_exclude(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         flags.pop("codex_first")
         flags.pop("statusline")
-        entries = bundle_file_entries(options["repo"], name, date, gate_record, machine=machine, **flags)
+        entries = bundle_file_entries(options["repo"], name, date, gate_record, machine=machine, packs=packs, excluded=bundle_excluded, **flags)
     except ValueError as exc:
         print(f"bundle refused: {exc}")
         return 2
@@ -2130,6 +2328,9 @@ def install(options):
         validate_machine_flags(machine, {"codex_first": True, "publish": False, "statusline": True}, sources.__getitem__)
         validate_machine_efforts(machine, sources.__getitem__)
         validate_gh_accounts(machine, sources.__getitem__)
+        packs = validate_packs(machine, options["repo"], sources.__getitem__)
+        validate_bundle_exclude(machine, sources.__getitem__)
+        pack_skills = pack_skill_sources(options["repo"], packs)
         machine.setdefault("codex_effort", DEFAULT_CODEX_EFFORT)
         machine.setdefault("claude_effort", DEFAULT_CLAUDE_EFFORT.copy())
         validate_statusline_weather(machine, sources.__getitem__)
@@ -2139,9 +2340,12 @@ def install(options):
         proxy_conflicts = proxy_launcher_conflicts(machine, options["home"])
         if proxy_conflicts and not options["dry_run"]:
             raise ValueError(f"{proxy_conflicts[0]} exists and was not written by install.py (set proxy.bin_dir to another folder or move that file)")
-        check_remote_skills(machine, options["home"], options["repo"])
+        check_remote_skills(machine, options["home"], options["repo"], pack_skills)
         if local_markdown_destination.exists() and not local_markdown_destination.is_file():
             raise ValueError(f"{local_markdown_destination}: must be a file")
+        shared_markdown = render_conditional_markdown(
+            (options["repo"] / "claude" / "CLAUDE.md").read_bytes().decode("utf-8-sig"), machine, options["repo"],
+        )
     except (OSError, ValueError) as exc:
         print(f"install refused: {exc}")
         return 2
@@ -2176,9 +2380,9 @@ def install(options):
         )
         installer.write_bytes(local_dir / "machine.local.md", stub.encode("utf-8"))
 
-    installer.copy_file(
-        options["repo"] / "claude" / "CLAUDE.md",
+    installer.write_bytes(
         options["home"] / ".claude" / "CLAUDE.md",
+        shared_markdown.encode("utf-8"),
     )
     install_keybindings(installer, options["repo"], options["home"])
     statusline_installed = install_statusline(installer, options["repo"], options["home"], machine)
@@ -2191,6 +2395,7 @@ def install(options):
             installer.sync_directory(
                 source, options["home"] / ".claude" / "skills" / source.name
             )
+    install_pack_skills(installer, pack_skills)
     install_gh_credentials(installer, machine)
     install_remote_skills(installer, machine, options["repo"])
     agents = options["repo"] / "claude" / "agents"
@@ -2206,10 +2411,9 @@ def install(options):
                 source,
                 options["home"] / ".claude" / "templates" / source.relative_to(templates),
             )
-    installer.copy_file(
-        options["repo"] / "codex" / "AGENTS.md",
-        options["home"] / ".codex" / "AGENTS.md",
-    )
+    codex_agents = options["repo"] / "codex" / "AGENTS.md"
+    if codex_agents.is_file():
+        installer.copy_file(codex_agents, options["home"] / ".codex" / "AGENTS.md")
 
     settings_path = options["home"] / ".claude" / "settings.json"
     existing_settings = read_json(settings_path) if settings_path.is_file() else {}
@@ -2290,6 +2494,18 @@ def install(options):
         )
         if completed.returncode != 0:
             tests_failed = True
+        for pack in packs:
+            folder = options["repo"] / "claude" / "packs" / pack
+            for path in sorted((folder / "tests").glob("*_test.py")):
+                completed = subprocess.run(
+                    [sys.executable, str(path)],
+                    cwd=folder,
+                    env=environment,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    print(f"pack tests failed: {pack}: {path.name}")
+                    tests_failed = True
     if installer.failed:
         print("install finished with removal failures")
         return 3

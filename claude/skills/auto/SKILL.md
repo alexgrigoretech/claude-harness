@@ -1,6 +1,6 @@
 ---
 name: auto
-description: Autonomously complete a task with a checkable goal by planning, delegating implementation to Codex, verifying, reviewing and looping until the goal holds, stopping with a written decision list when something needs the user. Use when the user says "auto", "just get it done", "run autonomously", "finish this while I am away", or hands over a goal and leaves.
+description: Autonomously complete a task with a checkable goal by planning, delegating implementation through the delegate skill, verifying, reviewing and looping until the goal holds, stopping with a written decision list when something needs the user. Use when the user says "auto", "just get it done", "run autonomously", "finish this while I am away", or hands over a goal and leaves.
 ---
 
 # Auto
@@ -16,8 +16,8 @@ Budget flags, given by the user or defaulted: `--max-iterations` (default 5) and
 ## Loop
 
 1. Plan once: read the repository, the newest handoff and the plan file for this project, decide the approach and the file list, and write the goal check as a command that exits 0 when the goal holds. Run it first; a goal that already holds ends the run.
-2. Implement through the delegate skill: one brief per iteration, Codex implements, this skill never edits source itself. Follow-ups on the same task go through `codex exec resume`, never a fresh run.
-3. Verify through the verify-pass skill on every Codex report. A refuted claim goes back through resume with the measurement attached.
+2. Implement through the delegate skill: one brief per iteration, the machine's implementer implements (Codex or a Sonnet agent, the delegate skill decides from codex_first), this skill never edits source itself. Follow-ups on the same task go through the delegate skill's resume step, never a fresh run.
+3. Verify through the verify-pass skill on every implementer report. A refuted claim goes back through resume with the measurement attached.
 4. Review: first mark every new file with `git add -N <path>` by explicit path so the runner's diff includes it (the runner diffs the working tree against the base and skips untracked files), then run the pr-review skill at tier 0 and tier 1 on the diff. Tier 2 runs only when tier 1 reports a finding or the diff touches auth, billing, a data path or a client repository. Confirmed findings go back through resume.
 5. Run the goal check. Holds: go to Finish. Does not hold: next iteration, with the failing output in the brief.
 
@@ -29,7 +29,7 @@ Any one of these ends the loop immediately and produces the decision list instea
 
 - An action on the ask-first list of the user's CLAUDE.md: dropping tables, force pushes, history rewrites, deleting data, replaying into a live consumer, sending anything to a client or a shared channel, pushing to a remote, deploying, registering scheduled tasks or services, editing another machine.
 - A permission denial from a hook or the classifier. Do not retry the denied action another way.
-- A Codex quota exhaustion (exit 0 with no output file). Record the session id so the next session can resume it.
+- An implementer quota exhaustion (Codex: exit 0 with no output file; a Claude agent: a usage-limit error). Record the session or agent id so the next session can resume it.
 - The same finding failing after two resumes.
 - A fork in the task that different readings would implement differently, or a fact the run needs that is not in the repository, the docs or the handoff.
 - The iteration or minute budget.

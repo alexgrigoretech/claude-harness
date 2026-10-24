@@ -42,6 +42,23 @@ TEST_MACHINE = os.environ.get("HARNESS_TEST_MACHINE") or sorted(
 BUNDLE_BUILD_TESTS = (REPO / "bundle-terms.txt").is_file()
 
 
+class SkillImplementerTests(unittest.TestCase):
+    def test_only_delegate_and_setup_name_codex_exec(self):
+        offending = [
+            str(path.relative_to(REPO))
+            for path in sorted((REPO / "claude" / "skills").glob("*/SKILL.md"))
+            if path.parent.name not in {"delegate", "setup"}
+            and "codex exec" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(offending, [], "Skills naming codex exec: " + ", ".join(offending))
+
+    def test_delegate_skill_carries_both_branches(self):
+        text = (REPO / "claude" / "skills" / "delegate" / "SKILL.md").read_text(encoding="utf-8")
+        for expected in ("codex_first", "SendMessage", "Delegating to a Sonnet agent", "--sandbox workspace-write"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+
+
 class AtomicWriteTextTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -2048,6 +2065,254 @@ class DraftWrapGuardTests(HookCase):
 
 class InstallerTests(unittest.TestCase):
     @contextlib.contextmanager
+    def conditional_markdown_fixture(self, text):
+        with tempfile.TemporaryDirectory(dir=self.base) as temporary:
+            with mock.patch.object(self, "base", Path(temporary)):
+                copied = self.copy_repo_without_local_machine_files("fixturepack")
+                (copied / "claude" / "CLAUDE.md").write_bytes(text.encode("utf-8"))
+                home = self.new_home("fixturesecond")
+                yield home, copied
+
+    def test_conditional_markdown_markers_removed_and_local_override(self):
+        text = "# Shared\n<!-- harness:if codex_first -->\nfixtureskill\n<!-- harness:else -->\nfixturetool\n<!-- harness:end -->\n"
+        with self.conditional_markdown_fixture(text) as (home, copied):
+            local = copied / "machines" / f"{TEST_MACHINE}.local.json"
+            destination = home / ".claude" / "CLAUDE.md"
+            for enabled, expected in ((True, "fixtureskill"), (False, "fixturetool")):
+                with self.subTest(codex_first=enabled):
+                    local.write_text(json.dumps({"codex_first": enabled}), encoding="utf-8")
+                    result = self.run_install(home, copied)
+                    self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                    self.assertEqual(destination.read_bytes(), f"# Shared\n{expected}\n".encode("utf-8"))
+                    self.assertNotIn("<!-- harness:", destination.read_text(encoding="utf-8"))
+            repeated = self.run_install(home, copied)
+            self.assertEqual(repeated.returncode, 0, repeated.stderr or repeated.stdout)
+            self.assertIn(f"ACTION  {destination}  (unchanged)", repeated.stdout)
+
+    def test_conditional_markdown_skill_and_negation(self):
+        text = "<!-- harness:if skill:fixtureskill -->\nfixtureskill\n<!-- harness:end -->\n<!-- harness:if !skill:fixtureskill -->\nfixturesecond\n<!-- harness:end -->\n"
+        with self.conditional_markdown_fixture(text) as (home, copied):
+            skill = copied / "claude" / "skills" / "fixtureskill"
+            self.assertFalse(skill.exists())
+            for present, expected in ((False, b"fixturesecond\n"), (True, b"fixtureskill\n")):
+                with self.subTest(present=present):
+                    if present:
+                        skill.mkdir()
+                    result = self.run_install(home, copied)
+                    self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                    self.assertEqual((home / ".claude" / "CLAUDE.md").read_bytes(), expected)
+
+    def test_conditional_markdown_pack_skill_and_negation(self):
+        text = "<!-- harness:if skill:fixtureskill -->\nfixtureskill\n<!-- harness:end -->\n<!-- harness:if !skill:fixtureskill -->\nfixturesecond\n<!-- harness:end -->\n"
+        with self.gh_credentials_fixture() as (module, installer, home):
+            skill = home / "claude" / "packs" / "fixturepack" / "skills" / "fixtureskill"
+            skill.mkdir(parents=True)
+            for machine, expected in (
+                ({"packs": ["fixturepack"]}, "fixtureskill\n"),
+                ({}, "fixturesecond\n"),
+                ({"packs": []}, "fixturesecond\n"),
+                ({"packs": ["fixturesecond"]}, "fixturesecond\n"),
+                ({"packs": None}, "fixturesecond\n"),
+                ({"packs": "fixturepack"}, "fixturesecond\n"),
+                ({"packs": {}}, "fixturesecond\n"),
+            ):
+                with self.subTest(machine=machine):
+                    self.assertEqual(module.render_conditional_markdown(text, machine, home), expected)
+
+    def test_conditional_markdown_client_reviewers(self):
+        text = "".join(
+            f"<!-- harness:if reviewer:{name} -->\n{name}\n<!-- harness:end -->\n"
+            f"<!-- harness:if !reviewer:{name} -->\nfixtureskill\n<!-- harness:end -->\n"
+            for name in ("muse", "kimi", "fixturetool")
+        )
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for configured in (None, [{"name": name} for name in ("muse", "kimi", "fixturetool")]):
+                for client in (False, True):
+                    with self.subTest(configured=configured, client=client):
+                        machine = {"client": client, "pr_review_reviewers": configured}
+                        expected = "fixtureskill\nfixtureskill\nfixturetool\n" if client else "muse\nkimi\nfixturetool\n"
+                        self.assertEqual(module.render_conditional_markdown(text, machine, home), expected)
+
+    def test_conditional_markdown_reviewer_and_negation(self):
+        text = "<!-- harness:if reviewer:fixturetool -->\nfixturetool\n<!-- harness:end -->\n<!-- harness:if !reviewer:fixturetool -->\nfixturesecond\n<!-- harness:end -->\n"
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for machine, expected in (
+                ({}, "fixturetool\n"),
+                ({"pr_review_reviewers": [{"name": "fixturetool", "cmd": "fixturetool", "stdin": True}]}, "fixturetool\n"),
+                ({"pr_review_reviewers": [{"name": "fixturesecond", "cmd": "fixturesecond", "stdin": True}]}, "fixturesecond\n"),
+                ({"pr_review_reviewers": []}, "fixturetool\n"),
+                ({"pr_review_reviewers": None}, "fixturetool\n"),
+                ({"pr_review_reviewers": {}}, "fixturetool\n"),
+                ({"pr_review_reviewers": "fixturetool"}, "fixturetool\n"),
+                ({"pr_review_reviewers": 1}, "fixturetool\n"),
+                ({"pr_review_reviewers": ["fixturetool"]}, "fixturesecond\n"),
+            ):
+                with self.subTest(machine=machine):
+                    self.assertEqual(module.render_conditional_markdown(text, machine, home), expected)
+
+    def test_conditional_markdown_refusals_before_writes(self):
+        cases = (
+            ("<!-- harness:if fixturetool -->\n<!-- harness:end -->\n", 2, "<!-- harness:if fixturetool -->"),
+            ("<!-- harness:end -->\n", 2, "<!-- harness:end -->"),
+            ("<!-- harness:if codex_first -->\nfixtureskill\n", 2, "<!-- harness:if codex_first -->"),
+            ("<!-- harness:if codex_first -->\n<!-- harness:else -->\n<!-- harness:else -->\n<!-- harness:end -->\n", 4, "<!-- harness:else -->"),
+            ("<!-- harness:if codex_first -->\n<!-- harness:if harvest -->\n<!-- harness:end -->\n", 3, "<!-- harness:if harvest -->"),
+            ("<!-- harness:else -->\n", 2, "<!-- harness:else -->"),
+            ("<!-- harness:if codex_first and harvest -->\n<!-- harness:end -->\n", 2, "<!-- harness:if codex_first and harvest -->"),
+            ("<!-- harness:unknown -->\n", 2, "<!-- harness:unknown -->"),
+        )
+        for text, line_number, marker in cases:
+            with self.subTest(text=text):
+                with self.conditional_markdown_fixture("# Shared\n" + text) as (home, copied):
+                    result = self.run_install(home, copied)
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertIn(f"install refused: line {line_number}: {marker}", result.stdout)
+                    self.assertEqual(list(home.iterdir()), [])
+
+    def test_conditional_markdown_dry_run(self):
+        text = "<!-- harness:if codex_first -->\nfixtureskill\n<!-- harness:else -->\nfixturetool\n<!-- harness:end -->\n"
+        with self.conditional_markdown_fixture(text) as (home, copied):
+            result = self.run_install(home, copied, ["--dry-run"])
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertIn(f"ACTION  {home / '.claude' / 'CLAUDE.md'}  (would write)", result.stdout)
+            self.assertEqual(list(home.iterdir()), [])
+
+    def test_conditional_markdown_without_markers_byte_identical(self):
+        text = "# Shared\n\n  fixtureskill  \n\nfixturetool\n"
+        with self.conditional_markdown_fixture(text) as (home, copied):
+            result = self.run_install(home, copied)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual((home / ".claude" / "CLAUDE.md").read_bytes(), text.encode("utf-8"))
+
+    def test_conditional_markdown_real_shared_file(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            source = REPO / "claude" / "CLAUDE.md"
+            raw = source.read_text(encoding="utf-8")
+
+            def expected_markdown(repo, machine):
+                expected = []
+                keep = True
+                for line in raw.splitlines(keepends=True):
+                    marker = line.strip()
+                    if marker.startswith("<!-- harness:if "):
+                        condition = marker.removeprefix("<!-- harness:if ").removesuffix(" -->")
+                        if condition == "codex_first":
+                            keep = machine[condition]
+                        elif condition.startswith("skill:"):
+                            keep = (repo / "claude" / "skills" / condition.split(":", 1)[1]).is_dir()
+                        else:
+                            self.assertTrue(condition.startswith("reviewer:"), condition)
+                            keep = True
+                    elif marker == "<!-- harness:else -->":
+                        keep = not keep
+                    elif marker == "<!-- harness:end -->":
+                        keep = True
+                    elif keep:
+                        expected.append(line)
+                return "".join(expected)
+
+            machine = {"codex_first": True}
+            expected = expected_markdown(REPO, machine)
+            rendered = module.render_conditional_markdown(raw, machine, REPO)
+            self.assertEqual(rendered, expected)
+            self.assertNotIn("<!-- harness:", rendered)
+            self.assertLessEqual(len(rendered.splitlines()), 80)
+            self.assertNotIn(b"\r", source.read_bytes())
+            alternative = module.render_conditional_markdown(raw, {"codex_first": False}, REPO)
+            self.assertLessEqual(len(alternative.splitlines()), 80)
+            self.assertIn("Delegating to a Sonnet agent", alternative)
+            self.assertNotIn("codex exec", alternative)
+            with self.subTest(repo="fixturepack"):
+                copied = self.copy_repo_without_local_machine_files("fixturepack")
+                remote = copied / "claude" / "skills" / "remote"
+                self.assertTrue(remote.resolve().is_relative_to(self.base.resolve()))
+                if remote.is_dir():
+                    shutil.rmtree(remote)
+                self.assertFalse(remote.exists())
+                rendered = module.render_conditional_markdown(raw, machine, copied)
+                self.assertEqual(rendered, expected_markdown(copied, machine))
+                self.assertNotIn("Remote prompts", rendered)
+                self.assertIn("Muse Wonder Full", rendered)
+
+    def test_conditional_markdown_boolean_defaults_and_negation(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            defaults = {"codex_first": True, "harvest": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
+            for key, default in defaults.items():
+                text = f"<!-- harness:if {key} -->\nfixtureskill\n<!-- harness:else -->\nfixturesecond\n<!-- harness:end -->\n"
+                negated = text.replace(f"if {key}", f"if !{key}")
+                for machine, enabled in (({}, default), ({key: True}, True), ({key: False}, False)):
+                    with self.subTest(key=key, machine=machine):
+                        self.assertEqual(module.render_conditional_markdown(text, machine, home), "fixtureskill\n" if enabled else "fixturesecond\n")
+                        self.assertEqual(module.render_conditional_markdown(negated, machine, home), "fixturesecond\n" if enabled else "fixtureskill\n")
+            text = "<!-- harness:if fixturetool -->\nfixtureskill\n<!-- harness:end -->\n"
+            self.assertEqual(module.render_conditional_markdown(text, {"fixturetool": True}, home), "fixtureskill\n")
+
+    def test_conditional_markdown_non_boolean_named_key_refused(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for key in ("codex_first", "fixturetool"):
+                for value in (None, 0, 1, "true", [], {}):
+                    with self.subTest(key=key, value=value):
+                        marker = f"<!-- harness:if {key} -->"
+                        with self.assertRaisesRegex(ValueError, f"line 1: {marker}: {key} must be true or false"):
+                            module.render_conditional_markdown(marker + "\n<!-- harness:end -->\n", {key: value}, home)
+
+    def test_conditional_markdown_preserves_whitespace_and_physical_lines(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            text = "# Shared\n\n \t<!-- harness:if codex_first --> \t\n  fixtureskill  \n\n \t<!-- harness:else --> \t\nfixturesecond\n \t<!-- harness:end --> \t\nfixturetool\n"
+            expected = "# Shared\n\n  fixtureskill  \n\nfixturetool\n"
+            self.assertEqual(module.render_conditional_markdown(text, {}, home), expected)
+            self.assertEqual(module.render_conditional_markdown("fixtureskill", {}, home), "fixtureskill")
+            for separator in ("\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+                with self.subTest(separator=separator):
+                    content = f"fixtureskill{separator}fixturetool\nfixturesecond\n"
+                    self.assertEqual(module.render_conditional_markdown(content, {}, home).encode("utf-8"), content.encode("utf-8"))
+                    with self.assertRaisesRegex(ValueError, "line 3: <!-- harness:end -->"):
+                        module.render_conditional_markdown(content + "<!-- harness:end -->\n", {}, home)
+
+    def test_conditional_markdown_fenced_markers_are_content(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for fence, other_fence in (("```", "~~~"), ("~~~", "```")):
+                content = f"  {fence}text\n<!-- harness:if fixturetool -->\nfixturetool <!-- harness:end -->\n{other_fence}\n<!-- harness:else -->\n<!-- harness:end -->\n{fence}\n"
+                text = f"<!-- harness:if codex_first -->\n{content}fixtureskill\n<!-- harness:else -->\nfixturesecond\n<!-- harness:end -->\n"
+                for enabled in (True, False):
+                    with self.subTest(fence=fence, codex_first=enabled):
+                        expected = content + "fixtureskill\n" if enabled else "fixturesecond\n"
+                        self.assertEqual(module.render_conditional_markdown(text, {"codex_first": enabled}, home), expected)
+                with self.subTest(fence=fence):
+                    self.assertEqual(module.render_conditional_markdown(content, {}, home), content)
+
+    def test_conditional_markdown_stray_markers_refused_before_writes(self):
+        for marker in (
+            "fixturetool <!-- harness:if codex_first -->",
+            "<!-- harness:if codex_first --> fixturetool",
+            "<!-- harness:end --> fixturetool",
+            "<!-- harness:else --> fixturetool",
+            "<!-- harness:unknown -->",
+        ):
+            with self.subTest(marker=marker):
+                with self.conditional_markdown_fixture(f"# Shared\n{marker}\n") as (home, copied):
+                    result = self.run_install(home, copied)
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertIn(f"install refused: line 2: {marker}: marker must be alone on its line", result.stdout)
+                    self.assertEqual(list(home.iterdir()), [])
+
+    def test_conditional_markdown_install_preserves_crlf(self):
+        text = "# Shared\r\n<!-- harness:if codex_first -->\r\nfixtureskill\r\n<!-- harness:end -->\r\n"
+        with self.conditional_markdown_fixture(text) as (home, copied):
+            local = copied / "machines" / f"{TEST_MACHINE}.local.json"
+            local.write_text(json.dumps({"codex_first": True}), encoding="utf-8")
+            result = self.run_install(home, copied)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual((home / ".claude" / "CLAUDE.md").read_bytes(), b"# Shared\r\nfixtureskill\r\n")
+
+    def test_conditional_markdown_install_drops_bom_only(self):
+        text = "# Shared\r\nfixtureskill\r\nfixturetool"
+        with self.conditional_markdown_fixture("\ufeff" + text) as (home, copied):
+            result = self.run_install(home, copied)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual((home / ".claude" / "CLAUDE.md").read_bytes(), text.encode("utf-8"))
+
+    @contextlib.contextmanager
     def gh_credentials_fixture(self):
         spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
         module = importlib.util.module_from_spec(spec)
@@ -2286,6 +2551,7 @@ class InstallerTests(unittest.TestCase):
         copied.mkdir()
         ignore_local = shutil.ignore_patterns("*.local.json", "*.local.md", "*.bundle-terms.txt", "__pycache__")
         for directory in (
+            ".claude",
             "machines",
             "claude",
             "templates",
@@ -2365,6 +2631,419 @@ class InstallerTests(unittest.TestCase):
             check=False,
         )
 
+    def pack_fixture(self, name):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        copied = self.copy_repo_without_local_machine_files(name + "-repo")
+        codex = copied / "codex"
+        codex.mkdir(exist_ok=True)
+        for filename, content in (("AGENTS.md", "fixturetool\n"), ("config.template.toml", "fixturetool = true\n")):
+            path = codex / filename
+            if not path.is_file():
+                path.write_bytes(content.encode("utf-8"))
+        home = self.new_home(name + "-home")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine.pop("packs", None)
+        machine.pop("bundle_exclude", None)
+        machine_path.write_bytes(module.json_bytes(machine))
+        folder = copied / "claude" / "packs" / "fixturepack"
+        skill = folder / "skills" / "fixtureskill"
+        skill.mkdir(parents=True)
+        delimiter = "-" * 3
+        (skill / "SKILL.md").write_text(f"{delimiter}\nname: fixtureskill\n{delimiter}\n\nfixtureskill\n", encoding="utf-8")
+        (folder / "PACK.md").write_text("fixturepack\n", encoding="utf-8")
+        for directory in ("tools", "templates", "tests"):
+            (folder / directory).mkdir()
+        (folder / "tools" / "fixturetool.py").write_text("print('fixturetool')\n", encoding="utf-8")
+        (folder / "templates" / "fixturetool.md").write_text("fixturetool\n", encoding="utf-8")
+        (folder / "tests" / "fixturetool_test.py").write_text("from pathlib import Path\nPath('fixturetool').write_text('fixtureskill', encoding='utf-8')\n", encoding="utf-8")
+        return module, copied, home, machine, folder
+
+    def pack_bundle_entries(self, module, copied, machine):
+        return module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "harvest.py").is_file(), machine=machine)
+
+    def test_packs_absent_bundle_and_install(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-absent")
+        entries = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertFalse(any(path.startswith("claude/packs/") for path in entries))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse((home / ".claude" / "skills" / "fixtureskill").exists())
+        self.assertEqual(read_json_test(home / ".claude" / "local" / "pack-skills.json"), {"skills": []})
+        self.assertFalse((folder / "fixturetool").exists())
+
+    def test_packs_listed_bundle_install_and_pack_tests(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-listed")
+        (folder / "tests" / "helper.py").write_text("value = 'fixtureskill'\n", encoding="utf-8")
+        (folder / "tools" / "fixturetool.py").write_text("value = 'fixturetool'\n", encoding="utf-8")
+        (folder / "tests" / "fixturetool_test.py").write_text("import sys\nfrom pathlib import Path\nimport helper\nsys.path.insert(0, str(Path(__file__).resolve().parents[1]))\nfrom tools import fixturetool\nassert fixturetool.value == 'fixturetool'\nPath('fixturetool').write_text(helper.value, encoding='utf-8')\n", encoding="utf-8")
+        machine["packs"] = ["fixturepack"]
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        entries = dict(self.pack_bundle_entries(module, copied, machine))
+        for relative in ("PACK.md", "skills/fixtureskill/SKILL.md", "tools/fixturetool.py", "templates/fixturetool.md", "tests/fixturetool_test.py"):
+            self.assertIn("claude/packs/fixturepack/" + relative, entries)
+        options = module.parse_args([])
+        options.update(machine=TEST_MACHINE, repo=copied, home=home)
+        original_run = module.subprocess.run
+        hooks_path = str(home / ".claude" / "hooks" / "hooks_test.py")
+
+        def run(command, **kwargs):
+            if command == [sys.executable, hooks_path]:
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(module.subprocess, "run", side_effect=run) as calls, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(module.install(options), 0)
+        self.assertTrue((home / ".claude" / "skills" / "fixtureskill" / "SKILL.md").is_file())
+        self.assertEqual(read_json_test(home / ".claude" / "local" / "pack-skills.json"), {"skills": ["fixtureskill"]})
+        self.assertEqual((folder / "fixturetool").read_text(encoding="utf-8"), "fixtureskill")
+        commands = [call.args[0] for call in calls.call_args_list]
+        pack_command = [sys.executable, str(folder / "tests" / "fixturetool_test.py")]
+        self.assertLess(commands.index([sys.executable, hooks_path]), commands.index(pack_command))
+        self.assertFalse((home / ".claude" / "templates" / "fixturetool.md").exists())
+
+    def test_pack_folder_missing_refused_before_writes(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-missing")
+        machine["packs"] = ["fixturetool"]
+        with self.assertRaisesRegex(ValueError, "pack folder missing: claude/packs/fixturetool"):
+            module.validate_packs(machine, copied, lambda key: "fixturepack")
+        with self.assertRaisesRegex(ValueError, "pack folder missing"):
+            self.pack_bundle_entries(module, copied, machine)
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("pack folder missing", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_pack_skill_collision_with_base_refused_before_writes(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-collision")
+        base = next(path for path in sorted((copied / "claude" / "skills").iterdir()) if path.is_dir())
+        (folder / "skills" / base.name).mkdir()
+        with self.assertRaisesRegex(ValueError, "pack skill collides with a base skill: " + re.escape(base.name)):
+            module.pack_skill_sources(copied, ["fixturepack"])
+        machine["packs"] = ["fixturepack"]
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("collides with a base skill", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_pack_skill_collision_between_packs(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-collision-pair")
+        shutil.copytree(folder, folder.with_name("fixturetool"))
+        with self.assertRaisesRegex(ValueError, "pack skill collides with another pack: fixtureskill"):
+            module.pack_skill_sources(copied, ["fixturepack", "fixturetool"])
+
+    def test_pack_skill_collision_with_base_ignores_case(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-case-collision")
+        shutil.copytree(folder / "skills" / "fixtureskill", copied / "claude" / "skills" / "Fixtureskill")
+        with self.assertRaisesRegex(ValueError, "pack skill collides with a base skill: fixtureskill"):
+            module.pack_skill_sources(copied, ["fixturepack"])
+        machine["packs"] = ["fixturepack"]
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("pack skill collides with a base skill: fixtureskill", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_pack_removed_cleans_recorded_skills_only(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-removed")
+        machine["packs"] = ["fixturepack"]
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine_path.write_bytes(module.json_bytes(machine))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        base = next(path for path in sorted((copied / "claude" / "skills").iterdir()) if path.is_dir())
+        base_before = module.tree_snapshot(home / ".claude" / "skills" / base.name)
+        unrecorded = home / ".claude" / "skills" / "fixturetool" / "SKILL.md"
+        unrecorded.parent.mkdir()
+        unrecorded.write_text("fixturetool\n", encoding="utf-8")
+        machine.pop("packs")
+        machine_path.write_bytes(module.json_bytes(machine))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse((home / ".claude" / "skills" / "fixtureskill").exists())
+        self.assertEqual(read_json_test(home / ".claude" / "local" / "pack-skills.json"), {"skills": []})
+        self.assertEqual(module.tree_snapshot(home / ".claude" / "skills" / base.name), base_before)
+        self.assertEqual(unrecorded.read_text(encoding="utf-8"), "fixturetool\n")
+
+    def test_pack_skill_promoted_to_base_survives_install(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-promoted")
+        source = folder / "skills" / "fixtureskill"
+        shutil.copytree(source, copied / "claude" / "skills" / "fixtureskill")
+        record = home / ".claude" / "local" / "pack-skills.json"
+        record.parent.mkdir(parents=True)
+        record.write_bytes(module.json_bytes({"skills": ["fixtureskill"]}))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        installed = home / ".claude" / "skills" / "fixtureskill" / "SKILL.md"
+        self.assertTrue(installed.is_file())
+        self.assertEqual(installed.read_bytes(), (source / "SKILL.md").read_bytes())
+        self.assertEqual(read_json_test(record), {"skills": []})
+
+    def test_pack_remote_skill_collision_refused_before_writes(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-remote-collision")
+        machine["packs"] = ["fixturepack"]
+        machine["remote"] = {"fixtureskill": {"ssh": "fixturetool"}}
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        sources = module.pack_skill_sources(copied, machine["packs"])
+        with self.assertRaisesRegex(ValueError, "remote.fixtureskill conflicts with a repository skill"):
+            module.check_remote_skills(machine, home, copied, sources)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("remote.fixtureskill conflicts with a repository skill", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_pack_link_check_outside_refused_inside_missing_allowed(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-links")
+        machine["packs"] = ["fixturepack"]
+        markdown = folder / "PACK.md"
+        markdown.write_text("[fixturetool](../../common/x.md)\n", encoding="utf-8")
+        with self.assertRaisesRegex(module.BundleRefusal, "pack link outside the pack: claude/packs/fixturepack/PACK.md: ../../common/x.md"):
+            self.pack_bundle_entries(module, copied, machine)
+        for content in (
+            "[fixturetool](<../../common/x.md>)\n",
+            "  [fixturetool]: ../../common/x.md\n",
+            "[fixturetool]: <../../common/x.md>\n",
+            "[fixturetool](/fixturetool)\n",
+            "[fixturetool](\\fixturetool)\n",
+            '[fixturetool](../../x.md "fixturetool")\n',
+            '[fixturetool](<../../x.md> "fixturetool")\n',
+            "[fixturetool](%2E%2E/%2E%2E/x.md)\n",
+            "[fixturetool](%2Ffixturetool)\n",
+        ):
+            with self.subTest(content=content):
+                markdown.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(module.BundleRefusal, "pack link outside the pack"):
+                    self.pack_bundle_entries(module, copied, machine)
+        markdown.write_text("[fixturetool](references/x.md)\n[fixturetool](references/x%20y.md)\n[fixturetool](#fixturetool)\n[fixturetool](C:/fixturetool)\n  [fixturetool]: references/x.md\n", encoding="utf-8")
+        self.assertIn("claude/packs/fixturepack/PACK.md", dict(self.pack_bundle_entries(module, copied, machine)))
+        allowed = markdown.read_text(encoding="utf-8")
+        for fence in (chr(96) * 3, "~~~"):
+            with self.subTest(fence=fence):
+                markdown.write_text(allowed + f"\n{fence}\n[fixturetool](../../y.md)\n[fixturetool]: ../../x.md\n{fence}\n", encoding="utf-8")
+                self.pack_bundle_entries(module, copied, machine)
+        markdown.write_text(allowed + chr(96) + "[fixturetool](../../y.md)" + chr(96) + "\n", encoding="utf-8")
+        self.pack_bundle_entries(module, copied, machine)
+        nested = folder / "skills" / "fixtureskill" / "SKILL.md"
+        nested.write_text(nested.read_text(encoding="utf-8") + "\n[fixturetool](../../../../common/x.md)\n", encoding="utf-8")
+        with self.assertRaisesRegex(module.BundleRefusal, "pack link outside the pack"):
+            self.pack_bundle_entries(module, copied, machine)
+
+    def test_bundle_exclude_names_prefixes_empty_and_validation(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-exclude")
+        shutil.copytree(folder / "skills" / "fixtureskill", copied / "claude" / "skills" / "Fixtureskill")
+        shutil.copytree(folder / "skills" / "fixtureskill", copied / "claude" / "skills" / "fixturesecond")
+        original = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertIn("claude/skills/Fixtureskill/SKILL.md", original)
+        self.assertTrue(any(path.startswith("claude/skills/fixturesecond/") for path in original))
+        self.assertIn("codex/AGENTS.md", original)
+        machine["bundle_exclude"] = ["fixturesecond", "codex/"]
+        entries = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertFalse(any(path.startswith(("claude/skills/fixturesecond/", "codex/")) for path in entries))
+        self.assertIn(b"Excluded by the machine file: fixturesecond, codex/\n", entries["INSTALL.md"])
+        self.assertNotIn(b"codex/AGENTS.md\n", entries["MANIFEST.txt"])
+        machine["bundle_exclude"] = ["FIXTURESECOND", "CODEX/", "fixturetool/"]
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            mixed = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertEqual(output.getvalue(), "bundle_exclude: no entry matched fixturetool/\n")
+        self.assertEqual(set(mixed), set(entries))
+        machine["bundle_exclude"] = []
+        self.assertEqual(dict(self.pack_bundle_entries(module, copied, machine)), original)
+        machine["bundle_exclude"] = ["fixtureskill"]
+        folded = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertFalse(any(path.startswith("claude/skills/Fixtureskill/") for path in folded))
+        for value in ("fixturesecond", None, [""], [" "], [1], ["codex/AGENTS.md"], [" fixturesecond"], ["fixturesecond "], ["codex/ "], ["\tcodex/"]):
+            with self.subTest(value=value):
+                machine["bundle_exclude"] = value
+                with self.assertRaisesRegex(ValueError, "fixturepack: bundle_exclude must be a list"):
+                    module.validate_bundle_exclude(machine, lambda key: "fixturepack")
+                with self.assertRaisesRegex(ValueError, "bundle_exclude must be a list"):
+                    self.pack_bundle_entries(module, copied, machine)
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_bytes(module.json_bytes({"bundle_exclude": "fixturesecond"}))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn(f"{TEST_MACHINE}.local.json: bundle_exclude must be a list", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_conditional_codex_copy_missing_and_present(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-codex")
+        agents = copied / "codex" / "AGENTS.md"
+        content = agents.read_bytes()
+        agents.unlink()
+        (copied / "codex" / "config.template.toml").unlink()
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse((home / ".codex" / "AGENTS.md").exists())
+        self.assertNotIn(str(agents), result.stdout)
+        agents.write_bytes(content)
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual((home / ".codex" / "AGENTS.md").read_bytes(), content)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_without_codex_sources_succeeds(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-bundle-no-codex")
+        for filename in ("AGENTS.md", "config.template.toml"):
+            (copied / "codex" / filename).unlink()
+        output = self.base / "packs-bundle-no-codex.zip"
+        result = self.run_bundle(copied, output)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(output) as archive:
+            self.assertFalse(any(path.startswith("codex/") for path in archive.namelist()))
+            self.assertIn("install.py", archive.namelist())
+
+    def test_packs_validation_rejects_string_and_invalid_names(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-validation")
+        for packs in (["fixturepack", "fixturepack"], ["fixturepack", "FIXTUREPACK"]):
+            with self.subTest(packs=packs):
+                with self.assertRaisesRegex(ValueError, "fixturepack: packs must not repeat a pack name"):
+                    module.validate_packs({"packs": packs}, copied, lambda key: "fixturepack")
+        for value in ("powerbi", None, {}, [""], [" "], [1], ["../fixturepack"], ["fixturepack/x"], ["fixturepack.x"]):
+            with self.subTest(value=value):
+                machine["packs"] = value
+                with self.assertRaisesRegex(ValueError, "fixturepack: packs must be a list of pack folder names"):
+                    module.validate_packs(machine, copied, lambda key: "fixturepack")
+                with self.assertRaisesRegex(ValueError, "packs must be a list"):
+                    self.pack_bundle_entries(module, copied, machine)
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_bytes(module.json_bytes({"packs": "powerbi"}))
+        result = self.run_install(home, copied)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn(f"{TEST_MACHINE}.local.json: packs must be a list", result.stdout)
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_pack_skills_failed_removal_stays_recorded_for_retry(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-removal-retry")
+        installer = module.Installer(home, copied, False)
+        sources = module.pack_skill_sources(copied, ["fixturepack"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.install_pack_skills(installer, sources)
+        destination = home / ".claude" / "skills" / "fixtureskill"
+        record = home / ".claude" / "local" / "pack-skills.json"
+
+        def fail_removal(path):
+            installer.failed = True
+
+        with mock.patch.object(installer, "remove", side_effect=fail_removal) as remove, contextlib.redirect_stdout(io.StringIO()):
+            module.install_pack_skills(installer, {})
+        remove.assert_called_once_with(destination)
+        self.assertTrue(installer.failed)
+        self.assertTrue(destination.is_dir())
+        self.assertEqual(read_json_test(record), {"skills": ["fixtureskill"]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.install_pack_skills(module.Installer(home, copied, False), {})
+        self.assertFalse(destination.exists())
+        self.assertEqual(read_json_test(record), {"skills": []})
+
+    def test_pack_fixture_supplies_omitted_codex_sources(self):
+        copy_repo = self.copy_repo_without_local_machine_files
+
+        def copy_without_codex(name):
+            copied = copy_repo(name)
+            for filename in ("AGENTS.md", "config.template.toml"):
+                (copied / "codex" / filename).unlink(missing_ok=True)
+            return copied
+
+        with mock.patch.object(self, "copy_repo_without_local_machine_files", side_effect=copy_without_codex):
+            module, copied, home, machine, folder = self.pack_fixture("packs-omitted-codex")
+        entries = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertEqual(entries["codex/AGENTS.md"], b"fixturetool\n")
+        self.assertEqual(entries["codex/config.template.toml"], b"fixturetool = true\n")
+
+    def test_pack_bundle_prevalidated_lists_preserve_original_machine(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-prevalidated")
+        for configured in (None, {}):
+            with self.subTest(machine=configured), mock.patch.object(module, "validate_packs") as packs, mock.patch.object(module, "validate_bundle_exclude") as excluded, mock.patch.object(module, "bundle_install_text", wraps=module.bundle_install_text) as text:
+                module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "harvest.py").is_file(), machine=configured, packs=[], excluded=[])
+                packs.assert_not_called()
+                excluded.assert_not_called()
+                self.assertIs(text.call_args.kwargs["machine"], configured)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_packs_bundle_validates_lists_once_with_local_source(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-validation-once")
+        local = copied / "machines" / f"{TEST_MACHINE}.local.json"
+        local.write_bytes(module.json_bytes({"packs": ["fixturepack"], "bundle_exclude": ["fixturetool/"]}))
+        options = module.parse_args([])
+        options.update(bundle=TEST_MACHINE, repo=copied, home=self.bundle_home(copied), out=self.base / "packs-validation-once.zip")
+        with mock.patch.object(module, "validate_packs", wraps=module.validate_packs) as packs, mock.patch.object(module, "validate_bundle_exclude", wraps=module.validate_bundle_exclude) as excluded, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(module.build_bundle(options), 0, output.getvalue())
+        packs.assert_called_once()
+        excluded.assert_called_once()
+        self.assertEqual(packs.call_args.args[2]("packs"), f"machines/{TEST_MACHINE}.local.json")
+        self.assertEqual(excluded.call_args.args[1]("bundle_exclude"), f"machines/{TEST_MACHINE}.local.json")
+
+    def test_pack_skills_malformed_record_is_empty_and_dry_run_is_safe(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-record")
+        installer = module.Installer(home, copied, False)
+        record = home / ".claude" / "local" / "pack-skills.json"
+        record.parent.mkdir(parents=True)
+        unrecorded = home / ".claude" / "skills" / "fixturetool" / "SKILL.md"
+        unrecorded.parent.mkdir(parents=True)
+        unrecorded.write_text("fixturetool\n", encoding="utf-8")
+        for content in (b"{", b"[]", b'{"skills": null}', b'{"skills": ["../fixturetool"]}'):
+            with self.subTest(content=content), contextlib.redirect_stdout(io.StringIO()):
+                record.write_bytes(content)
+                module.install_pack_skills(installer, {})
+                self.assertEqual(read_json_test(record), {"skills": []})
+                self.assertTrue(unrecorded.is_file())
+        sources = module.pack_skill_sources(copied, ["fixturepack"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.install_pack_skills(installer, sources)
+        before = module.tree_snapshot(home)
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.install_pack_skills(module.Installer(home, copied, True), {})
+        self.assertEqual(module.tree_snapshot(home), before)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_packs_bundle_gate_and_unlisted_pack_omitted(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-gate")
+        output_path = self.base / "packs-absent.zip"
+        result = self.run_bundle(copied, output_path)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(output_path) as archive:
+            self.assertFalse(any(path.startswith("claude/packs/") for path in archive.namelist()))
+            self.assertIn("codex/AGENTS.md", archive.namelist())
+        machine["packs"] = ["fixturepack"]
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        bundled = self.base / "packs-listed.zip"
+        result = self.run_bundle(copied, bundled)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with zipfile.ZipFile(bundled) as archive:
+            self.assertIn("claude/packs/fixturepack/PACK.md", archive.namelist())
+            self.assertIn("claude/packs/fixturepack/skills/fixtureskill/SKILL.md", archive.namelist())
+        (folder / "PACK.md").write_text("bundleprobe" + " exclusion\n", encoding="utf-8")
+        refused = self.base / "packs-refused.zip"
+        result = self.run_bundle(copied, refused)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("GATE claude/packs/fixturepack/PACK.md:1:", result.stdout)
+        self.assertFalse(refused.exists())
+
+    def test_pack_tests_failure_and_dry_run(self):
+        module, copied, home, machine, folder = self.pack_fixture("packs-test-failure")
+        machine["packs"] = ["fixturepack"]
+        (copied / "machines" / f"{TEST_MACHINE}.json").write_bytes(module.json_bytes(machine))
+        options = module.parse_args([])
+        options.update(machine=TEST_MACHINE, repo=copied, home=home)
+        original_run = module.subprocess.run
+
+        def run(command, **kwargs):
+            if command[0] == sys.executable:
+                return subprocess.CompletedProcess(command, 1 if command[-1].endswith("fixturetool_test.py") else 0)
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(module.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(module.install(options), 2)
+        self.assertIn("install finished with hook test failures", output.getvalue())
+        self.assertIn("pack tests failed: fixturepack: fixturetool_test.py\n", output.getvalue())
+        options["dry_run"] = True
+        with mock.patch.object(module.subprocess, "run", side_effect=run) as calls, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(module.install(options), 0)
+        self.assertFalse(any(call.args[0][0] == sys.executable for call in calls.call_args_list))
+        self.assertFalse((folder / "fixturetool").exists())
+
     def test_empty_home_install(self):
         home = self.new_home("empty-home")
         copied = self.copy_repo_without_local_machine_files("empty-repo")
@@ -2380,9 +3059,12 @@ class InstallerTests(unittest.TestCase):
             home / ".claude" / "local" / "machine.md",
             home / ".claude" / "local" / "machine.local.md",
             home / ".claude" / "local" / "harness-mode",
-            home / ".codex" / "AGENTS.md",
         ):
             self.assertTrue(path.is_file(), str(path))
+        if (copied / "codex" / "AGENTS.md").is_file():
+            self.assertTrue((home / ".codex" / "AGENTS.md").is_file())
+        else:
+            self.assertFalse((home / ".codex" / "AGENTS.md").exists())
         self.assertEqual(
             read_json_test(home / ".claude" / "keybindings.json"),
             read_json_test(copied / "claude" / "keybindings.json"),
@@ -2406,7 +3088,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(settings["modelSettings"]["claude-fable-5-1"]["effortLevel"], "medium")
         installed_machine = read_json_test(home / ".claude" / "local" / "machine.json")
         self.assertEqual(installed_machine["codex_effort"], "high")
-        self.assertEqual(installed_machine["claude_effort"], {"claude-fable-5-1": "medium", "claude-opus-5-5": "high", "claude-sonnet-5-5": "medium", "claude-haiku-5-5": "medium"})
+        self.assertEqual(installed_machine["claude_effort"], machine.get("claude_effort", {"claude-fable-5-1": "medium", "claude-opus-5-5": "high", "claude-sonnet-5-5": "medium", "claude-haiku-5-5": "medium"}))
         self.assertFalse((home / ".codex" / "config.toml").exists())
         self.assertIn(f'ACTION  {home / ".codex" / "config.toml"}  (skipped (no ~/.codex/config.toml))', result.stdout)
         self.assertNotIn("autoMode", settings)
@@ -2905,6 +3587,7 @@ class InstallerTests(unittest.TestCase):
         path = copied / "machines" / f"{TEST_MACHINE}.json"
         machine = read_json_test(path)
         machine.pop("codex_model", None)
+        machine.pop("claude_effort", None)
         path.write_text(json.dumps(machine), encoding="utf-8")
         return copied
 
@@ -4166,6 +4849,13 @@ class InstallerTests(unittest.TestCase):
             local_facts,
         )
 
+    def test_bundle_excludes_nested_shared_markdown(self):
+        settings = (REPO / ".claude" / "settings.json").read_bytes()
+        self.assertIn("**/claude/CLAUDE.md", json.loads(settings)["claudeMdExcludes"])
+        module, copied, home, machine, folder = self.pack_fixture("fixturetool")
+        entries = dict(self.pack_bundle_entries(module, copied, machine))
+        self.assertEqual(entries[".claude/settings.json"], settings)
+
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_directory(self):
         copied = self.copy_repo_without_local_machine_files("bundle-directory-repo")
@@ -4175,6 +4865,7 @@ class InstallerTests(unittest.TestCase):
         for relative in (
             "install.py",
             "install-manifest.json",
+            ".claude/settings.json",
             "INSTALL.md",
             "claude/CLAUDE.md",
             "claude/keybindings.json",
@@ -4248,7 +4939,7 @@ class InstallerTests(unittest.TestCase):
         )
         output = completed.stdout + completed.stderr
         self.assertEqual(completed.returncode, 0, output)
-        test_count = unittest.defaultTestLoader.loadTestsFromModule(
+        test_count = unittest.TestLoader().loadTestsFromModule(
             sys.modules[__name__]
         ).countTestCases()
         self.assertIn(f"Ran {test_count} tests", output)
@@ -4770,7 +5461,7 @@ class InstallerTests(unittest.TestCase):
         )
         output = completed.stdout + completed.stderr
         self.assertEqual(completed.returncode, 0, output)
-        test_count = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]).countTestCases()
+        test_count = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__]).countTestCases()
         self.assertIn(f"Ran {test_count} tests", output)
         self.assertIn("OK", output)
 
@@ -5760,7 +6451,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(65 files)", result.stdout)
+            self.assertIn("(66 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())
