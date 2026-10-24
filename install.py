@@ -1375,6 +1375,9 @@ def bundle_commit(repo):
     return "an uncommitted tree"
 
 
+OWNER_ONLY_EXCLUDED = frozenset(item.casefold() for item in ("tools/release.py", "tools/release_test.py"))
+
+
 PLAN_TOOLS_EXCLUDED = (
     "tools/masterplan.py", "tools/masterplan_registry.py", "tools/masterplan_test.py",
     "tools/daily_collect.py", "tools/daily_collect_test.py", "tools/project_init.py",
@@ -1577,6 +1580,8 @@ def bundle_entry_adders(entries, *, plan_tools=True):
         source = Path(source)
         relative = Path(relative)
         normalized = relative.as_posix().casefold()
+        if normalized in OWNER_ONLY_EXCLUDED:
+            return
         if not plan_tools and any(
             normalized.startswith(item.casefold()) if item.endswith("/") else normalized == item.casefold()
             for item in PLAN_TOOLS_EXCLUDED
@@ -1639,10 +1644,22 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
     if harvest:
         add(repo / "harvest.py", "harvest.py")
     if publish:
-        for filename in ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes"):
+        filenames = ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes")
+        overlay = repo / "publish" / name
+        if overlay.exists():
+            for path in sorted(overlay.iterdir()):
+                if path.name not in filenames or not path.is_file():
+                    raise BundleRefusal(f"{path.relative_to(repo).as_posix()}: unexpected publish overlay entry")
+                if path.name == "LICENSE":
+                    raise BundleRefusal(f"{path.relative_to(repo).as_posix()}: LICENSE cannot be overridden")
+        for filename in filenames:
             source = repo / "publish" / filename
             if not source.is_file():
                 raise BundleRefusal(f"publish/{filename} is missing")
+            if (overlay / filename).is_file():
+                if filename == "THIRD-PARTY-NOTICES.md" and source.read_text(encoding="utf-8") not in (overlay / filename).read_text(encoding="utf-8"):
+                    raise BundleRefusal(f"{(overlay / filename).relative_to(repo).as_posix()}: must contain the full root THIRD-PARTY-NOTICES.md text")
+                source = overlay / filename
             add(source, filename)
     for suffix in (".md", ".json", ".local.md", ".local.json"):
         source = repo / "machines" / f"{name}{suffix}"

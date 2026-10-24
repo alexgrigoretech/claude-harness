@@ -4426,6 +4426,137 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("audit/") for name in names))
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_owner_only_exclusion_at_every_add_site(self):
+        spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        for index, (plan_tools, publish) in enumerate(((True, True), (True, False), (False, True), (False, False))):
+            with self.subTest(plan_tools=plan_tools, publish=publish):
+                copied = self.copy_repo_without_local_machine_files(f"bundle-owner-only-{index}-repo")
+                for filename in ("release.py", "release_test.py", "RELEASE.py", "RELEASE_TEST.py"):
+                    (copied / "tools" / filename).write_text("# Synthetic owner fixture\n", encoding="utf-8")
+                (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"plan_tools": plan_tools, "publish": publish}), encoding="utf-8")
+                bundle = self.base / f"bundle-owner-only-{index}.zip"
+                result = self.run_bundle(copied, bundle)
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                with zipfile.ZipFile(bundle) as archive:
+                    names = [name.casefold() for name in archive.namelist()]
+                self.assertNotIn("tools/release.py", names)
+                self.assertNotIn("tools/release_test.py", names)
+                entries = {}
+                add, add_tree = installer.bundle_entry_adders(entries, plan_tools=plan_tools)
+                source = copied / "tools" / "release.py"
+                for relative in ("tools/release.py", "TOOLS/RELEASE.PY", "Tools/Release_Test.Py"):
+                    add(source, relative)
+                add_tree(copied / "tools", "TOOLS")
+                self.assertFalse(any(name.casefold() in installer.OWNER_ONLY_EXCLUDED for name in entries))
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_machine_overlay(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-overlay-repo")
+        overlay = copied / "publish" / TEST_MACHINE
+        overlay.mkdir(exist_ok=True)
+        (overlay / "README.md").write_text("Synthetic overlay README\n", encoding="utf-8")
+        for name in (TEST_MACHINE, "synthetic-overlay-other"):
+            if name != TEST_MACHINE:
+                for suffix in (".json", ".md"):
+                    shutil.copyfile(copied / "machines" / f"{TEST_MACHINE}{suffix}", copied / "machines" / f"{name}{suffix}")
+            machine_path = copied / "machines" / f"{name}.json"
+            machine = read_json_test(machine_path)
+            machine["publish"] = True
+            machine_path.write_text(json.dumps(machine), encoding="utf-8")
+            bundle = self.base / f"bundle-overlay-{name}.zip"
+            result = subprocess.run([sys.executable, str(REPO / "install.py"), "--bundle", name, "--out", str(bundle), "--repo", str(copied), "--home", str(self.bundle_home(copied))], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            with zipfile.ZipFile(bundle) as archive:
+                source = overlay / "README.md" if name == TEST_MACHINE else copied / "publish" / "README.md"
+                self.assertEqual(archive.read("README.md"), source.read_bytes())
+                self.assertEqual(archive.read("LICENSE"), (copied / "publish" / "LICENSE").read_bytes())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_overlay_refuses_stray_entries(self):
+        for index, directory in enumerate((False, True)):
+            with self.subTest(directory=directory):
+                copied = self.copy_repo_without_local_machine_files(f"bundle-overlay-stray-{index}-repo")
+                overlay = copied / "publish" / TEST_MACHINE
+                overlay.mkdir(exist_ok=True)
+                stray = overlay / ("README.md" if directory else "stray.txt")
+                if directory:
+                    stray.mkdir()
+                else:
+                    stray.write_text("Synthetic stray\n", encoding="utf-8")
+                (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text('{"publish": true}', encoding="utf-8")
+                bundle = self.base / f"bundle-overlay-stray-{index}.zip"
+                result = self.run_bundle(copied, bundle)
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(stray.relative_to(copied).as_posix(), result.stdout)
+                self.assertFalse(bundle.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_overlay_passes_through_gate(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-overlay-gate-repo")
+        overlay = copied / "publish" / TEST_MACHINE
+        overlay.mkdir(exist_ok=True)
+        (overlay / "README.md").write_text("bundleprobe" + " exclusion\n", encoding="utf-8")
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text('{"publish": true}', encoding="utf-8")
+        bundle = self.base / "bundle-overlay-gate.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("GATE README.md:1:", result.stdout)
+        self.assertFalse(bundle.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_overlay_keeps_root_files_required(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-overlay-required-repo")
+        overlay = copied / "publish" / TEST_MACHINE
+        overlay.mkdir(exist_ok=True)
+        shutil.copyfile(copied / "publish" / "README.md", overlay / "README.md")
+        (copied / "publish" / "README.md").unlink()
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text('{"publish": true}', encoding="utf-8")
+        result = self.run_bundle(copied, self.base / "bundle-overlay-required.zip")
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn("publish/README.md is missing", result.stdout)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_overlay_preserves_root_notices(self):
+        for index, preserve in enumerate((False, True)):
+            with self.subTest(preserve=preserve):
+                copied = self.copy_repo_without_local_machine_files(f"bundle-overlay-notices-{index}-repo")
+                overlay = copied / "publish" / TEST_MACHINE
+                overlay.mkdir(exist_ok=True)
+                root = (copied / "publish" / "THIRD-PARTY-NOTICES.md").read_text(encoding="utf-8")
+                path = overlay / "THIRD-PARTY-NOTICES.md"
+                text = (root if preserve else "") + "\nSynthetic additional notice.\n"
+                path.write_text(text, encoding="utf-8")
+                (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text('{"publish": true}', encoding="utf-8")
+                bundle = self.base / f"bundle-overlay-notices-{index}.zip"
+                result = self.run_bundle(copied, bundle)
+                if preserve:
+                    self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                    with zipfile.ZipFile(bundle) as archive:
+                        self.assertEqual(archive.read("THIRD-PARTY-NOTICES.md"), path.read_bytes())
+                else:
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertIn(path.relative_to(copied).as_posix(), result.stdout)
+                    self.assertIn("must contain the full root", result.stdout)
+                    self.assertFalse(bundle.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_publish_overlay_cannot_override_license(self):
+        copied = self.copy_repo_without_local_machine_files("bundle-overlay-license-repo")
+        overlay = copied / "publish" / TEST_MACHINE
+        overlay.mkdir(exist_ok=True)
+        path = overlay / "LICENSE"
+        shutil.copyfile(copied / "publish" / "LICENSE", path)
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text('{"publish": true}', encoding="utf-8")
+        bundle = self.base / "bundle-overlay-license.zip"
+        result = self.run_bundle(copied, bundle)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn(path.relative_to(copied).as_posix(), result.stdout)
+        self.assertIn("LICENSE cannot be overridden", result.stdout)
+        self.assertFalse(bundle.exists())
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_plan_tools_default_keeps_plan_tooling(self):
         if not (REPO / "tools" / "masterplan.py").is_file():
             self.skipTest("plan tooling is absent from this bundle")
