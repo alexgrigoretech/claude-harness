@@ -504,13 +504,18 @@ class HookCase(unittest.TestCase):
 
 
 class CodexFirstGuardTests(HookCase):
-    def payload(self, path=None, notebook=None):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(dir=REPO)
+        cls.home = Path(cls.temporary.name).resolve()
+
+    def payload(self, path=None, notebook=None, cwd="C:/work"):
         tool_input = {}
         if path is not None:
             tool_input["file_path"] = path
         if notebook is not None:
             tool_input["notebook_path"] = notebook
-        return {"tool_name": "Write", "cwd": "C:/work", "tool_input": tool_input}
+        return {"tool_name": "Write", "cwd": cwd, "tool_input": tool_input}
 
     def setUp(self):
         marker = self.home / ".claude" / "direct-edit-ok"
@@ -549,6 +554,91 @@ class CodexFirstGuardTests(HookCase):
             "codex_first_guard.py", self.payload("F:/proj/tmp/x.py")
         )
         self.assertEqual(result.returncode, 2)
+
+    def test_codex_first_scratch_paths_are_allowed(self):
+        for path in (
+            "F:/proj/.scratch/auto/goal-check.sh",
+            "C:\\work\\.scratch\\probe.py",
+            "/home/u/repo/.scratch/2026-11-03/x.py",
+            "F:/proj/.SCRATCH/x.py",
+            ".scratch/x.py",
+        ):
+            with self.subTest(path=path):
+                result = self.run_hook(
+                    "codex_first_guard.py", self.payload(path, cwd=str(self.home))
+                )
+                self.assertEqual(result.returncode, 0)
+
+    def test_codex_first_other_source_paths_stay_blocked(self):
+        for path in (
+            "F:/proj/scratch/x.py",
+            "F:/proj/.scratchy/x.py",
+            "F:/proj/my.scratch/x.py",
+            "F:/proj/src/x.py",
+            "F:/repo/src/.scratch/../app.py",
+        ):
+            with self.subTest(path=path):
+                result = self.run_hook("codex_first_guard.py", self.payload(path))
+                self.assertEqual(result.returncode, 2)
+
+    def test_codex_first_existing_scratch_scripts_are_allowed(self):
+        directory = self.home / "proj" / ".scratch" / "auto"
+        directory.mkdir(parents=True)
+        (self.home / "proj" / ".git").mkdir()
+        result = self.run_hook(
+            "codex_first_guard.py",
+            self.payload(".scratch/auto/goal-check.sh", cwd=str(self.home / "proj")),
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_codex_first_scratch_worktree_and_clone_sources_are_blocked(self):
+        scratch = self.home / "proj" / ".scratch"
+        worktree = scratch / "wt-x"
+        (worktree / "src").mkdir(parents=True)
+        (worktree / ".git").write_text(
+            "gitdir: ../../.git/worktrees/wt-x\n", encoding="utf-8"
+        )
+        (scratch / "clone" / ".git").mkdir(parents=True)
+        for path in ("proj/.scratch/wt-x/src/x.py", "proj/.scratch/clone/a.py"):
+            with self.subTest(path=path):
+                result = self.run_hook(
+                    "codex_first_guard.py", self.payload(path, cwd=str(self.home))
+                )
+                self.assertEqual(result.returncode, 2)
+
+    def test_codex_first_scratch_worktree_in_temp_is_blocked(self):
+        directory = self.home
+        if not re.search(r"AppData/Local/Temp(?:/|$)", directory.as_posix(), re.I):
+            directory = directory / "AppData" / "Local" / "Temp"
+        worktree = directory / "proj" / ".scratch" / "wt-x"
+        (worktree / "src").mkdir(parents=True, exist_ok=True)
+        (worktree / ".git").write_text(
+            "gitdir: ../../.git/worktrees/wt-x\n", encoding="utf-8"
+        )
+        result = self.run_hook(
+            "codex_first_guard.py", self.payload((worktree / "src" / "x.py").as_posix())
+        )
+        self.assertEqual(result.returncode, 2)
+
+    def test_codex_first_scratch_inside_worktree_is_allowed(self):
+        worktree = self.home / "proj" / ".scratch" / "wt-x"
+        (worktree / ".scratch").mkdir(parents=True)
+        (worktree / ".git").write_text(
+            "gitdir: ../../.git/worktrees/wt-x\n", encoding="utf-8"
+        )
+        result = self.run_hook(
+            "codex_first_guard.py",
+            self.payload(".scratch/probe.py", cwd=str(worktree)),
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_codex_first_scratch_probe_errors_are_blocked(self):
+        from codex_first_guard import main
+
+        payload = self.payload("proj/.scratch/auto/probe.py", cwd=str(self.home))
+        with mock.patch("codex_first_guard.Path.exists", side_effect=OSError("unavailable")), mock.patch("codex_first_guard.read_payload", return_value=payload):
+            with mock.patch("codex_first_guard.hooks_home", return_value=self.home), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(), 2)
 
     def test_posix_tmp_root_is_allowed(self):
         result = self.run_hook(
@@ -6451,7 +6541,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(66 files)", result.stdout)
+            self.assertIn("(68 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())

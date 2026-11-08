@@ -1,6 +1,6 @@
 ---
 name: resume
-description: Start a session from the newest handoff file and continue its next step. Use when the user says "resume", "continue from the handoff", "pick up where we left off", "where were we", or pastes a handoff path as the first message.
+description: Start a session from the newest handoff file and continue its next step. Use when the user says "resume", "continue from the handoff", "pick up where we left off", "where were we", "where did we leave things", "where did we leave things on Friday", "where did we left things", or pastes a handoff path as the first message.
 ---
 
 # Resume

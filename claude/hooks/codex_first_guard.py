@@ -16,13 +16,29 @@ BLOCKED_EXTENSIONS = {
 }
 
 
-def is_blocked_path(raw_path):
+def is_blocked_path(raw_path, cwd=None):
     path = str(raw_path).replace("\\", "/")
+    if cwd and not os.path.isabs(path):
+        path = os.path.join(str(cwd).replace("\\", "/"), path)
+    path = os.path.normpath(path).replace("\\", "/")
     basename = path.rsplit("/", 1)[-1]
     suffix = Path(basename).suffix.lower()
     if suffix not in BLOCKED_EXTENSIONS and not re.match(
         r"^Dockerfile(?:\..+)?$", basename, re.I
     ):
+        return False
+    scratch_segments = list(re.finditer(r"(^|/)\.scratch(?=/)", path, re.I))
+    if scratch_segments:
+        scratch_end = scratch_segments[-1].end()
+        directories = [Path(path[:scratch_end])]
+        for part in path[scratch_end + 1:].split("/")[:-1]:
+            directories.append(directories[-1] / part)
+        for directory in directories:
+            try:
+                if (directory / ".git").exists():
+                    return True
+            except OSError:
+                return True
         return False
     exemptions = (
         r"/(?:\.claude|\.codex)/",
@@ -42,7 +58,7 @@ def main():
     if not isinstance(tool_input, dict):
         return 0
     path = tool_input.get("file_path") or tool_input.get("notebook_path")
-    if not path or not is_blocked_path(path):
+    if not path or not is_blocked_path(path, cwd=payload.get("cwd")):
         return 0
 
     home = hooks_home()

@@ -1,6 +1,6 @@
 ---
 name: easy
-description: Explain a topic, change or decision simply using the person's own context without starting work. Use for "easy", "/easy", "explain it simply", "in plain words", "eli5", "I do not get it", "help me understand this", or "what does this mean for me".
+description: Explain a topic, change or decision simply using the person's own context without starting work. Use for "easy", "/easy", "esay" (the common typo), "explain it simply", "in plain words", "eli5", "eli15", or a bare "simpler", "shorter" or "shorter simpler" said right after an explanation (not "make that shorter" about a draft, a message or code, which is an edit request), "I do not get it", "help me understand this", or "what does this mean for me".
 model: sonnet
 ---
 

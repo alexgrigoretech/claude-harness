@@ -1,6 +1,6 @@
 ---
 name: status
-description: Answer questions about a running or finished job from logs and output files without starting any work. Use when the user says "status", "eta", "is it done", "so it's done?", "everything done?", "CI green yet?", "when should I be back", or asks how a running job is doing. Plan-level questions (where the whole plan stands, what changed in the plan) belong to the masterplan and progress skills where the plan tools are installed; otherwise answer them from the newest handoff file.
+description: Answer questions about a running or finished job from logs and output files without starting any work. Use when the user says "status", "eta", "is it done", "so it's done?", "everything done?", "CI green yet?", "when should I be back", "open items", "show me open items", or asks how a running job is doing or what is still open on it; for "what's next" and "what is left" read the open items and next step of the newest handoff and print them without starting the step (the resume skill is the one that starts it). Plan-level questions (where the whole plan stands, what changed in the plan) belong to the masterplan and progress skills where the plan tools are installed; otherwise answer them from the newest handoff file.
 model: haiku
 ---
 
