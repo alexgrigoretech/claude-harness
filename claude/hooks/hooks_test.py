@@ -2326,7 +2326,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_conditional_markdown_boolean_defaults_and_negation(self):
         with self.gh_credentials_fixture() as (module, installer, home):
-            defaults = {"codex_first": True, "harvest": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
+            defaults = {"codex_first": True, "harvest": True, "design": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
             for key, default in defaults.items():
                 text = f"<!-- harness:if {key} -->\nfixtureskill\n<!-- harness:else -->\nfixturesecond\n<!-- harness:end -->\n"
                 negated = text.replace(f"if {key}", f"if !{key}")
@@ -2646,8 +2646,6 @@ class InstallerTests(unittest.TestCase):
             "claude",
             "templates",
             "codex",
-            "audit",
-            "checkers",
             "tools",
             "publish",
             "monitor",
@@ -2657,13 +2655,13 @@ class InstallerTests(unittest.TestCase):
                 shutil.copytree(source, copied / directory, ignore=ignore_local)
         shutil.copy2(REPO / "install-manifest.json", copied / "install-manifest.json")
         shutil.copy2(REPO / "install.py", copied / "install.py")
-        if (REPO / "harvest.py").is_file():
-            shutil.copy2(REPO / "harvest.py", copied / "harvest.py")
         for machine_path in (copied / "machines").glob("*.json"):
             machine = read_json_test(machine_path)
             machine["owns"] = []
-            if machine_path.stem == TEST_MACHINE and client is not None:
-                machine["client"] = client
+            if machine_path.stem == TEST_MACHINE:
+                machine["design"] = False
+                if client is not None:
+                    machine["client"] = client
             machine_path.write_text(json.dumps(machine), encoding="utf-8")
         terms_path = self.bundle_terms_file(copied)
         terms_path.parent.mkdir(parents=True)
@@ -2752,7 +2750,7 @@ class InstallerTests(unittest.TestCase):
         return module, copied, home, machine, folder
 
     def pack_bundle_entries(self, module, copied, machine):
-        return module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "harvest.py").is_file(), machine=machine)
+        return module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "tools" / "harvest.py").is_file(), machine=machine)
 
     def test_packs_absent_bundle_and_install(self):
         module, copied, home, machine, folder = self.pack_fixture("packs-absent")
@@ -3046,7 +3044,7 @@ class InstallerTests(unittest.TestCase):
         module, copied, home, machine, folder = self.pack_fixture("packs-prevalidated")
         for configured in (None, {}):
             with self.subTest(machine=configured), mock.patch.object(module, "validate_packs") as packs, mock.patch.object(module, "validate_bundle_exclude") as excluded, mock.patch.object(module, "bundle_install_text", wraps=module.bundle_install_text) as text:
-                module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "harvest.py").is_file(), machine=configured, packs=[], excluded=[])
+                module.bundle_file_entries(copied, TEST_MACHINE, "date", "gate", harvest=(copied / "tools" / "harvest.py").is_file(), machine=configured, packs=[], excluded=[])
                 packs.assert_not_called()
                 excluded.assert_not_called()
                 self.assertIs(text.call_args.kwargs["machine"], configured)
@@ -3216,7 +3214,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_copy_repo_without_harvest_tooling(self):
         copied = self.copy_repo_without_local_machine_files("copy-without-harvest-source")
-        tool = copied / "harvest.py"
+        tool = copied / "tools" / "harvest.py"
         if tool.is_file():
             tool.unlink()
         skill = copied / "claude" / "skills" / "harvest"
@@ -3226,7 +3224,7 @@ class InstallerTests(unittest.TestCase):
         with mock.patch.dict(globals(), REPO=copied):
             result = self.copy_repo_without_local_machine_files("copy-without-harvest-result")
         self.assertTrue((result / "install.py").is_file())
-        self.assertFalse((result / "harvest.py").exists())
+        self.assertFalse((result / "tools" / "harvest.py").exists())
         self.assertFalse((result / "claude" / "skills" / "harvest").exists())
 
     def test_install_preserves_existing_local_markdown_without_source(self):
@@ -4914,6 +4912,187 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(home.iterdir()), [])
         self.assertIn("(would write)", result.stdout)
+        self.assertIs(read_json_test(copied / "machines" / f"{TEST_MACHINE}.json")["design"], False)
+        self.assertFalse(any(line.startswith("design:") for line in result.stdout.splitlines()))
+
+    def test_design_defaults_true_without_probe(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            with mock.patch.object(module.subprocess, "run") as run:
+                self.assertIs(module.validate_machine_flags({}, {"design": True}, lambda key: "source.json")["design"], True)
+                self.assertTrue(module.conditional_markdown_condition("design", {}, REPO))
+            run.assert_not_called()
+
+    def test_design_default_reports_once_after_actions(self):
+        copied = self.copy_repo_without_local_machine_files("design-default-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine.pop("design", None)
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        home = self.new_home("design-default-home")
+        result = self.run_install(home, copied, ["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        lines = result.stdout.splitlines()
+        reports = [line for line in lines if line.startswith("design:")]
+        self.assertEqual(len(reports), 1, result.stdout)
+        self.assertTrue(reports[0].startswith("design: Playwright "), reports[0])
+        self.assertEqual(lines[-2:], [reports[0], "install complete"])
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_design_local_false_suppresses_report(self):
+        copied = self.copy_repo_without_local_machine_files("design-disabled-repo")
+        machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
+        machine = read_json_test(machine_path)
+        machine["design"] = True
+        machine_path.write_text(json.dumps(machine), encoding="utf-8")
+        (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"design": False}), encoding="utf-8")
+        home = self.new_home("design-disabled-home")
+        result = self.run_install(home, copied, ["--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertFalse(any(line.startswith("design:") for line in result.stdout.splitlines()))
+        self.assertEqual(list(home.iterdir()), [])
+
+    def test_design_invalid_flag_names_merged_source(self):
+        for location in ("tracked", "local", "home"):
+            with self.subTest(location=location):
+                copied = self.copy_repo_without_local_machine_files(f"design-invalid-{location}-repo")
+                home = self.new_home(f"design-invalid-{location}-home")
+                path = (home / ".claude" / "local" / "machine.local.json" if location == "home" else
+                        copied / "machines" / f"{TEST_MACHINE}{'.local' if location == 'local' else ''}.json")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                machine = read_json_test(path) if path.is_file() else {}
+                machine["design"] = "yes"
+                path.write_text(json.dumps(machine), encoding="utf-8")
+                result = self.run_install(home, copied, ["--dry-run"])
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(f"install refused: {path}: design must be true or false", result.stdout)
+                self.assertNotIn("ACTION  ", result.stdout)
+
+    def test_design_python_invalid_names_merged_source(self):
+        for location, value in (("tracked", None), ("local", ""), ("home", "  ")):
+            with self.subTest(location=location, value=value):
+                copied = self.copy_repo_without_local_machine_files(f"design-python-{location}-repo")
+                home = self.new_home(f"design-python-{location}-home")
+                path = (home / ".claude" / "local" / "machine.local.json" if location == "home" else
+                        copied / "machines" / f"{TEST_MACHINE}{'.local' if location == 'local' else ''}.json")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                machine = read_json_test(path) if path.is_file() else {}
+                machine["python"] = value
+                path.write_text(json.dumps(machine), encoding="utf-8")
+                result = self.run_install(home, copied, ["--dry-run"])
+                self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                self.assertIn(f"install refused: {path}: python must be a path string", result.stdout)
+                self.assertNotIn("ACTION  ", result.stdout)
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for value in (False, 1, [], {}):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "source.json: python must be a path string"):
+                        module.validate_machine_python({"python": value}, lambda key: "source.json")
+
+    def test_design_report_ready_uses_interpreter_home_and_timeout(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for machine in ({}, {"python": "python3"}):
+                with self.subTest(machine=machine):
+                    with mock.patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "1.57.0\n", "")) as run:
+                        self.assertEqual(module.design_report_line(machine, REPO), "design: Playwright 1.57.0 with Chromium ready")
+                    arguments, keywords = run.call_args
+                    self.assertEqual(arguments[0], [machine.get("python", sys.executable), "-c", mock.ANY])
+                    self.assertIn("chromium.launch(headless=True)", arguments[0][2])
+                    self.assertIn("browser.close()", arguments[0][2])
+                    self.assertIn("manager.stop()", arguments[0][2])
+                    self.assertEqual(keywords["cwd"], str(Path.home()))
+                    self.assertEqual(keywords["timeout"], 60)
+                    self.assertTrue(keywords["capture_output"])
+                    self.assertFalse(keywords["check"])
+
+    def test_design_report_failures_return_install_command(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            interpreter = "python3"
+            expected = f"design: Playwright missing; run: {interpreter} -m pip install playwright, then {interpreter} -m playwright install chromium"
+            for failure in (subprocess.CompletedProcess([], 1, "", "failure"), subprocess.TimeoutExpired([], 60), OSError("unavailable")):
+                with self.subTest(failure=failure):
+                    with mock.patch.object(module.subprocess, "run") as run:
+                        if isinstance(failure, Exception):
+                            run.side_effect = failure
+                        else:
+                            run.return_value = failure
+                        self.assertEqual(module.design_report_line({"python": interpreter}, REPO), expected)
+                        self.assertEqual(run.call_args.args[0], [interpreter, "-c", mock.ANY])
+                        self.assertEqual(run.call_args.kwargs["cwd"], str(Path.home()))
+
+    def test_design_interpreter_commands_quote_whitespace(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for interpreter, command in (
+                ("C:/Program Files/py/python.exe", '"C:/Program Files/py/python.exe"'),
+                ("C:/py/python.exe", "C:/py/python.exe"),
+                ("python3", "python3"),
+                ("fixture\tpython", '"fixture\tpython"'),
+            ):
+                with self.subTest(interpreter=interpreter):
+                    machine = {"python": interpreter}
+                    with mock.patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
+                        report = module.design_report_line(machine, REPO)
+                    self.assertEqual(run.call_args.args[0], [interpreter, "-c", mock.ANY])
+                    self.assertEqual(report, f"design: Playwright missing; run: {command} -m pip install playwright, then {command} -m playwright install chromium")
+                    text = module.bundle_install_text(TEST_MACHINE, "date", "commit", "gate", machine=machine)
+                    self.assertIn(f"4. Design renders need Playwright: run {command} -m pip install playwright, then {command} -m playwright install chromium, with the interpreter the machine file names; install.py prints design: Playwright ... ready once it is.\n", text)
+
+    def test_design_report_resolves_relative_interpreter_against_repo(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            repo = Path("/r")
+            for interpreter, expected in (("venv/bin/python", str((repo / "venv/bin/python").resolve())), ("python3", "python3")):
+                with self.subTest(interpreter=interpreter):
+                    with mock.patch.object(module.Path, "home", return_value=home), mock.patch.object(module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
+                        report = module.design_report_line({"python": interpreter}, repo)
+                    self.assertEqual(run.call_args.args[0], [expected, "-c", mock.ANY])
+                    self.assertEqual(run.call_args.kwargs["cwd"], str(home))
+                    self.assertEqual(report, f"design: Playwright missing; run: {expected} -m pip install playwright, then {expected} -m playwright install chromium")
+
+    def test_bundle_design_step_numbering_and_opt_out(self):
+        with self.gh_credentials_fixture() as (module, installer, home):
+            for publish in (True, False):
+                for proxy in (True, False):
+                    for design in (True, False):
+                        with self.subTest(publish=publish, proxy=proxy, design=design):
+                            machine = {"python": "fixture/python.exe"}
+                            if proxy:
+                                machine["proxy"] = {"key_file": "~/client.key"}
+                            text = module.bundle_install_text(TEST_MACHINE, "date", "commit", "gate", design=design, publish=publish, machine=machine)
+                            steps = re.findall(r"^(\d+)\. (.*)$", text, re.MULTILINE)
+                            self.assertEqual([int(number) for number, _ in steps], list(range(1, 5 + int(proxy) + int(design))))
+                            self.assertTrue(steps[-1][1].startswith("Restart"))
+                            if design:
+                                self.assertTrue(steps[-3][1].startswith("Real run:"))
+                                self.assertEqual(steps[-2][1], "Design renders need Playwright: run fixture/python.exe -m pip install playwright, then fixture/python.exe -m playwright install chromium, with the interpreter the machine file names; install.py prints design: Playwright ... ready once it is.")
+                            else:
+                                self.assertNotIn("Playwright", text)
+
+    @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
+    def test_bundle_design_local_flag_and_interpreter(self):
+        copied = self.copy_repo_without_local_machine_files("design-bundle-repo")
+        local = copied / "machines" / f"{TEST_MACHINE}.local.json"
+        for design in (True, False, "yes"):
+            with self.subTest(design=design):
+                local.write_text(json.dumps({"design": design, "python": "fixture/python.exe"}), encoding="utf-8")
+                output = self.base / f"design-bundle-{design}.zip"
+                result = self.run_bundle(copied, output)
+                if design == "yes":
+                    self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+                    self.assertIn(f"machines/{TEST_MACHINE}.local.json: design must be true or false", result.stdout)
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                    with zipfile.ZipFile(output) as archive:
+                        text = archive.read("INSTALL.md").decode("utf-8")
+                    if design:
+                        self.assertIn("fixture/python.exe -m pip install playwright, then fixture/python.exe -m playwright install chromium", text)
+                    else:
+                        self.assertNotIn("Playwright", text)
+        local.write_text(json.dumps({"python": False}), encoding="utf-8")
+        output = self.base / "design-bundle-invalid-python.zip"
+        result = self.run_bundle(copied, output)
+        self.assertEqual(result.returncode, 2, result.stderr or result.stdout)
+        self.assertIn(f"machines/{TEST_MACHINE}.local.json: python must be a path string", result.stdout)
+        self.assertFalse(output.exists())
 
     def test_local_machine_override(self):
         home = self.new_home("override-home")
@@ -4964,7 +5143,7 @@ class InstallerTests(unittest.TestCase):
             f"machines/{TEST_MACHINE}.md",
             f"machines/{TEST_MACHINE}.json",
             "codex/AGENTS.md",
-            "checkers/check_writing.py",
+            "tools/check_writing.py",
             "tools/pr_review_runner.py",
             "tools/pr_review_prompts/review.txt",
         ):
@@ -4976,7 +5155,7 @@ class InstallerTests(unittest.TestCase):
         ):
             self.assertFalse((bundle / Path(relative)).exists(), relative)
         machine = read_json_test(copied / "machines" / f"{TEST_MACHINE}.json")
-        self.assertEqual((bundle / "harvest.py").is_file(), machine.get("harvest", True))
+        self.assertEqual((bundle / "tools" / "harvest.py").is_file(), machine.get("harvest", True))
         self.assertEqual((bundle / "README.md").is_file(), machine.get("publish", False))
         other_machines = sorted(
             path.stem for path in (copied / "machines").glob("*.json")
@@ -5103,7 +5282,7 @@ class InstallerTests(unittest.TestCase):
         with zipfile.ZipFile(bundle) as archive:
             names = archive.namelist()
             instructions = archive.read("INSTALL.md").decode("utf-8")
-        self.assertNotIn("harvest.py", names)
+        self.assertNotIn("tools/harvest.py", names)
         self.assertFalse(any(name.startswith("claude/skills/harvest/") for name in names))
         self.assertIn("4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files.\n", instructions)
         self.assertNotIn("harvest", instructions)
@@ -5112,7 +5291,7 @@ class InstallerTests(unittest.TestCase):
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_harvest_default_keeps_export_tooling(self):
-        if not (REPO / "harvest.py").is_file():
+        if not (REPO / "tools" / "harvest.py").is_file():
             self.skipTest("harvest tooling is absent from this bundle")
         copied = self.copy_repo_without_local_machine_files("bundle-harvest-default-repo")
         machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
@@ -5125,9 +5304,9 @@ class InstallerTests(unittest.TestCase):
         with zipfile.ZipFile(bundle) as archive:
             names = archive.namelist()
             instructions = archive.read("INSTALL.md").decode("utf-8")
-        self.assertIn("harvest.py", names)
+        self.assertIn("tools/harvest.py", names)
         self.assertIn("claude/skills/harvest/SKILL.md", names)
-        self.assertIn("4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files. Memories travel back with `python harvest.py --export <folder>`.\n", instructions)
+        self.assertIn("4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files. Memories travel back with `python tools/harvest.py --export <folder>`.\n", instructions)
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_harvest_non_boolean_is_refused(self):
@@ -5160,7 +5339,7 @@ class InstallerTests(unittest.TestCase):
         omitted_folders = (
             "claude/skills/masterplan/", "claude/skills/progress/", "claude/skills/daily/",
             "claude/skills/project-init/", "claude/skills/harness-audit/", "claude/skills/relay-prompt/",
-            "claude/skills/t3-insights/", "audit/",
+            "claude/skills/t3-insights/", "tools/audit/",
         )
         for location in ("tracked", "local"):
             with self.subTest(location=location):
@@ -5182,7 +5361,7 @@ class InstallerTests(unittest.TestCase):
                 for name in (
                     "tools/agy_llm.py", "tools/pr_review_runner.py", "tools/pr_review_score.py",
                     "tools/pr_review_test.py", "tools/clip_image.ps1", "tools/pr_review_prompts/review.txt",
-                    "checkers/check_writing.py", "claude/skills/humanizer/SKILL.md",
+                    "tools/check_writing.py", "claude/skills/humanizer/SKILL.md",
                 ):
                     self.assertIn(name, names)
 
@@ -5194,7 +5373,7 @@ class InstallerTests(unittest.TestCase):
         if source.exists():
             source.rename(variant)
         variant.write_text("# Fixture\n", encoding="utf-8")
-        audit = copied / "audit" / "fixture.py"
+        audit = copied / "tools" / "audit" / "fixture.py"
         audit.parent.mkdir(exist_ok=True)
         audit.write_text("# Fixture\n", encoding="utf-8")
         (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"plan_tools": False}), encoding="utf-8")
@@ -5204,7 +5383,7 @@ class InstallerTests(unittest.TestCase):
         with zipfile.ZipFile(bundle) as archive:
             names = [name.casefold() for name in archive.namelist()]
         self.assertNotIn("tools/masterplan.py", names)
-        self.assertFalse(any(name.startswith("audit/") for name in names))
+        self.assertFalse(any(name.startswith("tools/audit/") for name in names))
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
     def test_bundle_owner_only_exclusion_at_every_add_site(self):
@@ -5214,7 +5393,7 @@ class InstallerTests(unittest.TestCase):
         for index, (plan_tools, publish) in enumerate(((True, True), (True, False), (False, True), (False, False))):
             with self.subTest(plan_tools=plan_tools, publish=publish):
                 copied = self.copy_repo_without_local_machine_files(f"bundle-owner-only-{index}-repo")
-                for filename in ("release.py", "release_test.py", "RELEASE.py", "RELEASE_TEST.py"):
+                for filename in ("release.py", "release_test.py", "RELEASE.py", "RELEASE_TEST.py", "harvest_test.py", "run_harvest.py", "install_scheduler.py", "HARVEST_TEST.py", "RUN_HARVEST.py", "INSTALL_SCHEDULER.py"):
                     (copied / "tools" / filename).write_text("# Synthetic owner fixture\n", encoding="utf-8")
                 (copied / "machines" / f"{TEST_MACHINE}.local.json").write_text(json.dumps({"plan_tools": plan_tools, "publish": publish}), encoding="utf-8")
                 bundle = self.base / f"bundle-owner-only-{index}.zip"
@@ -5224,10 +5403,13 @@ class InstallerTests(unittest.TestCase):
                     names = [name.casefold() for name in archive.namelist()]
                 self.assertNotIn("tools/release.py", names)
                 self.assertNotIn("tools/release_test.py", names)
+                self.assertNotIn("tools/harvest_test.py", names)
+                self.assertNotIn("tools/run_harvest.py", names)
+                self.assertNotIn("tools/install_scheduler.py", names)
                 entries = {}
                 add, add_tree = installer.bundle_entry_adders(entries, plan_tools=plan_tools)
                 source = copied / "tools" / "release.py"
-                for relative in ("tools/release.py", "TOOLS/RELEASE.PY", "Tools/Release_Test.Py"):
+                for relative in ("tools/release.py", "TOOLS/RELEASE.PY", "Tools/Release_Test.Py", "TOOLS/HARVEST_TEST.PY", "Tools/Run_Harvest.Py", "tools/install_scheduler.py"):
                     add(source, relative)
                 add_tree(copied / "tools", "TOOLS")
                 self.assertFalse(any(name.casefold() in installer.OWNER_ONLY_EXCLUDED for name in entries))
@@ -5350,7 +5532,7 @@ class InstallerTests(unittest.TestCase):
         result = self.run_bundle(copied, bundle)
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         with zipfile.ZipFile(bundle) as archive:
-            for name in ("tools/masterplan.py", "claude/skills/masterplan/SKILL.md", "audit/hist.py", "templates/project-structure.md"):
+            for name in ("tools/masterplan.py", "claude/skills/masterplan/SKILL.md", "tools/audit/hist.py", "templates/project-structure.md"):
                 self.assertIn(name, archive.namelist())
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle creation requires repository terms")
@@ -5381,6 +5563,7 @@ class InstallerTests(unittest.TestCase):
                 copied = self.copy_repo_without_local_machine_files(f"bundle-publish-{index}-repo")
                 machine_path = copied / "machines" / f"{TEST_MACHINE}.json"
                 machine = read_json_test(machine_path)
+                machine["design"] = True
                 machine.pop("publish", None)
                 if value is not None:
                     machine["publish"] = value
@@ -5397,7 +5580,7 @@ class InstallerTests(unittest.TestCase):
                     instructions = archive.read("INSTALL.md").decode("utf-8")
                 first = (f"1. Clone the repository as the harness install folder named in machines/{TEST_MACHINE}.md, or unpack this folder there. Update it later with git pull; a release replaces the shared files and never touches your local files."
                          if value else f"1. On a first install, unpack the zip as the harness install folder named in machines/{TEST_MACHINE}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing). If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one.")
-                steps = [line for line in instructions.splitlines() if re.match(r"[1-4]\. ", line)]
+                steps = [line for line in instructions.splitlines() if re.match(r"\d+\. ", line)]
                 self.assertEqual(steps[0], first)
                 self.assertIn("Bundle gate applied:", result.stdout)
                 self.assertIn("fingerprints", result.stdout)
@@ -5405,7 +5588,8 @@ class InstallerTests(unittest.TestCase):
                     self.assertNotIn("Bundle gate applied", instructions)
                     self.assertNotIn(" from ", instructions.splitlines()[0])
                     self.assertNotIn("fingerprints", instructions)
-                    self.assertEqual(steps[3], "4. Restart Claude Code and run /setup; it asks who you are, your git identities and gh account, and whether you use Codex CLI, and writes the local files.")
+                    self.assertEqual(steps[4], "5. Restart Claude Code and run /setup; it asks who you are, your git identities and gh account, and whether you use Codex CLI, and writes the local files.")
+                    self.assertIn("4. Design renders need Playwright:", steps[3])
                 else:
                     self.assertIn("Bundle gate applied:", instructions)
                     self.assertIn(" from ", instructions.splitlines()[0])
@@ -5443,7 +5627,7 @@ class InstallerTests(unittest.TestCase):
         for publish in (True, False):
             for harvest in (True, False):
                 with self.subTest(publish=publish, harvest=harvest):
-                    text = installer.bundle_install_text(TEST_MACHINE, date, commit, record, harvest=harvest, publish=publish)
+                    text = installer.bundle_install_text(TEST_MACHINE, date, commit, record, harvest=harvest, design=False, publish=publish)
                     header = f"# Harness bundle for {TEST_MACHINE}, built {date}"
                     if publish:
                         self.assertEqual(text.splitlines()[0], header)
@@ -5453,7 +5637,7 @@ class InstallerTests(unittest.TestCase):
                     else:
                         restart = "4. Restart Claude Code and run /setup; it asks for what this machine still needs (who you are, git identities, gh account, Codex model, engagement rules) and writes the local files."
                         if harvest:
-                            restart += " Memories travel back with `python harvest.py --export <folder>`."
+                            restart += " Memories travel back with `python tools/harvest.py --export <folder>`."
                         self.assertEqual(text, (
                             f"{header} from {commit}\n\n{record}\n\n"
                             f"1. On a first install, unpack the zip as the harness install folder named in machines/{TEST_MACHINE}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing). If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one.\n"
@@ -5536,7 +5720,7 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("codex_model", read_json_test(home / ".claude" / "local" / "machine.json"))
         self.assertEqual((home / ".claude" / "local" / "harness-mode").read_text(encoding="utf-8"), "bundle\n")
         self.assertNotIn("codex_first_guard", (home / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        for relative in ("tools/masterplan.py", "audit", "harvest.py", "claude/skills/harvest"):
+        for relative in ("tools/masterplan.py", "tools/audit", "tools/harvest.py", "claude/skills/harvest"):
             self.assertFalse((unpacked / relative).exists(), relative)
         self.assertEqual(list((unpacked / "machines").glob("*.json")), [unpacked / "machines" / f"{TEST_MACHINE}.json"])
         environment = os.environ.copy()
@@ -6126,7 +6310,7 @@ class InstallerTests(unittest.TestCase):
         with zipfile.ZipFile(bundle) as archive:
             names = archive.namelist()
             instructions = archive.read("INSTALL.md").decode("utf-8")
-        self.assertNotIn("harvest.py", names)
+        self.assertNotIn("tools/harvest.py", names)
         self.assertFalse(any(name.startswith("claude/skills/harvest/") for name in names))
         self.assertNotIn("harvest", instructions)
 
@@ -6541,7 +6725,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(68 files)", result.stdout)
+            self.assertIn("(80 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())
@@ -7500,7 +7684,7 @@ class ProxyInstallerTests(unittest.TestCase):
         self.key = "sk-" + "cpa-TESTKEY"
         (self.home / "client.key").write_text(self.key + "\n", encoding="utf-8")
         self.machine = {
-            "name": "probe", "os": "linux", "codex_model": "gpt-6-astra", "statusline": False,
+            "name": "probe", "os": "linux", "codex_model": "gpt-6-astra", "statusline": False, "design": False,
             "proxy": {"host": "127.0.0.1", "key_file": "client.key"},
         }
         for relative, content in {
@@ -8189,7 +8373,7 @@ echo %CLIPROXY_API_KEY%
         plain = self.module.bundle_install_text("probe", "date", "commit", "gate")
         self.assertNotIn("client key", plain)
         self.assertEqual(re.findall(r"^(\d+)\. (\w+)", plain, re.MULTILINE), [
-            ("1", "On"), ("2", "Dry"), ("3", "Real"), ("4", "Restart"),
+            ("1", "On"), ("2", "Dry"), ("3", "Real"), ("4", "Design"), ("5", "Restart"),
         ])
         self.machine["proxy"]["key_file"] = "~/client.key"
         text = self.module.bundle_install_text("probe", "date", "commit", "gate", machine=self.machine)
@@ -8198,7 +8382,7 @@ echo %CLIPROXY_API_KEY%
         self.assertIn(".claude/local/bin", text)
         self.assertIn("must precede the real binaries on PATH", text)
         self.assertEqual(re.findall(r"^(\d+)\. (\w+)", text, re.MULTILINE), [
-            ("1", "On"), ("2", "Before"), ("3", "Dry"), ("4", "Real"), ("5", "Restart"),
+            ("1", "On"), ("2", "Before"), ("3", "Dry"), ("4", "Real"), ("5", "Design"), ("6", "Restart"),
         ])
 
     @unittest.skipUnless(BUNDLE_BUILD_TESTS, "bundle gate requires the source repository")
@@ -8505,7 +8689,7 @@ class GitHooksInstallTests(unittest.TestCase):
 
 class CheckWritingTests(unittest.TestCase):
     def setUp(self):
-        if not (REPO / "checkers" / "check_writing.py").is_file():
+        if not (REPO / "tools" / "check_writing.py").is_file():
             self.skipTest("writing checker is absent from the repository")
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name).resolve()
@@ -8515,7 +8699,7 @@ class CheckWritingTests(unittest.TestCase):
 
     def run_checker(self, path):
         return subprocess.run(
-            [sys.executable, str(REPO / "checkers" / "check_writing.py"), str(path)],
+            [sys.executable, str(REPO / "tools" / "check_writing.py"), str(path)],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -8579,7 +8763,7 @@ WRAPPED = (
 class HardWrapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        checker = REPO / "checkers" / "check_writing.py"
+        checker = REPO / "tools" / "check_writing.py"
         if not checker.is_file():
             raise unittest.SkipTest("writing checker is absent from the repository")
         spec = importlib.util.spec_from_file_location("check_writing", checker)
@@ -8767,7 +8951,7 @@ class HardWrapTests(unittest.TestCase):
     def test_broken_helper_import_is_caught(self):
         for source in (b"invalid syntax here", b"\xff"):
             with self.subTest(source=source):
-                checker = self.base / "checkers" / "check_writing.py"
+                checker = self.base / "tools" / "check_writing.py"
                 checker.parent.mkdir(exist_ok=True)
                 shutil.copy2(self.check_writing.__file__, checker)
                 hooks = self.base / "claude" / "hooks"

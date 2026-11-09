@@ -12,7 +12,7 @@ import sys
 import tempfile
 import traceback
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -117,6 +117,51 @@ def validate_machine_flags(machine, defaults, source_for_key):
         if not isinstance(flags[key], bool):
             raise ValueError(f"{source_for_key(key)}: {key} must be true or false")
     return flags
+
+
+def validate_machine_python(machine, source_for_key):
+    if "python" in machine and (not isinstance(machine["python"], str) or not machine["python"].strip()):
+        raise ValueError(f"{source_for_key('python')}: python must be a path string")
+
+
+def quoted_command_path(path):
+    value = str(path)
+    return f'"{value}"' if any(character.isspace() for character in value) else value
+
+
+def design_report_line(machine, repo) -> str:
+    interpreter = machine.get("python", sys.executable)
+    script = (
+        "try:\n"
+        "    import playwright\n"
+        "    from importlib.metadata import version\n"
+        "    from playwright.sync_api import sync_playwright\n"
+        "    installed = version('playwright')\n"
+        "    manager = sync_playwright().start()\n"
+        "    try:\n"
+        "        browser = manager.chromium.launch(headless=True)\n"
+        "        browser.close()\n"
+        "    finally:\n"
+        "        manager.stop()\n"
+        "    print(installed)\n"
+        "except Exception:\n"
+        "    raise SystemExit(1)\n"
+    )
+    try:
+        if any(separator in interpreter for separator in ("/", "\\")) and not (Path(interpreter).is_absolute() or PureWindowsPath(interpreter).is_absolute()):
+            interpreter = str((Path(repo) / interpreter).resolve())
+        completed = subprocess.run(
+            [interpreter, "-c", script],
+            cwd=str(Path.home()),
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
+        )
+        version = completed.stdout.strip()
+        if completed.returncode == 0 and version and len(version.splitlines()) == 1:
+            return f"design: Playwright {version} with Chromium ready"
+    except Exception:
+        pass
+    command = quoted_command_path(interpreter)
+    return f"design: Playwright missing; run: {command} -m pip install playwright, then {command} -m playwright install chromium"
 
 
 def validate_packs(machine, repo, source_for_key):
@@ -1148,7 +1193,7 @@ def install_proxy(installer, machine, statusline_installed, key, conflicts=()):
 def conditional_markdown_condition(condition, machine, repo):
     negated = condition.startswith("!")
     condition = condition[1:] if negated else condition
-    defaults = {"codex_first": True, "harvest": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
+    defaults = {"codex_first": True, "harvest": True, "design": True, "plan_tools": True, "publish": False, "statusline": True, "client": False}
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", condition):
         if condition not in defaults and condition not in machine:
             raise ValueError(f"unknown condition: {condition}")
@@ -1519,7 +1564,10 @@ def bundle_commit(repo):
     return "an uncommitted tree"
 
 
-OWNER_ONLY_EXCLUDED = frozenset(item.casefold() for item in ("tools/release.py", "tools/release_test.py"))
+OWNER_ONLY_EXCLUDED = frozenset(item.casefold() for item in (
+    "tools/release.py", "tools/release_test.py",
+    "tools/harvest_test.py", "tools/run_harvest.py", "tools/install_scheduler.py",
+))
 
 
 PLAN_TOOLS_EXCLUDED = (
@@ -1527,7 +1575,7 @@ PLAN_TOOLS_EXCLUDED = (
     "tools/daily_collect.py", "tools/daily_collect_test.py", "tools/project_init.py",
     "tools/project_init_test.py", "tools/transcripts.py", "tools/transcripts_test.py",
     "templates/project-masterplan.json", "templates/project-plan.md", "templates/project-structure.md",
-    "audit/", "claude/skills/masterplan/", "claude/skills/progress/", "claude/skills/daily/",
+    "tools/audit/", "claude/skills/masterplan/", "claude/skills/progress/", "claude/skills/daily/",
     "claude/skills/project-init/", "claude/skills/harness-audit/", "claude/skills/relay-prompt/",
     "claude/skills/t3-insights/",
 )
@@ -1690,7 +1738,7 @@ def all_bundle_terms(home, repo=None, report=None, *, details=None):
     return global_terms + domain_terms
 
 
-def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publish=False, machine=None):
+def bundle_install_text(name, date, commit, gate_record, *, harvest=True, design=True, publish=False, machine=None):
     heading = f"# Harness bundle for {name}, built {date} from {commit}\n\n{gate_record}\n\n"
     first = f"1. On a first install, unpack the zip as the harness install folder named in machines/{name}.md. On every later update, run `python install.py --unpack <zip>` inside the existing install folder (use the interpreter the machine file names), which writes the shipped files, removes files the previous release shipped and this one does not, and keeps everything else (handoffs, `.scratch/`, `bundles/`, `inbox/`, your local machine files, which it backs up under `.scratch/` before replacing)."
     first += " If the install folder's install.py does not know `--unpack` yet, extract install.py from the zip first (`unzip -o <zip> install.py` or Expand-Archive for that one file) and run that one."
@@ -1700,7 +1748,7 @@ def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publis
         first = f"1. Clone the repository as the harness install folder named in machines/{name}.md, or unpack this folder there. Update it later with git pull; a release replaces the shared files and never touches your local files."
         restart = "4. Restart Claude Code and run /setup; it asks who you are, your git identities and gh account, and whether you use Codex CLI, and writes the local files."
     elif harvest:
-        restart += " Memories travel back with `python harvest.py --export <folder>`."
+        restart += " Memories travel back with `python tools/harvest.py --export <folder>`."
     if machine is not None and machine.get("bundle_exclude"):
         heading += "Excluded by the machine file: " + ", ".join(machine["bundle_exclude"]) + "\n\n"
     proxy_step = ""
@@ -1710,13 +1758,18 @@ def bundle_install_text(name, date, commit, gate_record, *, harvest=True, publis
         proxy_step = f"2. Before running install.py, copy the device's client key to `{machine['proxy']['key_file']}` by hand. The proxy launchers land in `{proxy_bin_dir(machine)}` (relative to the home unless absolute) and must precede the real binaries on PATH.\n"
         dry_run_step = 3
         real_run_step = 4
-        restart = "5." + restart[2:]
+    design_step = ""
+    if design:
+        interpreter = quoted_command_path((machine or {}).get("python", "python"))
+        design_step = f"{real_run_step + 1}. Design renders need Playwright: run {interpreter} -m pip install playwright, then {interpreter} -m playwright install chromium, with the interpreter the machine file names; install.py prints design: Playwright ... ready once it is.\n"
+    restart = f"{real_run_step + 1 + int(design)}." + restart[2:]
     return (
         f"{heading}"
         f"{first}\n"
         f"{proxy_step}"
         f"{dry_run_step}. Dry run and read every line: `python install.py --machine {name} --dry-run` (use the interpreter the machine file names; where the permission classifier blocks config edits, run the real install with the ! prefix).\n"
         f"{real_run_step}. Real run: `python install.py --machine {name}`. The hook tests run last and all must pass.\n"
+        f"{design_step}"
         f"{restart}\n"
     )
 
@@ -1788,7 +1841,7 @@ def check_pack_links(repo, pack):
                 raise BundleRefusal(f"pack link outside the pack: {relative}: {target}")
 
 
-def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_tools=True, publish=False, machine=None, packs=None, excluded=None):
+def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, design=True, plan_tools=True, publish=False, machine=None, packs=None, excluded=None):
     machine_settings = machine or {}
     if packs is None:
         packs = validate_packs(machine_settings, repo, lambda key: f"machines/{name}.json")
@@ -1818,17 +1871,15 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
         source = repo / "codex" / filename
         if source.is_file():
             add(source, "codex/" + filename)
-    for source in sorted((repo / "audit").glob("*.py")):
-        add(source, Path("audit") / source.name)
-    for source in sorted((repo / "checkers").glob("*.py")):
-        add(source, Path("checkers") / source.name)
     for source in sorted((repo / "tools").glob("*.py")):
+        if not harvest and source.name == "harvest.py":
+            continue
         add(source, Path("tools") / source.name)
     for source in sorted((repo / "tools").glob("*.ps1")):
         add(source, Path("tools") / source.name)
+    for source in sorted((repo / "tools" / "audit").glob("*.py")):
+        add(source, Path("tools/audit") / source.name)
     add_tree(repo / "tools" / "pr_review_prompts", "tools/pr_review_prompts")
-    if harvest:
-        add(repo / "harvest.py", "harvest.py")
     if publish:
         filenames = ("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", ".gitignore", ".gitattributes")
         overlay = repo / "publish" / name
@@ -1862,7 +1913,7 @@ def bundle_file_entries(repo, name, date, gate_record, *, harvest=True, plan_too
         for relative in matches:
             del entries[relative]
     commit = bundle_commit(repo)
-    entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, publish=publish, machine=machine).encode("utf-8")
+    entries["INSTALL.md"] = bundle_install_text(name, date, commit, gate_record, harvest=harvest, design=design, publish=publish, machine=machine).encode("utf-8")
     if not publish:
         entries["MANIFEST.txt"] = ("\n".join(sorted([*entries, "MANIFEST.txt"])) + "\n").encode("utf-8")
     return unpack_build_entries(entries, repo)
@@ -2105,9 +2156,10 @@ def build_bundle(options):
     try:
         machine = deep_merge(machine, local_machine, replace_whole=frozenset({"statusline_weather"}))
         flags = validate_machine_flags(
-            machine, {"harvest": True, "plan_tools": True, "publish": False, "codex_first": True, "statusline": True},
+            machine, {"harvest": True, "design": True, "plan_tools": True, "publish": False, "codex_first": True, "statusline": True},
             lambda key: local_relative if key in local_machine else f"machines/{name}.json",
         )
+        validate_machine_python(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         validate_statusline_weather(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         validate_proxy(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
         validate_remote(machine, lambda key: local_relative if key in local_machine else f"machines/{name}.json")
@@ -2325,7 +2377,8 @@ def install(options):
         tracked_flags = validate_machine_flags(read_json(tracked_path), {"publish": False}, lambda key: tracked_path)
         sources = {}
         machine = load_machine(options["repo"], name, home=options["home"], sources=sources)
-        validate_machine_flags(machine, {"codex_first": True, "publish": False, "statusline": True}, sources.__getitem__)
+        flags = validate_machine_flags(machine, {"codex_first": True, "design": True, "publish": False, "statusline": True}, sources.__getitem__)
+        validate_machine_python(machine, sources.__getitem__)
         validate_machine_efforts(machine, sources.__getitem__)
         validate_gh_accounts(machine, sources.__getitem__)
         packs = validate_packs(machine, options["repo"], sources.__getitem__)
@@ -2478,6 +2531,8 @@ def install(options):
     for relative in machine.get("delete") or []:
         installer.remove(options["home"] / Path(relative))
 
+    if flags["design"]:
+        print(design_report_line(machine, options["repo"]), flush=True)
     if options["dry_run"]:
         print("install complete")
         return 0

@@ -18,7 +18,9 @@ BLOCKED_EXTENSIONS = {
 
 def is_blocked_path(raw_path, cwd=None):
     path = str(raw_path).replace("\\", "/")
-    if cwd and not os.path.isabs(path):
+    # a leading slash is a POSIX absolute path even on Windows, where
+    # Python 3.13 stopped treating a single slash as absolute
+    if cwd and not (os.path.isabs(path) or path.startswith("/")):
         path = os.path.join(str(cwd).replace("\\", "/"), path)
     path = os.path.normpath(path).replace("\\", "/")
     basename = path.rsplit("/", 1)[-1]
