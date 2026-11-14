@@ -130,7 +130,7 @@ def main():
         fresh = False
     if fresh:
         try:
-            marker_text = marker.read_text(encoding="utf-8", errors="replace").strip()
+            marker_text = marker.read_text(encoding="utf-8-sig", errors="replace").strip()
             append_jsonl(
                 home / ".claude" / "wrap-ok-log.jsonl",
                 {

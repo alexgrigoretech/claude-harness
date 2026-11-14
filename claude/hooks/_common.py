@@ -90,9 +90,8 @@ def hard_wrap_findings(text):
     lines = text.splitlines()
     front_matter_end = -1
     if lines and lines[0].strip() == "-" * 3:
-        front_matter_end = 0
-        for index in range(1, min(len(lines), 60)):
-            if lines[index].strip() == "-" * 3:
+        for index in range(1, min(len(lines), 400)):
+            if lines[index].strip() in ("-" * 3, "." * 3):
                 front_matter_end = index
                 break
             if lines[index].strip() and not (

@@ -21,6 +21,8 @@ Budget flags, given by the user or defaulted: `--max-iterations` (default 5) and
 4. Review: first mark every new file with `git add -N <path>` by explicit path so the runner's diff includes it (the runner diffs the working tree against the base and skips untracked files), then run the pr-review skill at tier 0 and tier 1 on the diff. Tier 2 runs only when tier 1 reports a finding or the diff touches auth, billing, a data path or a client repository. Confirmed findings go back through resume.
 5. Run the goal check. Holds: go to Finish. Does not hold: next iteration, with the failing output in the brief.
 
+The diff serves the goal and nothing else. A side issue the run notices (an unrelated bug, a cleanup, a review finding outside the goal) goes on the decision list with its file and line; it is never fixed in this run's branch.
+
 Each iteration appends one row to `auto-trail.tsv` next to the newest handoff in the project (create it): iteration, what was done, why, evidence (the command and its observed value), result. Local only, never committed.
 
 ## Stop conditions
@@ -38,6 +40,6 @@ Any one of these ends the loop immediately and produces the decision list instea
 
 Whether the goal holds or a stop condition fired:
 
-1. Commit on a branch this run created (`auto/<goal-slug>`), staging by explicit path, when the tree has changes that pass tier 0. Never push. On a client repository, commit only if the project CLAUDE.md allows local commits from agents; otherwise leave the tree and say so.
+1. Commit once, here and nowhere earlier in the run: iterations leave their work in the tree and no iteration commits. Commit on a branch this run created (`auto/<goal-slug>`), staging by explicit path, when the tree has changes that pass tier 0; when that branch already carries this run's or today's unpushed commit, amend it instead of adding another. Never push. On a client repository, commit only if the project CLAUDE.md allows local commits from agents; otherwise leave the tree and say so.
 2. Run the save skill with the handoff trigger so a fresh session can resume.
 3. Reply with: the goal and whether it holds (with the check's output), the iterations used, the branch and commit hash if any, and the decision list: one bullet per decision the user must make, each with the reason it is theirs in one sentence and the recommended option first.

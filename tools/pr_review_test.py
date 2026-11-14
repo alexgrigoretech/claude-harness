@@ -323,6 +323,13 @@ class PRReviewTest(unittest.TestCase):
                 code = function(arguments)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def run_logging_main(self, arguments):
+        with mock.patch.dict(os.environ, {
+            "CLAUDE_HOOKS_HOME": str(self.home), "HOME": str(self.home),
+            "USERPROFILE": str(self.home), "XDG_CONFIG_HOME": str(self.home / "config"),
+        }):
+            return self.run_main(lambda argv: runner.main(argv, home=self.home), arguments)
+
     def run_agy(self, fake, prompt="Review this: café", *arguments):
         stdin = io.StringIO(prompt)
         stdout = io.StringIO()
@@ -353,6 +360,336 @@ class PRReviewTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     runner.build_parser().parse_args(["--timeout", value])
                 self.assertEqual(caught.exception.code, 2)
+
+    def test_reviewer_raw_output_on_success_nonzero_and_parse_error(self):
+        for exit_code, last_message, status in ((0, "\ufeff[]\r\n", "ok"), (7, "partial reply\r\n", "error"), (0, "invalid reply", "error")):
+            with self.subTest(exit_code=exit_code, last_message=last_message):
+                def complete(command, **kwargs):
+                    Path(command[-1]).write_text(last_message, encoding="utf-8", newline="")
+                    return subprocess.CompletedProcess(command, exit_code, stdout="raw stdout\n", stderr="raw stderr\n")
+                config = {"name": "fixture", "cmd": self.command(self.plain) + ' "{output_file}"'}
+                with mock.patch.object(runner.subprocess, "run", side_effect=complete):
+                    run = runner.run_reviewer(config, "fixture prompt", home=self.home)
+                self.assertEqual(run.status, status)
+                self.assertEqual(run.stdout, "raw stdout\n")
+                self.assertEqual(run.stderr, "raw stderr\n")
+                self.assertEqual(run.last_message, last_message)
+                self.assertEqual(run.exit_code, exit_code)
+                self.assertTrue({"stdout", "stderr", "last_message", "exit_code"}.isdisjoint(run.public_status()))
+
+    def test_reviewer_raw_stdout_without_last_message(self):
+        config = {"name": "fixture", "cmd": self.command(self.plain)}
+        for output, status in (("[]\n", "ok"), ("invalid reply\n", "error")):
+            with self.subTest(status=status), mock.patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=output, stderr="")):
+                run = runner.run_reviewer(config, "fixture prompt", home=self.home)
+            self.assertEqual(run.status, status)
+            self.assertEqual(run.stdout, output)
+            self.assertEqual(run.stderr, "")
+            self.assertEqual(run.exit_code, 0)
+            self.assertIsNone(run.last_message)
+
+    def test_reviewer_timeout_keeps_partial_output_and_oserror_has_none(self):
+        config = {"name": "fixture", "cmd": self.command(self.plain)}
+        for error in (subprocess.TimeoutExpired("fixture", 1, output="partial"), OSError("fixture failure")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(runner.subprocess, "run", side_effect=error):
+                run = runner.run_reviewer(config, "fixture prompt", home=self.home)
+            self.assertEqual(run.status, "error")
+            self.assertEqual(run.stdout, "partial" if isinstance(error, subprocess.TimeoutExpired) else None)
+            for name in ("stderr", "last_message", "exit_code"):
+                self.assertIsNone(getattr(run, name))
+
+    def test_review_log_timeout_keeps_partial_stdout_and_stderr(self):
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        cases = [("partial stdout", b"partial stderr\xff", "partial stdout", "partial stderr\ufffd"),
+                 (b"partial stdout\xff", "partial stderr", "partial stdout\ufffd", "partial stderr"),
+                 (None, None, None, None)]
+        root = self.home / ".claude" / "local" / "review-log"
+        for stdout, stderr, expected_stdout, expected_stderr in cases:
+            with self.subTest(stdout=stdout, stderr=stderr):
+                previous = set(root.iterdir()) if root.exists() else set()
+                error = subprocess.TimeoutExpired("fixture", 1, output=stdout, stderr=stderr)
+                with mock.patch.object(runner, "read_body", return_value=""), mock.patch.object(runner.subprocess, "run", side_effect=error):
+                    code, _, diagnostic = self.run_logging_main(arguments)
+                self.assertEqual(code, 1, diagnostic)
+                folder, = set(root.iterdir()) - previous
+                metadata = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual(metadata["reviewers"][0]["error"], "timeout")
+                self.assertIsNone(metadata["reviewers"][0]["exit_code"])
+                for label, expected in (("stdout", expected_stdout), ("stderr", expected_stderr)):
+                    path = folder / f"plain.{label}.txt"
+                    if expected is None:
+                        self.assertFalse(path.exists())
+                    else:
+                        self.assertEqual(path.read_text(encoding="utf-8"), expected)
+
+    def test_review_log_contains_prompt_raw_outputs_and_metadata(self):
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain,wrapped,failed", *self.reviewer_arguments()]
+        with mock.patch.object(runner, "read_body", return_value="fixture body"):
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 0, stderr)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        self.assertIsNotNone(runner.REVIEW_LOG_FOLDER_PATTERN.fullmatch(folder.name))
+        self.assertTrue(folder.name.endswith("-" + runner.REVIEW_LOG_UNSAFE_CHARS.sub("_", self.root.name)))
+        prompt = runner.build_prompt("fixture body", self.diff.read_text(encoding="utf-8"))
+        self.assertEqual((folder / "prompt.txt").read_bytes(), prompt.encode("utf-8"))
+        self.assertEqual((folder / "plain.stdout.txt").read_text(encoding="utf-8"), json.dumps(FINDINGS) + "\n")
+        self.assertEqual((folder / "plain.stderr.txt").read_bytes(), b"")
+        self.assertEqual((folder / "failed.stdout.txt").read_bytes(), b"")
+        self.assertEqual((folder / "failed.stderr.txt").read_text(encoding="utf-8"), "reviewer failure\nwith details\n")
+        self.assertFalse((folder / "plain.last-message.txt").exists())
+        metadata = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        document = json.loads((self.root / "pr-review-findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(metadata), {"base", "repo", "generated", "reviewers"})
+        self.assertEqual(metadata["base"], "main")
+        self.assertEqual(metadata["repo"], str(self.root.resolve()))
+        self.assertEqual(metadata["generated"], document["generated"])
+        for item, public in zip(metadata["reviewers"], document["reviewers"]):
+            self.assertEqual(set(item), {"name", "file", "status", "seconds", "exit_code", "error", "findings", "usage"})
+            self.assertEqual(item["file"], item["name"])
+            self.assertEqual(item["exit_code"], 2 if item["name"] == "failed" else 0)
+            self.assertEqual(item["usage"], public.get("usage"))
+            self.assertEqual(item["error"], public.get("error"))
+            self.assertEqual({key: item[key] for key in ("name", "status", "seconds", "findings")}, {key: public[key] for key in ("name", "status", "seconds", "findings")})
+
+    def test_review_log_safe_filenames_last_message_and_folder_collision(self):
+        run = runner.ReviewerRun("fixture/reviewer", "ok", 1.25, [], stdout="raw\r\n", stderr="", last_message="reply\r\n", exit_code=0)
+        document = runner.result_document("fixture-base", [run])
+        document["generated"] = "2026-10-01T00:00:00+00:00"
+        for _ in range(3):
+            runner.write_review_log("prompt\r\n", self.root, document, [run], home=self.home)
+        root = self.home / ".claude" / "local" / "review-log"
+        name = "20261001T000000Z-" + self.root.name
+        self.assertEqual({path.name for path in root.iterdir()}, {name, name + "-2", name + "-3"})
+        folder = root / name
+        stem = runner.REVIEW_LOG_UNSAFE_CHARS.sub("_", run.name)
+        self.assertEqual((folder / f"{stem}.stdout.txt").read_bytes(), b"raw\r\n")
+        self.assertEqual((folder / f"{stem}.stderr.txt").read_bytes(), b"")
+        self.assertEqual((folder / f"{stem}.last-message.txt").read_bytes(), b"reply\r\n")
+        self.assertEqual((folder / "prompt.txt").read_bytes(), b"prompt\r\n")
+
+    def test_review_log_reviewer_filenames_avoid_case_insensitive_collisions(self):
+        names = ["a/b", "a_b", "a_b", "a_b-2", "Sonnet", "sonnet", "SONNET"]
+        runs = [runner.ReviewerRun(name, "ok", 1.0, [], stdout=f"stdout {index}", stderr=f"stderr {index}", last_message=f"reply {index}", exit_code=0)
+                for index, name in enumerate(names)]
+        document = runner.result_document("main", runs)
+        runner.write_review_log("fixture prompt", self.root, document, runs, home=self.home)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        metadata = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        stems = [item["file"] for item in metadata["reviewers"]]
+        self.assertEqual(stems, ["a_b", "a_b-2", "a_b-3", "a_b-2-2", "Sonnet", "sonnet-2", "SONNET-3"])
+        self.assertEqual(len({stem.casefold() for stem in stems}), len(runs))
+        for index, (item, stem) in enumerate(zip(metadata["reviewers"], stems)):
+            self.assertEqual(item["name"], names[index])
+            self.assertIsNone(runner.REVIEW_LOG_UNSAFE_CHARS.search(stem))
+            for label, prefix in (("stdout", "stdout"), ("stderr", "stderr"), ("last-message", "reply")):
+                self.assertEqual((folder / f"{stem}.{label}.txt").read_text(encoding="utf-8"), f"{prefix} {index}")
+
+    def test_review_log_empty_or_dot_only_reviewer_stems_use_reviewer(self):
+        runs = [runner.ReviewerRun(name, "ok", 1.0, [], stdout=str(index)) for index, name in enumerate(("", "...", "///", "reviewer"))]
+        runner.write_review_log("fixture prompt", self.root, runner.result_document("main", runs), runs, home=self.home)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        metadata = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["file"] for item in metadata["reviewers"]], ["reviewer", "reviewer-2", "reviewer-3", "reviewer-4"])
+        for index, item in enumerate(metadata["reviewers"]):
+            self.assertEqual((folder / (item["file"] + ".stdout.txt")).read_text(encoding="utf-8"), str(index))
+
+    def test_review_log_lone_surrogates_are_replaced_in_all_text_files(self):
+        run = runner.ReviewerRun("plain", "ok", 1.0, [], stdout="x\ud800", stderr="y\ud800", last_message="z\ud800", exit_code=0)
+        runner.write_review_log("p\ud800", self.root, runner.result_document("main", [run]), [run], home=self.home)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        for name, expected in (("prompt.txt", b"p?"), ("plain.stdout.txt", b"x?"), ("plain.stderr.txt", b"y?"), ("plain.last-message.txt", b"z?")):
+            self.assertEqual((folder / name).read_bytes(), expected)
+        self.assertEqual(json.loads((folder / "run.json").read_text(encoding="utf-8"))["reviewers"][0]["exit_code"], 0)
+
+    def test_review_log_client_machine_skips_silently(self):
+        machine = self.home / ".claude" / "local" / "machine.json"
+        machine.parent.mkdir(parents=True)
+        machine.write_text(json.dumps({"client": True, "pr_review_reviewers": [{"name": "plain", "cmd": self.command(self.plain)}]}), encoding="utf-8")
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        run = runner.ReviewerRun("plain", "ok", 1.0, [], stdout="fixture reply")
+        with mock.patch.object(runner, "read_body", return_value=""), mock.patch.object(runner, "run_reviewers", return_value=[run]):
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertFalse((machine.parent / "review-log").exists())
+        self.assertTrue((self.root / "pr-review-findings.json").is_file())
+
+    def test_review_log_missing_unreadable_or_non_client_machine_still_logs(self):
+        cases = [("missing", None), ("unreadable", None), ("invalid-json", b"{"), ("invalid-utf8", b"\xff"),
+                 ("non-object", b"[]"), ("false", b'{"client":false}'), ("number", b'{"client":1}'), ("string", b'{"client":"true"}')]
+        for name, content in cases:
+            with self.subTest(name=name):
+                home = self.home / name
+                machine = home / ".claude" / "local" / "machine.json"
+                machine.parent.mkdir(parents=True)
+                if name == "unreadable":
+                    machine.mkdir()
+                elif content is not None:
+                    machine.write_bytes(content)
+                with mock.patch.dict(os.environ, {"CLAUDE_HOOKS_HOME": str(home)}), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    runner.write_review_log("fixture prompt", self.root, runner.result_document("main", []), [])
+                self.assertEqual(stderr.getvalue(), "")
+                folder, = (machine.parent / "review-log").iterdir()
+                self.assertEqual((folder / "prompt.txt").read_text(encoding="utf-8"), "fixture prompt")
+
+    def test_review_log_sanitizes_repo_folder_name(self):
+        repo = self.root / "fixture repo@"
+        document = {"base": "main", "generated": "2026-10-01T00:00:00+00:00"}
+        runner.write_review_log("fixture prompt", repo, document, [], home=self.home)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        self.assertEqual(folder.name, "20261001T000000Z-" + runner.REVIEW_LOG_UNSAFE_CHARS.sub("_", repo.name))
+        self.assertIsNotNone(runner.REVIEW_LOG_FOLDER_PATTERN.fullmatch(folder.name))
+
+    def test_review_log_empty_repo_folder_name_uses_repo(self):
+        repo = Path(self.root.anchor)
+        self.assertEqual(repo.name, "")
+        document = {"base": "main", "generated": "2026-10-01T00:00:00+00:00"}
+        runner.write_review_log("fixture prompt", repo, document, [], home=self.home)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        self.assertEqual(folder.name, "20261001T000000Z-repo")
+        self.assertIsNotNone(runner.REVIEW_LOG_FOLDER_PATTERN.fullmatch(folder.name))
+
+    def test_review_log_unconfigured_reviewer_builds_no_prompt_or_log(self):
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "fixture-unconfigured"]
+        with mock.patch.object(runner, "read_body") as body, mock.patch.object(runner, "run_reviewers") as reviewers:
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 1, stderr)
+        body.assert_not_called()
+        reviewers.assert_not_called()
+        self.assertFalse((self.home / ".claude" / "local" / "review-log").exists())
+        document = json.loads((self.root / "pr-review-findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["reviewers"][0]["name"], "fixture-unconfigured")
+        self.assertEqual(document["reviewers"][0]["error"], "reviewer is not configured")
+
+    def test_review_log_invalid_utf8_output_file_keeps_error_run_and_findings_file(self):
+        fake = self.write_fake("invalid_output.py", "import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_bytes(b'\\xff')\nraise SystemExit(7)\n")
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "fixture",
+                     "--reviewer", 'fixture=' + self.command(fake) + ' "{output_file}"']
+        with mock.patch.object(runner, "read_body", return_value=""), mock.patch.object(runner, "run_reviewers", wraps=runner.run_reviewers) as reviewers, mock.patch.object(runner, "write_review_log", wraps=runner.write_review_log) as log:
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 1, stderr)
+        reviewers.assert_called_once()
+        self.assertEqual(reviewers.call_args.kwargs["home"], self.home)
+        self.assertIsNone(log.call_args.args[3][0].last_message)
+        document = json.loads((self.root / "pr-review-findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["findings"], [])
+        self.assertEqual(document["reviewers"][0]["status"], "error")
+        self.assertEqual(document["reviewers"][0]["error"], "exit 7")
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        self.assertFalse((folder / "fixture.last-message.txt").exists())
+        metadata = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["reviewers"][0]["exit_code"], 7)
+        self.assertEqual((folder / "fixture.stdout.txt").read_bytes(), b"")
+
+    def test_review_log_real_output_file_reviewer_through_main(self):
+        reply = json.dumps(FINDINGS) + "\r\n"
+        fake = self.write_fake("file_reviewer.py", "import sys\nfrom pathlib import Path\n"
+                               f"Path(sys.argv[1]).write_text({reply!r}, encoding='utf-8', newline='')\n"
+                               "print('fixture stdout')\nprint('fixture stderr', file=sys.stderr)\n")
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "fixture",
+                     "--reviewer", 'fixture=' + self.command(fake) + ' "{output_file}"']
+        with mock.patch.object(runner, "read_body", return_value="fixture body"):
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 0, stderr)
+        folder, = (self.home / ".claude" / "local" / "review-log").iterdir()
+        self.assertEqual((folder / "fixture.last-message.txt").read_bytes(), reply.encode("utf-8"))
+        self.assertEqual((folder / "fixture.stdout.txt").read_text(encoding="utf-8"), "fixture stdout\n")
+        self.assertEqual((folder / "fixture.stderr.txt").read_text(encoding="utf-8"), "fixture stderr\n")
+        document = json.loads((self.root / "pr-review-findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["reviewers"][0]["status"], "ok")
+        self.assertEqual(document["findings"], [{**finding, "reviewers": ["fixture"]} for finding in FINDINGS])
+
+    def test_review_log_retention_only_removes_matching_run_folders(self):
+        root = self.home / ".claude" / "local" / "review-log"
+        root.mkdir(parents=True)
+        unrelated = root / "unrelated-folder"
+        unrelated.mkdir()
+        (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+        matching_file = root / "20000101T000000Z-fixture-file"
+        matching_file.write_text("keep", encoding="utf-8")
+        start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+        names = []
+        for offset in range(runner.REVIEW_LOG_LIMIT + 5):
+            name = (start + datetime.timedelta(seconds=offset)).strftime("%Y%m%dT%H%M%SZ") + "-fixture"
+            names.append(name)
+            folder = root / name
+            folder.mkdir()
+            (folder / "prompt.txt").write_text("fixture prompt", encoding="utf-8")
+        document = {"base": "main", "generated": "2026-10-01T00:00:00+00:00"}
+        runner.write_review_log("new prompt", self.root, document, [], home=self.home)
+        folders = {path.name for path in root.iterdir() if path.is_dir() and path != unrelated}
+        self.assertEqual(len(folders), runner.REVIEW_LOG_LIMIT)
+        self.assertEqual(folders, set(names[6:]) | {"20261001T000000Z-" + self.root.name})
+        self.assertEqual((unrelated / "keep.txt").read_text(encoding="utf-8"), "keep")
+        self.assertEqual(matching_file.read_text(encoding="utf-8"), "keep")
+
+    def test_no_log_writes_nothing_and_findings_are_identical(self):
+        run = runner.ReviewerRun("plain", "ok", 1.25, FINDINGS, stdout="raw", stderr="", exit_code=0)
+        document = runner.result_document("main", [run])
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        with mock.patch.object(runner, "run_reviewers", return_value=[run]), mock.patch.object(runner, "result_document", return_value=document), mock.patch.object(runner, "read_body", return_value=""):
+            code, _, stderr = self.run_logging_main([*arguments, "--no-log"])
+            self.assertEqual(code, 0, stderr)
+            self.assertFalse((self.home / ".claude" / "local" / "review-log").exists())
+            without_logging = (self.root / "pr-review-findings.json").read_bytes()
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual((self.root / "pr-review-findings.json").read_bytes(), without_logging)
+        self.assertEqual(len(list((self.home / ".claude" / "local" / "review-log").iterdir())), 1)
+
+    def test_review_log_oserror_preserves_exit_code_and_findings(self):
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        root = self.home / ".claude" / "local" / "review-log"
+        root.parent.mkdir(parents=True)
+        root.write_text("fixture blocks log directory", encoding="utf-8")
+        for status, expected_code in (("ok", 0), ("error", 1)):
+            with self.subTest(status=status):
+                run = runner.ReviewerRun("plain", status, 1.25, [], error="fixture failure" if status == "error" else None)
+                document = runner.result_document("main", [run])
+                with mock.patch.object(runner, "run_reviewers", return_value=[run]), mock.patch.object(runner, "result_document", return_value=document), mock.patch.object(runner, "read_body", return_value=""):
+                    code, _, stderr = self.run_logging_main([*arguments, "--no-log"])
+                    baseline = (self.root / "pr-review-findings.json").read_bytes()
+                    self.assertEqual(code, expected_code)
+                    code, _, stderr = self.run_logging_main(arguments)
+                self.assertEqual(code, expected_code)
+                self.assertEqual((self.root / "pr-review-findings.json").read_bytes(), baseline)
+                warnings = [line for line in stderr.splitlines() if line.startswith("PR review log not written:")]
+                self.assertEqual(len(warnings), 1)
+
+    def test_review_log_valueerror_preserves_exit_code_and_findings(self):
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        for status, expected_code in (("ok", 0), ("error", 1)):
+            with self.subTest(status=status):
+                run = runner.ReviewerRun("plain", status, 1.0, [], error="fixture failure" if status == "error" else None)
+                document = runner.result_document("main", [run])
+                with mock.patch.object(runner, "read_body", return_value=""), mock.patch.object(runner, "run_reviewers", return_value=[run]), mock.patch.object(runner, "result_document", return_value=document), mock.patch.object(runner, "write_review_log", side_effect=ValueError("fixture\nlog failure")) as log:
+                    code, _, _ = self.run_logging_main([*arguments, "--no-log"])
+                    self.assertEqual(code, expected_code)
+                    baseline = (self.root / "pr-review-findings.json").read_bytes()
+                    code, _, stderr = self.run_logging_main(arguments)
+                self.assertEqual(code, expected_code)
+                self.assertEqual((self.root / "pr-review-findings.json").read_bytes(), baseline)
+                log.assert_called_once()
+                self.assertEqual([line for line in stderr.splitlines() if line.startswith("PR review log not written:")], ["PR review log not written: fixture log failure"])
+
+    def test_review_log_locked_expired_folder_does_not_warn(self):
+        root = self.home / ".claude" / "local" / "review-log"
+        expired = root / "20000101T000000Z-fixture"
+        expired.mkdir(parents=True)
+        (expired / "prompt.txt").write_text("fixture locked file", encoding="utf-8")
+        def locked(path, ignore_errors=False):
+            if not ignore_errors:
+                raise PermissionError("fixture locked file")
+        arguments = ["--repo", str(self.root), "--diff", str(self.diff), "--reviewers", "plain", *self.reviewer_arguments(False)]
+        run = runner.ReviewerRun("plain", "ok", 1.0, [], stdout="fixture reply")
+        with mock.patch.object(runner, "read_body", return_value=""), mock.patch.object(runner, "run_reviewers", return_value=[run]), mock.patch.object(runner, "REVIEW_LOG_LIMIT", 1), mock.patch.object(runner.shutil, "rmtree", side_effect=locked) as remove:
+            code, _, stderr = self.run_logging_main(arguments)
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        remove.assert_called_once_with(expired, ignore_errors=True)
+        folder, = set(root.iterdir()) - {expired}
+        self.assertTrue((folder / "run.json").is_file())
+        self.assertTrue((self.root / "pr-review-findings.json").is_file())
 
     def test_runner_passes_timeout_to_reviewers(self):
         for value, expected in ((None, 600), (123, 123)):

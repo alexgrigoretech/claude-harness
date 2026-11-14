@@ -2,6 +2,10 @@
 
 Fill every section. A brief with a vague section produces a vague diff. Numbers in the brief are measured by the orchestrator and pasted; Codex never guesses a value, a column name or a path.
 
+## Problem
+
+One sentence: the single problem this brief solves. Anything else the implementer notices goes under ASSUMPTIONS/RISKS in the report and is not changed.
+
 ## Files you may touch
 
 List them. Nothing else. Say explicitly what must not change (docs, macros, other modules, formatting of untouched lines). If a new file is allowed, name it. No new dependency unless it is named here.

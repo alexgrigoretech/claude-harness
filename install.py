@@ -1456,7 +1456,7 @@ def merge_settings(existing, machine, home, *, statusline_available=True, instal
         post = []
     post = [
         entry for entry in post
-        if not entry_mentions(entry, ("context_save_nudge",))
+        if not entry_mentions(entry, ("context_save_nudge", "pr_brief_nudge"))
     ]
     if not nudge_disabled(machine.get("context_save_at")):
         post.append(
@@ -1465,6 +1465,12 @@ def merge_settings(existing, machine, home, *, statusline_available=True, instal
                 "hooks": [command_hook(interpreter, hook_dir / "context_save_nudge.py")],
             }
         )
+    post.append(
+        {
+            "matcher": "Bash|PowerShell",
+            "hooks": [command_hook(interpreter, hook_dir / "pr_brief_nudge.py")],
+        }
+    )
     hooks["PostToolUse"] = post
 
     desired = machine.get("settings")

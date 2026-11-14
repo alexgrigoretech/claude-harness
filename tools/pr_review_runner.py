@@ -86,6 +86,9 @@ DEFAULT_REVIEWERS = [
     },
 ]
 SEVERITIES = {"high", "medium", "low"}
+REVIEW_LOG_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+REVIEW_LOG_FOLDER_PATTERN = re.compile(r"\d{8}T\d{6}Z-.+")
+REVIEW_LOG_LIMIT = 100
 
 
 class ReviewError(Exception):
@@ -100,6 +103,10 @@ class ReviewerRun:
     findings: list
     usage: dict | None = None
     error: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    last_message: str | None = None
+    exit_code: int | None = None
 
     def public_status(self):
         value = {
@@ -564,13 +571,15 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
                 check=False,
                 timeout=timeout,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             return ReviewerRun(
                 config["name"],
                 "error",
                 round(time.monotonic() - started, 3),
                 [],
                 error="timeout",
+                stdout=exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout,
+                stderr=exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr,
             )
         except (OSError, ValueError) as exc:
             return ReviewerRun(
@@ -581,21 +590,31 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
                 error=f"{exc.__class__.__name__}: {exc}",
             )
         seconds = round(time.monotonic() - started, 3)
+        file_output = None
+        if output_file is not None:
+            try:
+                with output_file.open(encoding="utf-8", newline="") as handle:
+                    file_output = handle.read()
+            except (OSError, UnicodeError):
+                pass
+        raw = {
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "last_message": file_output,
+            "exit_code": completed.returncode,
+        }
         if completed.returncode != 0:
             diagnostic = " ".join(completed.stderr[:300].split())
             error = f"exit {completed.returncode}"
             if diagnostic:
                 error += f": {diagnostic}"
-            return ReviewerRun(config["name"], "error", seconds, [], error=error)
+            return ReviewerRun(config["name"], "error", seconds, [], error=error, **raw)
         output = completed.stdout
         fallback_error = None
         if output_file is not None:
-            try:
-                file_output = output_file.read_text(encoding="utf-8-sig")
-            except OSError:
-                file_output = ""
-            if file_output.strip():
-                output = file_output
+            parsed_file_output = (file_output or "").removeprefix("\ufeff")
+            if parsed_file_output.strip():
+                output = parsed_file_output
             else:
                 fallback_error = "output file missing or empty, parsed stdout fallback"
         try:
@@ -604,7 +623,7 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
             error = str(exc)
             if fallback_error:
                 error += f": {fallback_error}"
-            return ReviewerRun(config["name"], "error", seconds, [], error=error)
+            return ReviewerRun(config["name"], "error", seconds, [], error=error, **raw)
         return ReviewerRun(
             config["name"],
             "ok",
@@ -612,6 +631,7 @@ def run_reviewer(config, prompt, timeout=300, repo=None, home=None):
             findings,
             usage=usage,
             error=fallback_error,
+            **raw,
         )
 
 
@@ -671,6 +691,74 @@ def result_document(base, runs):
     }
 
 
+def write_review_log(prompt, repo, document, runs, home=None):
+    base = Path(home) if home is not None else hooks_home()
+    try:
+        with (base / ".claude" / "local" / "machine.json").open(encoding="utf-8-sig") as handle:
+            machine = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        machine = None
+    if isinstance(machine, dict) and machine.get("client") is True:
+        return
+    root = base / ".claude" / "local" / "review-log"
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.fromisoformat(document["generated"]).astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    repo_name = REVIEW_LOG_UNSAFE_CHARS.sub("_", repo.name) or "repo"
+    folder_name = f"{stamp}-{repo_name}"
+    folder = root / folder_name
+    suffix = 1
+    while True:
+        try:
+            folder.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
+            folder = root / f"{folder_name}-{suffix}"
+    (folder / "prompt.txt").write_text(prompt, encoding="utf-8", errors="replace", newline="")
+    file_stems = []
+    used_stems = set()
+    for run in runs:
+        stem = REVIEW_LOG_UNSAFE_CHARS.sub("_", run.name)
+        if not REVIEW_LOG_UNSAFE_CHARS.sub("", run.name).strip("."):
+            stem = "reviewer"
+        name = stem
+        suffix = 1
+        while name.casefold() in used_stems:
+            suffix += 1
+            name = f"{stem}-{suffix}"
+        used_stems.add(name.casefold())
+        file_stems.append(name)
+        for label, content in (("stdout", run.stdout), ("stderr", run.stderr), ("last-message", run.last_message)):
+            if content is not None:
+                (folder / f"{name}.{label}.txt").write_text(content, encoding="utf-8", errors="replace", newline="")
+    metadata = {
+        "base": document["base"],
+        "repo": str(repo),
+        "generated": document["generated"],
+        "reviewers": [
+            {
+                "name": run.name,
+                "file": stem,
+                "status": run.status,
+                "seconds": run.seconds,
+                "exit_code": run.exit_code,
+                "error": run.error,
+                "findings": len(run.findings),
+                "usage": run.usage,
+            }
+            for run, stem in zip(runs, file_stems)
+        ],
+    }
+    (folder / "run.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", errors="replace")
+    folders = sorted(
+        (path for path in root.iterdir() if REVIEW_LOG_FOLDER_PATTERN.fullmatch(path.name) and path.is_dir() and not path.is_symlink()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for expired in folders[REVIEW_LOG_LIMIT:]:
+        shutil.rmtree(expired, ignore_errors=True)
+
+
 def print_summary(runs):
     print(f"{'reviewer':<20} {'status':<8} {'findings':>8} {'seconds':>8}")
     for run in runs:
@@ -693,12 +781,13 @@ def build_parser():
     parser.add_argument("--reviewers")
     parser.add_argument("--reviewer", action="append", default=[], type=parse_override)
     parser.add_argument("--out")
+    parser.add_argument("--no-log", action="store_true")
     parser.add_argument("--timeout", type=positive_integer, default=600)
     parser.add_argument("--max-diff-bytes", type=positive_integer, default=400000)
     return parser
 
 
-def main(argv=None):
+def main(argv=None, home=None):
     args = build_parser().parse_args(argv)
     repo = Path(args.repo).resolve()
     try:
@@ -711,13 +800,14 @@ def main(argv=None):
         return 1
 
     diff_text, _ = truncate_diff(diff_text, args.max_diff_bytes)
-    configs = load_reviewer_configs(args.reviewer)
+    configs = load_reviewer_configs(args.reviewer, home=home)
     selected, missing = select_reviewers(configs, args.reviewers)
     if args.reviewers is None:
         notice = optional_reviewer_notice(configs, selected)
         if notice is not None:
             print(notice, file=sys.stderr)
     runs = [ReviewerRun(name, "error", 0.0, [], error="reviewer is not configured") for name in missing]
+    prompt = ""
     if selected:
         try:
             body = read_body(repo, args.body)
@@ -725,8 +815,13 @@ def main(argv=None):
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"PR review failed: could not build the prompt: {exc}", file=sys.stderr)
             return 1
-        runs.extend(run_reviewers(prompt, selected, timeout=args.timeout, repo=repo))
+        runs.extend(run_reviewers(prompt, selected, timeout=args.timeout, repo=repo, home=home))
     document = result_document(args.base, runs)
+    if selected and not args.no_log:
+        try:
+            write_review_log(prompt, repo, document, runs, home=home)
+        except (OSError, ValueError) as exc:
+            print(f"PR review log not written: {' '.join(str(exc).split())}", file=sys.stderr)
     output = Path(args.out) if args.out else repo / "pr-review-findings.json"
     if not output.is_absolute():
         output = repo / output

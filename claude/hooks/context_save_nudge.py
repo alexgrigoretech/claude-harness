@@ -257,8 +257,10 @@ def decide(stamp, payload, home, threshold):
                 context = (
                     f"Context is at {int(tokens)} tokens, past the {int(threshold)} token save threshold. "
                     "Run the save skill with the handoff trigger now: write HANDOFF-YYYY-MM-DD-<topic>.md "
-                    "in the working folder with the Write tool (the hook recognises the save by that write), "
-                    "then continue the task from where it was without asking. "
+                    "in the working folder with the Write tool (the hook recognises the save by that write). "
+                    "Tell the user in one line in your reply that the session is past the rotation point and that "
+                    "/clear followed by resume continues from that handoff with a small context. "
+                    "Then continue the task from where it was without asking. "
                     "The user did not type this; it comes from the context_save_nudge hook."
                 )
     housekeeping(stamp.parent)

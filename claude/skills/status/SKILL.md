@@ -1,6 +1,6 @@
 ---
 name: status
-description: Answer questions about a running or finished job from logs and output files without starting any work. Use when the user says "status", "eta", "is it done", "so it's done?", "everything done?", "CI green yet?", "when should I be back", "open items", "show me open items", or asks how a running job is doing or what is still open on it; for "what's next" and "what is left" read the open items and next step of the newest handoff and print them without starting the step (the resume skill is the one that starts it). Plan-level questions (where the whole plan stands, what changed in the plan) belong to the masterplan and progress skills where the plan tools are installed; otherwise answer them from the newest handoff file.
+description: Answer questions about a running or finished job from logs and output files without starting any work. Use when the user says "status", "eta", "is it done", "so it's done?", "everything done?", "CI green yet?", "when should I be back", "open items", "show me open items", "what is open", "what is open to fully close the task", "what is left to close this", or asks how a running job is doing or what is still open on it; for "what's next" and "what is left" read the open items and next step of the newest handoff and print them without starting the step (the resume skill is the one that starts it). Plan-level questions (where the whole plan stands, what changed in the plan) belong to the masterplan and progress skills where the plan tools are installed; otherwise answer them from the newest handoff file.
 model: haiku
 ---
 
@@ -12,7 +12,9 @@ Look, in this order, and stop as soon as the answer is clear:
 1. Background task output files and Codex output files named in the conversation or in the newest `HANDOFF-*.md` in the working directory (`codex-*-out.md`, `*.log`, `codex-*-run.log`). An output file that does not exist yet means the run has not finished; a run log ending in `exit=0` with no output file means a quota exhaustion, not success.
 2. Running agent processes: `tasklist` on Windows, `ps -eo pid,etime,args` elsewhere, filtered to `codex` and `claude`. A process with a long elapsed time and no new log lines is stalled.
 3. `git status --porcelain` and `git log -1 --format=%cr` in the working directory for what has landed.
-4. CI: `gh pr checks` or `gh run list --limit 3` when a PR or workflow was mentioned.
+4. CI: `gh pr checks` or `gh run list --limit 3` when a PR or workflow was mentioned, run through `python <install folder>/tools/ghx.py` so the folder's account answers (the active account may belong to another session and gives a 404 or an empty list on a private repository); plain `gh` only where the tool is not installed.
 5. Timing memory: the project's memory files may hold a typical duration for this job (for example a build or a pipeline run). Use it for the estimate and say so.
+
+When the question is what is still open to close the task, the reply is instead the open items as a numbered list in the order they have to happen, each with who or what it waits on (a review, a CI run, a merge, a deploy, an answer from the user), ending with the item that closes the task; the five line cap does not apply to that list.
 
 Reply in five lines or fewer: state (done, running, stalled, failed, not started), evidence (file and timestamp or process and elapsed time), estimate with its basis, what is blocking if anything, and the one command the user can run to see more. No narrative, no restating the task.

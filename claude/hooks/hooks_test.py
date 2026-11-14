@@ -663,6 +663,26 @@ class CodexFirstGuardTests(HookCase):
         self.assertEqual(len(lines), 1)
         self.assertEqual(json.loads(lines[0])["marker"], "named test exception")
 
+    def test_fresh_marker_with_utf8_bom_allows_and_logs(self):
+        marker = self.home / ".claude" / "direct-edit-ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"\xef\xbb\xbftrivial: one line")
+        result = self.run_hook("codex_first_guard.py", self.payload("C:/work/main.py"))
+        self.assertEqual(result.returncode, 0)
+        log = self.home / ".claude" / "direct-edit-log.jsonl"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(lines[-1])["marker"], "trivial: one line")
+
+    def test_fresh_marker_without_utf8_bom_allows_and_logs(self):
+        marker = self.home / ".claude" / "direct-edit-ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"trivial: one line")
+        result = self.run_hook("codex_first_guard.py", self.payload("C:/work/main.py"))
+        self.assertEqual(result.returncode, 0)
+        log = self.home / ".claude" / "direct-edit-log.jsonl"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(lines[-1])["marker"], "trivial: one line")
+
     def test_stale_marker_blocks(self):
         marker = self.home / ".claude" / "direct-edit-ok"
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -946,6 +966,247 @@ class SessionContextTests(HookCase):
             with self.subTest(error=error), mock.patch.object(session_context, "file_lock", side_effect=error), mock.patch.object(session_context, "hooks_home", return_value=self.home), mock.patch.object(session_context, "git_run", return_value="false"), mock.patch.object(session_context, "process_context", return_value="none"):
                 session_context.build_context({"cwd": str(self.home), "source": "compact", "session_id": "compact-lock-failure"})
             self.assertFalse(stamp.exists())
+
+
+class PrBriefNudgeTests(HookCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(dir=type(self).home))
+        self.skill = self.home / ".claude" / "skills" / "pr-brief" / "SKILL.md"
+        self.skill.parent.mkdir(parents=True)
+        self.skill.write_text("fixture", encoding="utf-8")
+        self.url = "https://github.com/acme/widgets/pull/7"
+        self.payload = {
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "gh pr create"}, "tool_response": self.url,
+        }
+
+    def assert_nudge(self, url=None, filename="widgets-pr7.pdf"):
+        result = self.run_hook("pr_brief_nudge.py", self.payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), {"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": f"A pull request was opened: {url or self.url}. Run the pr-brief skill for it now and write {filename} to ~/.claude/plans/pr-briefs/, print the PDF path, then continue the task from where it was without asking. The user did not type this; it comes from the pr_brief_nudge hook.",
+        }})
+
+    def assert_silent(self, result=None):
+        if result is None:
+            result = self.run_hook("pr_brief_nudge.py", self.payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_gh_create_string_response_emits_exact_text(self):
+        self.assert_nudge()
+        self.assertFalse((self.home / ".claude" / "plans").exists())
+
+    def test_ghx_create_emits(self):
+        for path in ("tools/ghx.py", "F:/x/tools/ghx.py"):
+            with self.subTest(path=path):
+                self.payload["tool_input"]["command"] = "python " + path + " pr create"
+                self.assert_nudge()
+
+    def test_double_quoted_path_with_space_emits(self):
+        for name in ("gh", "gh.exe", "ghx.py"):
+            with self.subTest(name=name):
+                self.payload["tool_input"]["command"] = 'python "F:\\My Tools\\harness\\tools\\' + name + '" pr create'
+                self.assert_nudge()
+
+    def test_single_quoted_path_with_space_emits(self):
+        for name in ("gh", "gh.exe", "ghx.py"):
+            with self.subTest(name=name):
+                self.payload["tool_input"]["command"] = "python 'F:\\My Tools\\harness\\tools\\" + name + "' pr create"
+                self.assert_nudge()
+
+    def test_command_substitution_create_emits(self):
+        self.payload["tool_input"]["command"] = "URL=$(gh pr create " + "-" * 2 + "fill)"
+        self.assert_nudge()
+
+    def test_powershell_subexpression_create_emits(self):
+        self.payload["tool_name"] = "PowerShell"
+        self.payload["tool_input"]["command"] = "$u = (gh pr create " + "-" * 2 + "fill)"
+        self.assert_nudge()
+
+    def test_backtick_create_emits(self):
+        self.payload["tool_input"]["command"] = "URL=`gh pr create " + "-" * 2 + "fill`"
+        self.assert_nudge()
+
+    def test_echo_unrelated_substitution_with_url_is_silent(self):
+        self.payload["tool_input"]["command"] = 'echo "$(date) pr create"'
+        self.assert_silent()
+
+    def test_ghx_options_before_create_emit(self):
+        self.payload["tool_input"]["command"] = "python tools/ghx.py " + "-" * 2 + "user fixture-login " + "-" * 2 + "cwd /work/alpha pr create"
+        self.assert_nudge()
+
+    def test_gh_repo_option_before_create_emits(self):
+        for option in ("-R acme/widgets", "-" * 2 + "repo acme/widgets"):
+            with self.subTest(option=option):
+                self.payload["tool_input"]["command"] = "gh " + option + " pr create"
+                self.assert_nudge()
+
+    def test_gh_exe_create_emits(self):
+        self.payload["tool_input"]["command"] = "gh.exe pr create"
+        self.assert_nudge()
+
+    def test_echo_ghx_without_url_is_silent(self):
+        self.payload["tool_input"]["command"] = 'echo "ghx.py pr create"'
+        self.payload["tool_response"] = "ghx.py pr create"
+        self.assert_silent()
+
+    def test_pr_create_without_gh_is_silent(self):
+        for command in ("pr create", "gh pr view; pr create", "python tools/ghx.py; pr create"):
+            with self.subTest(command=command):
+                self.payload["tool_input"]["command"] = command
+                self.assert_silent()
+
+    def test_gitlab_post_web_url_emits(self):
+        url = "https://gitlab.example.com/group/sub/widgets/-/merge_requests/12"
+        self.payload["tool_input"]["command"] = "curl -X POST https://gitlab.example.com/api/v4/projects/1/merge_requests"
+        self.payload["tool_response"] = {"output": json.dumps({"web_url": url})}
+        self.assert_nudge(url, "widgets-pr12.pdf")
+
+    def test_gitlab_collection_encoded_project_post_emits(self):
+        url = "https://gitlab.example.com/group/widgets/-/merge_requests/12"
+        self.payload["tool_input"]["command"] = "curl -X POST https://gitlab.example.com/api/v4/projects/group%2Fwidgets/merge_requests"
+        self.payload["tool_response"] = {"output": json.dumps({"web_url": url})}
+        self.assert_nudge(url, "widgets-pr12.pdf")
+
+    def test_gitlab_collection_post_with_query_emits(self):
+        url = "https://gitlab.example.com/group/widgets/-/merge_requests/12"
+        self.payload["tool_input"]["command"] = 'curl -X POST "https://gitlab.example.com/api/v4/projects/group%2Fwidgets/merge_requests?title=fixture"'
+        self.payload["tool_response"] = {"output": json.dumps({"web_url": url})}
+        self.assert_nudge(url, "widgets-pr12.pdf")
+
+    def test_gitlab_existing_request_posts_are_silent(self):
+        url = "https://gitlab.example.com/group/widgets/-/merge_requests/12"
+        self.payload["tool_response"] = {"output": json.dumps({"web_url": url})}
+        for tool in ("curl -X POST", "Invoke-RestMethod -Method Post", "Invoke-WebRequest -Method Post"):
+            for action in ("approve", "notes", "merge"):
+                with self.subTest(tool=tool, action=action):
+                    self.payload["tool_name"] = "Bash" if tool.startswith("curl") else "PowerShell"
+                    self.payload["tool_input"]["command"] = f"{tool} https://gitlab.example.com/api/v4/projects/group%2Fwidgets/merge_requests/12/{action}"
+                    self.assert_silent()
+
+    def test_powershell_collection_encoded_project_post_emits(self):
+        url = "https://gitlab.example.com/group/widgets/-/merge_requests/12"
+        self.payload["tool_name"] = "PowerShell"
+        self.payload["tool_input"]["command"] = "Invoke-RestMethod -Method Post 'https://gitlab.example.com/api/v4/projects/group%2Fwidgets/merge_requests'"
+        self.payload["tool_response"] = {"content": json.dumps({"web_url": url})}
+        self.assert_nudge(url, "widgets-pr12.pdf")
+
+    def test_glab_create_emits(self):
+        url = "https://gitlab.example.com/group/sub/widgets/-/merge_requests/7"
+        self.payload["tool_input"]["command"] = "glab mr create"
+        self.payload["tool_response"] = {"stdout": url}
+        self.assert_nudge(url)
+
+    def test_push_option_url_in_stderr_emits(self):
+        url = "https://gitlab.example.com/group/sub/widgets/-/merge_requests/7"
+        for option in ("-o merge_request.create", "-omerge_request.create", "-" * 2 + "push-option=merge_request.create", "-" * 2 + "push-option 'merge_request.create'"):
+            with self.subTest(option=option):
+                self.payload["tool_input"]["command"] = "git push origin HEAD " + option
+                self.payload["tool_response"] = {"stdout": "", "stderr": "remote: " + url}
+                self.assert_nudge(url)
+
+    def test_powershell_post_emits(self):
+        self.payload["tool_name"] = "PowerShell"
+        for tool in ("Invoke-RestMethod", "Invoke-WebRequest"):
+            with self.subTest(tool=tool):
+                self.payload["tool_input"]["command"] = tool + " -Method Post https://gitlab.example.com/api/v4/projects/1/merge_requests"
+                self.assert_nudge()
+
+    def test_post_option_forms_emit(self):
+        for option in ("-X POST", "-" * 2 + "request POST", "-" * 2 + "data '{}'", "-d '{}'", "-" * 2 + "form title=fixture", "-F title=fixture"):
+            with self.subTest(option=option):
+                self.payload["tool_input"]["command"] = "curl " + option + " https://gitlab.example.com/api/v4/projects/1/merge_requests"
+                self.assert_nudge()
+
+    def test_dict_response_string_fields_emit(self):
+        for key in ("stdout", "stderr", "output", "content"):
+            with self.subTest(key=key):
+                self.payload["tool_response"] = {"stdout": None, "stderr": 1, "output": [], "content": {}, key: self.url}
+                self.assert_nudge()
+
+    def test_first_url_determines_brief_name(self):
+        url = "https://gitlab.example.com/group/sub/gadgets/-/merge_requests/12"
+        self.payload["tool_response"] = {"stdout": url, "stderr": self.url}
+        self.assert_nudge(url, "gadgets-pr12.pdf")
+
+    def test_no_url_is_silent(self):
+        self.payload["tool_response"] = "creation failed"
+        self.assert_silent()
+
+    def test_subagent_is_silent(self):
+        self.payload["agent_id"] = "fixture-agent"
+        self.assert_silent()
+
+    def test_other_tool_is_silent(self):
+        self.payload["tool_name"] = "Read"
+        self.assert_silent()
+
+    def test_missing_skill_is_silent(self):
+        self.skill.unlink()
+        self.assert_silent()
+
+    def test_existing_pdf_is_silent(self):
+        brief = self.home / ".claude" / "plans" / "pr-briefs" / "widgets-pr7.pdf"
+        brief.parent.mkdir(parents=True)
+        brief.write_bytes(b"fixture")
+        self.assert_silent()
+
+    def test_grep_without_url_is_silent(self):
+        self.payload["tool_input"]["command"] = 'grep "gh pr create" fixture.txt'
+        self.payload["tool_response"] = "gh pr create"
+        self.assert_silent()
+
+    def test_mentions_and_help_with_url_are_silent(self):
+        for command in (
+            'grep "gh pr create" fixture.txt', 'echo "glab mr create"',
+            'cat "gh pr create"', 'sed "gh pr create" fixture.txt',
+            'Select-String "gh pr create" fixture.txt', "gh pr create " + "-" * 2 + "help",
+            "glab mr create " + "-" * 2 + "help",
+            'grep "ghx.py pr create" fixture.txt', 'echo "ghx.py pr create"',
+            'cat "ghx.py pr create"', 'sed "ghx.py pr create" fixture.txt',
+            'Select-String "ghx.py pr create" fixture.txt', "python tools/ghx.py pr create " + "-" * 2 + "help",
+        ):
+            with self.subTest(command=command):
+                self.payload["tool_input"]["command"] = command
+                self.assert_silent()
+
+    def test_non_creation_with_url_is_silent(self):
+        for command in ("gh pr view", "git push origin HEAD", "git push origin merge_request.create", "curl https://gitlab.example.com/api/v4/projects/1/merge_requests"):
+            with self.subTest(command=command):
+                self.payload["tool_input"]["command"] = command
+                self.assert_silent()
+
+    def test_chained_creation_emits(self):
+        self.payload["tool_input"]["command"] = 'echo "opening"; gh pr create'
+        self.assert_nudge()
+
+    def test_invalid_tool_input_is_silent(self):
+        for value in (None, "gh pr create", {}, {"command": 7}):
+            with self.subTest(value=value):
+                self.payload["tool_input"] = value
+                self.assert_silent()
+
+    def test_invalid_response_is_silent(self):
+        for value in (None, [], 7, {"web_url": self.url}, {"stdout": [self.url]}):
+            with self.subTest(value=value):
+                self.payload["tool_response"] = value
+                self.assert_silent()
+
+    def test_missing_and_malformed_payloads_are_silent(self):
+        for raw in ("", "{", "null", "[]", "{}"):
+            with self.subTest(raw=raw):
+                self.assert_silent(self.run_hook("pr_brief_nudge.py", raw=raw))
+
+    def test_unexpected_exception_has_one_line_diagnostic(self):
+        import pr_brief_nudge
+        with mock.patch.object(pr_brief_nudge, "read_payload", side_effect=OSError("fixture\nerror")), contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(pr_brief_nudge.main(), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "pr-brief-nudge: fixture error\n")
 
 
 class ContextSaveNudgeTests(HookCase):
@@ -1717,12 +1978,22 @@ class ContextSaveNudgeTests(HookCase):
             self.assertEqual(self.nudge.main(), 0)
             transcript.assert_not_called()
 
+    def test_nudge_explains_rotation_and_keeps_working(self):
+        self.write_transcript(self.record())
+        context = json.loads(self.run_nudge().stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(context.startswith("Context is at 150000 tokens, past the 150000 token save threshold."))
+        self.assertIn("Tell the user in one line in your reply", context)
+        self.assertIn("past the rotation point", context)
+        self.assertIn("/clear followed by resume continues from that handoff with a small context", context)
+        self.assertIn("continue the task from where it was without asking", context)
+        self.assertTrue(context.endswith("The user did not type this; it comes from the context_save_nudge hook."))
+
     def test_at_threshold_fires_exact_text_and_stamp(self):
         self.write_transcript(self.record())
         result = self.run_nudge()
         self.assertEqual(json.loads(result.stdout), {"hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": "Context is at 150000 tokens, past the 150000 token save threshold. Run the save skill with the handoff trigger now: write HANDOFF-YYYY-MM-DD-<topic>.md in the working folder with the Write tool (the hook recognises the save by that write), then continue the task from where it was without asking. The user did not type this; it comes from the context_save_nudge hook.",
+            "additionalContext": "Context is at 150000 tokens, past the 150000 token save threshold. Run the save skill with the handoff trigger now: write HANDOFF-YYYY-MM-DD-<topic>.md in the working folder with the Write tool (the hook recognises the save by that write). Tell the user in one line in your reply that the session is past the rotation point and that /clear followed by resume continues from that handoff with a small context. Then continue the task from where it was without asking. The user did not type this; it comes from the context_save_nudge hook.",
         }})
         self.assertRegex(self.stamp.read_text(encoding="utf-8"),
                          r"\A150000 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00 nudged\n\Z")
@@ -1970,6 +2241,25 @@ class DraftWrapGuardTests(HookCase):
         result = self.run_draft(content="One paragraph.\n\nAnother paragraph.")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_design_template_write_is_allowed(self):
+        text = (REPO / "templates" / "DESIGN.md").read_text(encoding="utf-8")
+        result = self.run_draft(path="DESIGN.md", content=text)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_design_tokens_allow_fences_but_block_body_prose(self):
+        text = "-" * 3 + '\nname: "Sample country indicators"\nversion: 1\n'
+        text += "\n" * 60 + "-" * 3 + "\n# Sample design\n```yaml\n"
+        text += "scale: [4, 8, 12, 16, 20, 24, 32, 40, 44, 48, 56, 64, 96]\nradius: 4\n```\n"
+        result = self.run_draft(path="DESIGN.md", content=text)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for separator in ("", "~~~yaml\n" + self.wrapped + "\n~~~\n"):
+            with self.subTest(separator=separator):
+                content = text + separator + self.wrapped
+                result = self.run_draft(path="DESIGN.md", content=content)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                line_number = len((text + separator).splitlines()) + 1
+                self.assertIn(f"hard-wrapped at line {line_number} (", result.stderr)
+
     def test_python_write_is_allowed(self):
         result = self.run_draft(path="draft.py", content="# " + self.wrapped)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2090,6 +2380,30 @@ class DraftWrapGuardTests(HookCase):
         marker.write_text("Preserve intentional line breaks.\n", encoding="utf-8")
         result = self.run_draft(content=self.wrapped)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fresh_marker_with_utf8_bom_allows_and_logs(self):
+        marker = self.home / ".claude" / "wrap-ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"\xef\xbb\xbftrivial: one line")
+        log = self.home / ".claude" / "wrap-ok-log.jsonl"
+        before = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+        result = self.run_draft(content=self.wrapped)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), len(before) + 1)
+        self.assertEqual(json.loads(lines[-1])["marker"], "trivial: one line")
+
+    def test_fresh_marker_without_utf8_bom_allows_and_logs(self):
+        marker = self.home / ".claude" / "wrap-ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"trivial: one line")
+        log = self.home / ".claude" / "wrap-ok-log.jsonl"
+        before = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+        result = self.run_draft(content=self.wrapped)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), len(before) + 1)
+        self.assertEqual(json.loads(lines[-1])["marker"], "trivial: one line")
 
     def test_stale_marker_blocks_wrapped_text(self):
         marker = self.home / ".claude" / "wrap-ok"
@@ -3143,6 +3457,7 @@ class InstallerTests(unittest.TestCase):
             home / ".claude" / "hooks" / "gh_credential_helper.py",
             home / ".claude" / "hooks" / "draft_wrap_guard.py",
             home / ".claude" / "hooks" / "context_save_nudge.py",
+            home / ".claude" / "hooks" / "pr_brief_nudge.py",
             home / ".claude" / "local" / "machine.json",
             home / ".claude" / "local" / "machine.md",
             home / ".claude" / "local" / "machine.local.md",
@@ -4867,15 +5182,19 @@ class InstallerTests(unittest.TestCase):
         home = self.new_home("context-save-merge-home")
         unrelated = {"matcher": "Read", "hooks": [{"type": "command", "command": "custom-post"}]}
         stale = {"matcher": "Write", "hooks": [{"type": "command", "command": "python old/context_save_nudge.py"}]}
-        existing = {"hooks": {"PostToolUse": [unrelated, stale, stale]}}
+        stale_brief = {"matcher": "Write", "hooks": [{"type": "command", "command": "python old/pr_brief_nudge.py"}]}
+        existing = {"hooks": {"PostToolUse": [unrelated, stale, stale_brief, stale, stale_brief]}}
         expected = {"matcher": "Bash|PowerShell|Edit|MultiEdit|Write|Agent", "hooks": [installer.command_hook(
             Path(sys.executable), home / ".claude" / "hooks" / "context_save_nudge.py",
         )]}
+        brief = {"matcher": "Bash|PowerShell", "hooks": [installer.command_hook(
+            Path(sys.executable), home / ".claude" / "hooks" / "pr_brief_nudge.py",
+        )]}
         for attempt in range(2):
             existing = installer.merge_settings(existing, {}, home)
-            self.assertEqual(existing["hooks"]["PostToolUse"], [unrelated, expected])
+            self.assertEqual(existing["hooks"]["PostToolUse"], [unrelated, expected, brief])
         fresh = installer.merge_settings({}, {}, home)
-        self.assertEqual(fresh["hooks"]["PostToolUse"], [expected])
+        self.assertEqual(fresh["hooks"]["PostToolUse"], [expected, brief])
 
     def test_disabled_context_save_hook_removes_stale_entries(self):
         spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
@@ -4886,10 +5205,13 @@ class InstallerTests(unittest.TestCase):
         unrelated = {"hooks": [{"type": "command", "command": "custom-post"}]}
         stale = {"hooks": [{"type": "command", "command": "python context_save_nudge.py"}]}
         existing = {"hooks": {"PostToolUse": [stale, unrelated, stale]}}
+        brief = {"matcher": "Bash|PowerShell", "hooks": [installer.command_hook(
+            Path(sys.executable), home / ".claude" / "hooks" / "pr_brief_nudge.py",
+        )]}
         for attempt in range(2):
             existing = installer.merge_settings(existing, machine, home)
-            self.assertEqual(existing["hooks"]["PostToolUse"], [unrelated])
-        self.assertEqual(installer.merge_settings({}, machine, home)["hooks"]["PostToolUse"], [])
+            self.assertEqual(existing["hooks"]["PostToolUse"], [unrelated, brief])
+        self.assertEqual(installer.merge_settings({}, machine, home)["hooks"]["PostToolUse"], [brief])
 
 
     def test_unexpected_post_tool_use_shape_is_replaced(self):
@@ -6725,7 +7047,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(80 files)", result.stdout)
+            self.assertIn("(85 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())
@@ -8746,6 +9068,24 @@ class CheckWritingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("0 findings in 1 files", result.stdout)
 
+    def test_hard_wrap_design_template_and_body_prose(self):
+        path = self.base / "DESIGN.md"
+        text = (REPO / "templates" / "DESIGN.md").read_text(encoding="utf-8")
+        for body in ("", WRAPPED):
+            with self.subTest(body=body):
+                path.write_text(text + body, encoding="utf-8")
+                result = subprocess.run(
+                    [sys.executable, str(REPO / "tools" / "check_writing.py"),
+                     "-" * 2 + "rules", "hard-wrap", str(path)],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=5, check=False,
+                )
+                expected = [f"{int(bool(body))} findings in 1 files"]
+                if body:
+                    expected.insert(0, f"{path}:{len(text.splitlines()) + 1}: hard-wrap: {WRAPPED.splitlines()[0]}")
+                self.assertEqual(result.returncode, int(bool(body)), result.stderr)
+                self.assertEqual(result.stdout.splitlines(), expected)
+
     def test_command_options_are_not_dash_findings(self):
         path = self.base / "options.md"
         path.write_text("Use --flag and --dry-run in prose.\n", encoding="utf-8")
@@ -8819,6 +9159,100 @@ class HardWrapTests(unittest.TestCase):
         text = "-" * 3 + "\ndescription: >\n" + "\n".join("  " + line for line in WRAPPED.splitlines()) + "\n" + "-" * 3
         self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
         self.assertEqual(self.check_writing.hard_wrap_findings(text + "\n\n" + WRAPPED)[0][0], 8)
+
+    def test_design_template_is_clean(self):
+        text = (REPO / "templates" / "DESIGN.md").read_text(encoding="utf-8")
+        self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+
+    def test_measured_design_front_matter_false_positives(self):
+        name = 'name: "Sample country indicators"'
+        scale = "  scale: [4, 8, 12, 16, 20, 24, 32, 40, 44, 48, 56, 64, 96]"
+        for line_number, token in ((3, name), (4, name), (113, scale), (136, scale)):
+            with self.subTest(line_number=line_number):
+                lines = ["-" * 3, "# Sample design tokens"] + [""] * (line_number - 3)
+                if token == scale:
+                    lines[-1] = "spacing:"
+                lines += [token, "version: 1"]
+                lines += [""] * max(0, 76 - len(lines))
+                lines += ["-" * 3, "", "# Sample design"]
+                self.assertEqual(self.check_writing.hard_wrap_findings("\n".join(lines)), [])
+                lines[0] = lines[-3] = ""
+                self.assertEqual(
+                    self.check_writing.hard_wrap_findings("\n".join(lines)),
+                    [(line_number, token.strip())],
+                )
+
+    def test_front_matter_short_keys_and_long_list_are_clean(self):
+        tokens = 'name: "Sample country indicators"\nversion: 1\nbase_unit: 4\n'
+        tokens += "scale: [" + ", ".join(str(value) for value in range(4, 200, 4)) + "]\nradius: 4"
+        self.assertEqual(self.check_writing.hard_wrap_findings(tokens), [(1, tokens.splitlines()[0])])
+        for closing in ("-" * 3, "." * 3):
+            with self.subTest(closing=closing):
+                text = "-" * 3 + "\n" + tokens + "\n" + closing + "\n"
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+                self.assertEqual(
+                    self.check_writing.hard_wrap_findings(text + WRAPPED),
+                    [(len(text.splitlines()) + 1, WRAPPED.splitlines()[0])],
+                )
+
+    def test_front_matter_strips_delimiter_lines(self):
+        tokens = 'name: "Sample country indicators"\nversion: 1'
+        for opening in (" " + "-" * 3, "-" * 3 + " "):
+            with self.subTest(opening=opening):
+                text = opening + "\n" + tokens + "\n" + "-" * 3
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+        for closing in (" " + "-" * 3, "-" * 3 + " ", " " + "." * 3, "." * 3 + " "):
+            with self.subTest(closing=closing):
+                text = "-" * 3 + "\n" + tokens + "\n" + closing
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+        text = "\n" + "-" * 3 + "\n" + tokens + "\n" + "-" * 3
+        self.assertEqual(self.check_writing.hard_wrap_findings(text), [(3, tokens.splitlines()[0])])
+
+    def test_opening_thematic_rule_does_not_hide_wrapped_prose(self):
+        for prefix in ("", "title: Draft\n" + "\n" * 60):
+            with self.subTest(prefix=prefix):
+                text = "-" * 3 + "\n" + prefix + WRAPPED + "\n" + "-" * 3 + "\nMore text."
+                self.assertEqual(
+                    self.check_writing.hard_wrap_findings(text),
+                    [(2 + prefix.count("\n"), WRAPPED.splitlines()[0])],
+                )
+
+    def test_unterminated_front_matter_is_checked_as_prose(self):
+        text = "-" * 3 + "\n" + WRAPPED
+        self.assertEqual(self.check_writing.hard_wrap_findings(text), [(2, WRAPPED.splitlines()[0])])
+        text = "-" * 3 + '\nname: "Sample country indicators"\nversion: 1'
+        self.assertEqual(self.check_writing.hard_wrap_findings(text), [(2, text.splitlines()[1])])
+
+    def test_front_matter_does_not_parse_fence_markers(self):
+        text = "-" * 3 + "\n  ```yaml\n" + "\n".join("  " + line for line in WRAPPED.splitlines())
+        text += "\n" + "." * 3 + "\n"
+        self.assertEqual(self.check_writing.hard_wrap_findings(text + WRAPPED), [(7, WRAPPED.splitlines()[0])])
+
+    def test_fenced_yaml_between_wrapped_paragraphs(self):
+        tokens = 'name: "Sample country indicators"\nversion: 1\n'
+        tokens += "scale: [4, 8, 12, 16, 20, 24, 32, 40, 44, 48, 56, 64, 96]\nradius: 4"
+        for marker in ("```", "~~~~"):
+            for indent in range(4):
+                with self.subTest(marker=marker, indent=indent):
+                    fence = " " * indent + marker
+                    text = WRAPPED + "\n" + fence + "yaml\n" + tokens + "\n" + fence + marker[0] + "\n"
+                    self.assertEqual(
+                        self.check_writing.hard_wrap_findings(text + WRAPPED),
+                        [(1, WRAPPED.splitlines()[0]), (len(text.splitlines()) + 1, WRAPPED.splitlines()[0])],
+                    )
+
+    def test_fences_do_not_join_paragraph_fragments(self):
+        for marker in ("```", "~~~"):
+            with self.subTest(marker=marker):
+                text = WRAPPED.splitlines()[0] + "\n" + marker + "yaml\n" + WRAPPED + "\n" + marker
+                text += "\nand a continuation"
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+
+    def test_unclosed_fences_run_to_end(self):
+        for marker in ("```", "~~~~"):
+            with self.subTest(marker=marker):
+                text = "A clean paragraph.\n" + marker + "yaml\n" + WRAPPED
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
 
     def test_short_line_is_clean(self):
         self.assertEqual(self.check_writing.hard_wrap_findings("A" * 25 + "\na continuation"), [])
@@ -9012,11 +9446,22 @@ class HardWrapTests(unittest.TestCase):
         self.assertEqual(self.check_writing.hard_wrap_findings(text), [(2, WRAPPED.splitlines()[0])])
 
     def test_front_matter_closing_marker_has_line_limit(self):
-        for closing_line, expected in ((60, []), (61, [(2, "title: " + "A" * 30)])):
+        for closing_line, expected in ((400, []), (401, [(2, "title: " + "A" * 30)])):
             with self.subTest(closing_line=closing_line):
                 text = "-" * 3 + "\ntitle: " + "A" * 30 + "\nother: value\n"
                 text += "\n" * (closing_line - 4) + "-" * 3
                 self.assertEqual(self.check_writing.hard_wrap_findings(text), expected)
+
+    def test_front_matter_beyond_old_line_limit_is_clean(self):
+        for closing_line in (60, 61, 80, 136):
+            with self.subTest(closing_line=closing_line):
+                text = "-" * 3 + "\ntitle: " + "A" * 30 + "\nother: value\n"
+                text += "\n" * (closing_line - 4) + "-" * 3
+                self.assertEqual(self.check_writing.hard_wrap_findings(text), [])
+                self.assertEqual(
+                    self.check_writing.hard_wrap_findings(text + "\n" + WRAPPED),
+                    [(closing_line + 1, WRAPPED.splitlines()[0])],
+                )
 
     def test_two_line_paragraph_is_reported(self):
         text = "intro\n\n" + "\n".join(WRAPPED.splitlines()[:2])
