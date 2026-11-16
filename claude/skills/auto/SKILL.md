@@ -43,3 +43,11 @@ Whether the goal holds or a stop condition fired:
 1. Commit once, here and nowhere earlier in the run: iterations leave their work in the tree and no iteration commits. Commit on a branch this run created (`auto/<goal-slug>`), staging by explicit path, when the tree has changes that pass tier 0; when that branch already carries this run's or today's unpushed commit, amend it instead of adding another. Never push. On a client repository, commit only if the project CLAUDE.md allows local commits from agents; otherwise leave the tree and say so.
 2. Run the save skill with the handoff trigger so a fresh session can resume.
 3. Reply with: the goal and whether it holds (with the check's output), the iterations used, the branch and commit hash if any, and the decision list: one bullet per decision the user must make, each with the reason it is theirs in one sentence and the recommended option first.
+
+## Not done when
+
+A state on this list looks finished and is not. Report it as the state it is, never as done; the status skill reads this list too.
+
+- The goal check held in an earlier iteration but was not run on the final tree.
+- The goal check was never seen to fail. Step 1 runs it before any work; when it passes there and the work is not already done, it tests the wrong thing. A goal that cannot run on the base (a file that does not exist yet) counts as failing there; say so in the trail.
+- The commit exists but the handoff does not.

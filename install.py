@@ -1400,7 +1400,7 @@ def merge_settings(existing, machine, home, *, statusline_available=True, instal
         entry for entry in pre
         if not entry_mentions(
             entry,
-            ("codex-first-guard", "secret-guard", "codex_first_guard", "secret_guard", "draft_wrap_guard"),
+            ("codex-first-guard", "secret-guard", "codex_first_guard", "secret_guard", "draft_wrap_guard", "destructive_guard"),
         )
     ]
     edit_hooks = []
@@ -1418,7 +1418,10 @@ def merge_settings(existing, machine, home, *, statusline_available=True, instal
             },
             {
                 "matcher": "Bash|PowerShell",
-                "hooks": [command_hook(interpreter, hook_dir / "secret_guard.py")],
+                "hooks": [
+                    command_hook(interpreter, hook_dir / "secret_guard.py"),
+                    command_hook(interpreter, hook_dir / "destructive_guard.py"),
+                ],
             },
         ]
     )

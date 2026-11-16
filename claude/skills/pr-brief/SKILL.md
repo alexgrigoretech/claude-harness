@@ -31,7 +31,8 @@ The page is design content, so it is written by Fable or Opus (the session model
 
 1. `python <install folder>/tools/render_design.py ~/.claude/plans/pr-briefs/<name>.html --pdf --out ~/.claude/plans/pr-briefs` writes `<name>.pdf` and prints its absolute path. The install folder is the harness clone or bundle named in `~/.claude/local/machine.md`.
 2. Read the PDF back with the Read tool. One page only; a second page means the copy is too long, cut it. Diagram text that is clipped by its box is fixed in the SVG, not by shrinking the font below 8pt.
-3. Print the PDF path in the reply. When the ship or merge skill called this skill, that skill prints the path in its report.
+3. Open the finished PDF in the person's default viewer without asking, every time a brief is rendered, including when the ship or merge skill or the pr_brief_nudge hook triggered it at PR creation: `Start-Process "<pdf>"` from PowerShell on Windows, `open "<pdf>"` on macOS, `xdg-open "<pdf>"` on Linux with a desktop. Skip it only on a host with no display (a headless `claude -p` run, an ssh session) and say so. Several briefs in one pass open together after the last one renders.
+4. Print the PDF path in the reply. When the ship or merge skill called this skill, that skill prints the path in its report.
 
 ## Done means
 

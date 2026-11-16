@@ -16,3 +16,11 @@ The ship skill stops before the merge on purpose ("merge only on the user's go")
    Before the merge command, check for `~/.claude/plans/pr-briefs/<repo>-pr<n>.pdf`; when it is missing, run the pr-brief skill first, so no PR is merged without its brief.
 7. Local follow-up: when the base branch is checked out in another worktree of this clone, do not touch it (another session may own it). When this worktree holds the merged branch, `git fetch` and report that the branch can be removed; never delete a local branch or worktree in this skill.
 8. Report in four lines: PR number and merge commit, the review evidence used (and the PR brief path in `~/.claude/plans/pr-briefs/`), the account used, what is left (retargeted PRs, local branch cleanup, deploy if the project CLAUDE.md has a deploy section, which the ship skill owns).
+
+## Not done when
+
+A state on this list looks finished and is not. Report it as the state it is, never as done; the status skill reads this list too.
+
+- `gh pr merge` returned, but `gh pr view` does not read MERGED (an auto-merge is queued or a required check is still running).
+- A stacked PR that targeted the deleted head branch now reads CLOSED instead of retargeted.
+- The pull request is on the harness repository itself and the clone this machine installs from (named in `~/.claude/local/machine.md`) is not fast-forwarded and installed. That install is not this skill's step: report the merge as merged, not installed, and list the install under what is left. An install from a worktree is not an install; bundle machines get the change only through a new bundle and `install.py --unpack`.

@@ -15,3 +15,12 @@ Run the release ritual for the current project. No questions unless a gate fails
 6. Deploy per the project CLAUDE.md deploy section; if it defines a "needs VPS deploy" rule, apply it and say which path was taken and why. No deploy section: do steps 1 to 5 and ask which target applies, suggesting the CLAUDE.md line to add.
 7. Post-deploy checklist if the project defines one (revalidation, sitemap or IndexNow ping, smoke check).
 8. Report in one short block: commit hash, review result, gate result, the PR brief path when a PR was opened, what deployed where, checklist result.
+
+## Not done when
+
+A state on this list looks finished and is not. Report it as the state it is, never as done; the status skill reads this list too.
+
+- The gate ran on a tree other than the one committed, because a fix landed after the gate.
+- The branch is pushed and the PR is open, but its checks are pending or failed. Ship does not wait for them: report "pushed, checks pending" (or failed, with the failing names), and the merge skill's step 4 waits.
+- The PR exists and its brief PDF does not.
+- The deploy command returned, but the post-deploy checklist or smoke check did not run.

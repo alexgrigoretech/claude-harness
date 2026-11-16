@@ -15,6 +15,8 @@ Look, in this order, and stop as soon as the answer is clear:
 4. CI: `gh pr checks` or `gh run list --limit 3` when a PR or workflow was mentioned, run through `python <install folder>/tools/ghx.py` so the folder's account answers (the active account may belong to another session and gives a 404 or an empty list on a private repository); plain `gh` only where the tool is not installed.
 5. Timing memory: the project's memory files may hold a typical duration for this job (for example a build or a pipeline run). Use it for the estimate and say so.
 
+Before calling a job done, when the conversation, the handoff or the file names show which of the delegate, ship, merge, auto or remote skills ran it (for example `codex-*-run.log` for delegate, `auto-trail.tsv` for auto), read that skill's `## Not done when` list and compare it with the evidence already on disk. A job in one of those states is not done: name the state and the evidence. Never run a command to settle it; when the disk does not show the state either way, say "unconfirmed" and name the command the user can run.
+
 When the question is what is still open to close the task, the reply is instead the open items as a numbered list in the order they have to happen, each with who or what it waits on (a review, a CI run, a merge, a deploy, an answer from the user), ending with the item that closes the task; the five line cap does not apply to that list.
 
 Reply in five lines or fewer: state (done, running, stalled, failed, not started), evidence (file and timestamp or process and elapsed time), estimate with its basis, what is blocking if anything, and the one command the user can run to see more. No narrative, no restating the task.

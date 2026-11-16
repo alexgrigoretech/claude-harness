@@ -37,3 +37,11 @@ The merged `~/.claude/local/machine.json` has a top level `remote` object with t
 Replace the placeholders with a configured alias and a machine name matching `^[a-z][a-z0-9-]{0,31}$`. Allowed entry keys are `ssh`, `shell`, `cwd`, `claude`, `permission_mode`, `max_turns` and `timeout`. All are optional. Without `ssh`, the prompt runs on this computer; `shell` requires `ssh`. The default folder is `~` over ssh and the current directory locally. The default executable is `claude`, and the default timeout is 600 seconds. `max_turns` and `timeout` must be positive integers. Permission modes are `default`, `acceptEdits`, `plan`, `auto`, `dontAsk` and `bypassPermissions`; when absent, no permission mode flag is passed. The tool accepts `--permission-mode`, `--max-turns`, `--max-budget-usd` and `--timeout` for a single run.
 
 Edit the machine's local json and run install.py to generate a `/<name>` skill for each entry. Names must not match repository skill directories. The installer refuses to overwrite a skill it did not generate, and it does not delete skills for removed names. Sessions and the last detached run for each machine are recorded in `~/.claude/local/remote-sessions.json`.
+
+## Not done when
+
+A state on this list looks finished and is not. Report it as the state it is, never as done; the status skill reads this list too.
+
+- `--detach` printed a run id. The run started; only `--collect` exiting 0 with a result means it finished. Exit 4 is still running, and exit 3 finished without a result, which is a failure to report, not a finished run.
+- The remote session returned while a background job it started was still running. `claude -p` ends on its first notification and kills its children, so read the job's output file on the remote before calling it done.
+- The tool exited 0 but stderr carries a `permission denied` block. The remote session was stopped and the user decides.

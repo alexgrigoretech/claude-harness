@@ -700,6 +700,769 @@ class CodexFirstGuardTests(HookCase):
                 self.assertEqual(result.stdout, "")
 
 
+class DestructiveGuardTests(HookCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(dir=REPO)
+        cls.home = Path(cls.temporary.name).resolve()
+
+    def setUp(self):
+        self.fixture = tempfile.TemporaryDirectory(dir=REPO)
+        self.addCleanup(self.fixture.cleanup)
+        self.base = Path(self.fixture.name).resolve()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(
+            HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
+            GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(self.home / ".gitconfig"),
+            GIT_TERMINAL_PROMPT="0", DESTRUCTIVE_GUARD_TEMP_ROOTS="",
+        )
+        patcher = mock.patch.dict(os.environ, environment, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def payload(self, command, tool="Bash", cwd=None):
+        return {"tool_name": tool, "cwd": str(cwd or self.base), "tool_input": {"command": command}}
+
+    def invoke(self, command, tool="Bash", cwd=None, temp_roots=""):
+        with mock.patch.dict(os.environ):
+            if temp_roots is None:
+                os.environ.pop("DESTRUCTIVE_GUARD_TEMP_ROOTS", None)
+            else:
+                os.environ["DESTRUCTIVE_GUARD_TEMP_ROOTS"] = temp_roots
+            return self.run_hook("destructive_guard.py", self.payload(command, tool, cwd))
+
+    def files(self, name="build", count=3):
+        directory = self.base / name
+        directory.mkdir(parents=True, exist_ok=True)
+        for index in range(count):
+            (directory / f"file{index}.txt").write_text("fixture\n", encoding="utf-8")
+        return directory
+
+    def assert_allowed(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def assert_count(self, result, kind, count):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(f"confirm-{kind}={count}", result.stderr)
+
+    def git(self, *arguments, cwd=None):
+        result = subprocess.run(
+            ["git", "-C", str(cwd or self.base), *arguments],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def init_repo(self):
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "core.hooksPath", "")
+        self.commit("initial")
+
+    def commit(self, content):
+        (self.base / "tracked.txt").write_text(content + "\n", encoding="utf-8")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-qm", content)
+
+    def test_non_destructive_and_non_shell_tools_pass(self):
+        self.assert_allowed(self.invoke("echo ready"))
+        self.assert_allowed(self.invoke("rm -rf build", tool="Read"))
+        self.assert_allowed(self.invoke("rm build"))
+        self.assert_allowed(self.invoke("git status"))
+
+    def test_invalid_inputs_pass(self):
+        for payload in ({}, {"tool_name": "Bash", "tool_input": []}, self.payload(""), self.payload(None)):
+            with self.subTest(payload=payload):
+                self.assert_allowed(self.run_hook("destructive_guard.py", payload))
+        self.assert_allowed(self.run_hook("destructive_guard.py", raw="not json"))
+
+    def test_recursive_delete_requires_exact_count(self):
+        directory = self.files()
+        result = self.invoke("rm -rf build")
+        self.assert_count(result, "delete", 3)
+        self.assertIn(directory.as_posix(), result.stderr)
+        self.assertIn("3 files under", result.stderr)
+        self.assert_allowed(self.invoke("rm -rf build # confirm-delete=3"))
+        result = self.invoke("rm -rf build # confirm-delete=2")
+        self.assert_count(result, "delete", 3)
+        self.assertIn("confirm-delete=2 does not match the measured 3", result.stderr)
+        self.assertEqual(len(list(directory.iterdir())), 3)
+
+    def test_missing_and_explicit_temp_targets_pass(self):
+        self.assert_allowed(self.invoke("rm -rf missing"))
+        root = self.files("temp", 1)
+        target = self.files("temp/session", 1)
+        command = f'rm -rf "{target.as_posix()}"'
+        self.assert_count(self.invoke(command), "delete", 1)
+        self.assert_allowed(self.invoke(command, temp_roots=str(root)))
+
+    def test_default_temp_roots_in_process(self):
+        from destructive_guard import is_temp
+
+        root = Path(tempfile.gettempdir())
+        home = Path(self.base.anchor) / "nonexistent-guard-home"
+        with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            os.environ.pop("DESTRUCTIVE_GUARD_TEMP_ROOTS", None)
+            self.assertTrue(is_temp(str(root / "session" / "x")))
+            self.assertFalse(is_temp(str(root)))
+            self.assertFalse(is_temp(str(root / "claude")))
+            self.assertTrue(is_temp(str(root / "claude" / "session" / "x")))
+
+    def test_default_temp_roots_subprocess(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory)
+        for index in range(3):
+            (directory / f"file{index}.txt").write_text("fixture\n", encoding="utf-8")
+        command = f'rm -rf "{directory.as_posix()}"'
+        home = Path(self.base.anchor) / "nonexistent-guard-home"
+        with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            self.assert_allowed(self.invoke(command, temp_roots=None))
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_default_temp_roots_exclude_drive_local_tmp(self):
+        from destructive_guard import is_temp
+
+        root = Path(tempfile.gettempdir())
+        home = Path(self.base.anchor) / "nonexistent-guard-home"
+        with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}), contextlib.chdir(root):
+            os.environ.pop("DESTRUCTIVE_GUARD_TEMP_ROOTS", None)
+            self.assertFalse(is_temp(str(Path(root.anchor) / "tmp" / "x")))
+
+    def test_default_temp_roots_reject_home_and_ancestors(self):
+        from destructive_guard import is_temp
+
+        local = self.base / "local"
+        for home in (local / "Temp", local / "Temp" / "home"):
+            home.mkdir(parents=True, exist_ok=True)
+            environment = {
+                "HOME": str(home), "USERPROFILE": str(home), "LOCALAPPDATA": str(local),
+                "TMP": str(home), "TEMP": str(home), "TMPDIR": str(home),
+            }
+            with self.subTest(home=home), mock.patch.dict(os.environ, environment), mock.patch("tempfile.tempdir", None):
+                os.environ.pop("DESTRUCTIVE_GUARD_TEMP_ROOTS", None)
+                self.assertEqual(os.path.normcase(tempfile.gettempdir()), os.path.normcase(str(home)))
+                self.assertFalse(is_temp(str(home / "session" / "x")))
+
+    def test_temp_override_rejected_entries(self):
+        from destructive_guard import is_temp
+
+        home = self.base / "profile" / "home"
+        environment = {"HOME": str(home), "USERPROFILE": str(home)}
+        default_target = Path(tempfile.gettempdir()) / "session" / "x"
+        entries = ("/", self.base.anchor, str(home), str(home.parent), ".", "relative/dir", "   ")
+        if os.name == "nt":
+            entries += (str(home).swapcase(), str(home.parent).swapcase())
+        with mock.patch.dict(os.environ, environment):
+            for entry in entries:
+                with self.subTest(entry=entry), mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_TEMP_ROOTS": entry}):
+                    target = Path(os.path.realpath(entry.strip() or ".")) / "session" / "x"
+                    self.assertFalse(is_temp(str(target)))
+                    self.assertFalse(is_temp(str(default_target)))
+
+    def test_temp_override_mixed_list(self):
+        from destructive_guard import is_temp
+
+        home = self.base / "profile"
+        root = self.base / "profile-other"
+        temp_roots = os.pathsep.join(("", f" {root} ", self.base.anchor, "   "))
+        with mock.patch.dict(os.environ, {
+            "HOME": str(home), "USERPROFILE": str(home), "DESTRUCTIVE_GUARD_TEMP_ROOTS": temp_roots,
+        }):
+            self.assertTrue(is_temp(str(root / "session" / "x")))
+            self.assertFalse(is_temp(str(self.base / "elsewhere" / "x")))
+            self.assertFalse(is_temp(str(Path(tempfile.gettempdir()) / "session" / "x")))
+
+    def test_empty_temp_override_disables_exemption(self):
+        from destructive_guard import is_temp
+
+        with mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_TEMP_ROOTS": ""}):
+            self.assertFalse(is_temp(str(self.base / "session" / "x")))
+            self.assertFalse(is_temp(str(Path(tempfile.gettempdir()) / "session" / "x")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_powershell_unquoted_windows_paths_require_count(self):
+        directory = self.files(".scratch/probe/build", 4)
+        for prefix in ("Remove-Item -Recurse -Force", "rm -r"):
+            with self.subTest(prefix=prefix):
+                command = f"{prefix} {directory}"
+                result = self.invoke(command, tool="PowerShell")
+                self.assert_count(result, "delete", 4)
+                self.assertIn(directory.as_posix(), result.stderr)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=4", tool="PowerShell"))
+        self.assertEqual(len(list(directory.iterdir())), 4)
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_powershell_quoted_windows_paths_require_count(self):
+        directory = self.files(".scratch/probe/build with spaces", 4)
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote):
+                command = f"Remove-Item -Recurse -Force {quote}{directory}{quote}"
+                self.assert_count(self.invoke(command, tool="PowerShell"), "delete", 4)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=4", tool="PowerShell"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_powershell_backslash_does_not_escape_segment_boundary(self):
+        directory = self.files(".scratch/probe/build", 4)
+        self.files("extra", 2)
+        command = f'Remove-Item -Recurse "{directory}\\"; Remove-Item -Recurse extra'
+        self.assert_count(self.invoke(command, tool="PowerShell"), "delete", 6)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=6", tool="PowerShell"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_bash_unquoted_windows_path_uses_existing_literal_path(self):
+        directory = self.files(".scratch/probe/build", 4)
+        command = f"rm -rf {directory}"
+        self.assert_count(self.invoke(command), "delete", 4)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=4"))
+        self.assertEqual(len(list(directory.iterdir())), 4)
+
+    @unittest.skipUnless(os.name == "nt", "Windows paths require Windows")
+    def test_bash_existing_posix_target_takes_precedence(self):
+        self.files("one/build", 4)
+        self.files("onebuild", 2)
+        command = r"rm -rf one\build"
+        self.assert_count(self.invoke(command), "delete", 2)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=2"))
+
+    def test_segment_escape_character_depends_on_tool(self):
+        from destructive_guard import segments
+
+        command = r"rm -r build\; rm -r extra"
+        self.assertEqual(list(segments(command, "PowerShell")), ["rm -r build\\", "rm -r extra"])
+        self.assertEqual(list(segments(command, "Bash")), [command])
+        command = "rm -r build`; rm -r extra"
+        self.assertEqual(list(segments(command, "PowerShell")), [command])
+        self.assertEqual(list(segments(command, "Bash")), ["rm -r build`", "rm -r extra"])
+
+    def test_scratch_is_not_exempt(self):
+        self.files(".scratch/build")
+        self.assert_count(self.invoke("rm -rf .scratch/build"), "delete", 3)
+
+    def test_recursive_delete_syntaxes(self):
+        self.files()
+        for command in (
+            "Remove-Item -Recurse -Force build", "Remove-Item -Path build -Recurse",
+            "Remove-Item -LiteralPath build -r", "ri -rec build", "rm --recursive build",
+            "rm -R build", "del -Recurse build", "erase -Recurse build",
+            "rd -Recurse build", "rmdir /s /q build", "rd /S /Q build",
+        ):
+            with self.subTest(command=command):
+                tool = "Bash" if command in {"rm --recursive build", "rm -R build", "rmdir /s /q build", "rd /S /Q build"} else "PowerShell"
+                self.assert_count(self.invoke(command, tool=tool), "delete", 3)
+
+    def test_glob_and_comma_separated_targets(self):
+        self.files("build-one", 1)
+        self.files("build-two", 2)
+        for command in (
+            "rm -rf build-*", "Remove-Item -Path build-one,build-two -Recurse",
+            "Remove-Item -LiteralPath:build-one,build-two -Recurse",
+        ):
+            with self.subTest(command=command):
+                tool = "PowerShell" if command.startswith("Remove-Item") else "Bash"
+                self.assert_count(self.invoke(command, tool=tool), "delete", 3)
+
+    def test_bare_separator_and_quoted_separators(self):
+        self.files("-build", 1)
+        self.files("build; one", 2)
+        self.assert_count(self.invoke("rm -rf -- -build"), "delete", 1)
+        self.assert_count(self.invoke('rm -rf "build; one"'), "delete", 2)
+
+    def test_segments_sum_and_ignore_comment_commands(self):
+        self.files("one", 1)
+        self.files("two", 2)
+        for separator in (";", "&&", "||", "|", "\n"):
+            with self.subTest(separator=separator):
+                command = f"rm -rf one {separator} rm -rf two"
+                self.assert_count(self.invoke(command), "delete", 3)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=3"))
+        self.assert_allowed(self.invoke("echo ready # rm -rf one; rm -rf two"))
+        self.assert_count(self.invoke("rm -rf one # ignored\nrm -rf two"), "delete", 3)
+
+    def test_unresolved_targets_require_unmeasured(self):
+        for target in ("$VAR", "%VAR%", "`value`", "$(pwd)"):
+            with self.subTest(target=target):
+                command = f"rm -rf '{target}'"
+                self.assert_count(self.invoke(command), "delete", "unmeasured")
+                self.assert_allowed(self.invoke(command + " # confirm-delete=unmeasured"))
+
+    def test_cap_requires_capped_count(self):
+        self.files()
+        with mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_CAP": "2"}):
+            self.assert_count(self.invoke("rm -rf build"), "delete", "2+")
+            self.assert_allowed(self.invoke("rm -rf build # confirm-delete=2+"))
+            self.assert_count(self.invoke("rm -rf build '$VAR'"), "delete", "unmeasured")
+
+    def test_nested_shells_without_command_flags_are_not_inspected(self):
+        for shell in ("bash", "sh", "zsh", "powershell", "pwsh", "cmd"):
+            with self.subTest(shell=shell):
+                self.assert_allowed(self.invoke(f'{shell} "rm -rf $VAR"'))
+        self.assert_allowed(self.invoke("ssh acme echo ready"))
+        self.assert_allowed(self.invoke("wsl echo ready"))
+
+    def test_git_clean_requires_untracked_path_count(self):
+        self.init_repo()
+        self.files("build", 2)
+        command = "git clean -fd -- build/file0.txt build/file1.txt"
+        self.assert_count(self.invoke(command), "delete", 2)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=2"))
+        self.assert_allowed(self.invoke("git clean -n"))
+        self.assert_allowed(self.invoke("git clean -fnd"))
+        self.assertEqual(len(list((self.base / "build").iterdir())), 2)
+
+    def test_git_clean_honours_C_and_force_flag_groups(self):
+        self.init_repo()
+        (self.base / "one.txt").write_text("one", encoding="utf-8")
+        (self.base / "two.txt").write_text("two", encoding="utf-8")
+        command = f'git -C "{self.base.as_posix()}" clean -fd'
+        self.assert_count(self.invoke(command, cwd=self.home), "delete", 2)
+        self.assert_count(self.invoke("git clean --force"), "delete", 2)
+        (self.base / "-name.txt").write_text("fixture", encoding="utf-8")
+        self.assert_count(self.invoke("git clean -f -- -name.txt"), "delete", 1)
+
+    def test_git_reset_requires_discard_count(self):
+        self.init_repo()
+        (self.base / "tracked.txt").write_text("modified\n", encoding="utf-8")
+        command = "git reset --hard"
+        self.assert_count(self.invoke(command), "discard", 1)
+        self.assert_allowed(self.invoke(command + " # confirm-discard=1"))
+        self.assertEqual((self.base / "tracked.txt").read_text(encoding="utf-8"), "modified\n")
+
+    def test_git_reset_requires_drop_and_discard_counts(self):
+        self.init_repo()
+        self.commit("next")
+        command = "git reset --hard HEAD~1"
+        result = self.invoke(command)
+        self.assert_count(result, "discard", 1)
+        self.assert_count(result, "drop", 1)
+        self.assert_count(self.invoke(command + " # confirm-discard=1"), "drop", 1)
+        self.assert_allowed(self.invoke(command + " # confirm-discard=1 confirm-drop=1"))
+
+    def test_git_reset_retained_commits_and_detached_head(self):
+        self.init_repo()
+        self.commit("next")
+        self.git("branch", "retained")
+        self.assert_allowed(self.invoke("git reset --hard HEAD~1 # confirm-discard=1"))
+        self.git("checkout", "-q", "--detach")
+        self.assert_allowed(self.invoke("git reset --hard HEAD~1 # confirm-discard=1"))
+
+    def test_git_branch_unique_and_merged_commits(self):
+        self.init_repo()
+        self.git("checkout", "-qb", "feat/x")
+        self.commit("one")
+        self.commit("two")
+        self.git("checkout", "-q", "main")
+        for flags in ("-D", "-df", "--delete --force"):
+            with self.subTest(flags=flags):
+                self.assert_count(self.invoke(f"git branch {flags} feat/x"), "drop", 2)
+        self.assert_allowed(self.invoke("git branch -D feat/x # confirm-drop=2"))
+        self.assert_allowed(self.invoke("git branch -D missing"))
+        self.git("merge", "-q", "--ff-only", "feat/x")
+        self.assert_allowed(self.invoke("git branch -D feat/x"))
+        self.assertIn("feat/x", self.git("branch", "--list"))
+
+    def force_push_fixture(self):
+        self.init_repo()
+        remote = self.base / "remote.git"
+        self.git("init", "-q", "-b", "main", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        initial = self.git("rev-parse", "HEAD")
+        self.commit("remote commit")
+        self.git("push", "-qu", "origin", "main")
+        self.git("update-ref", "refs/heads/main", initial)
+        return remote
+
+    def test_force_push_requires_overwrite_count(self):
+        self.force_push_fixture()
+        for command in (
+            "git push --force origin main", "git push -f origin main",
+            "git push --force-with-lease origin main", "git push --force-with-lease=main origin main",
+            "git push origin +main:main", "git push --force origin HEAD", "git push --force",
+        ):
+            with self.subTest(command=command):
+                result = self.invoke(command)
+                self.assert_count(result, "overwrite", 1)
+                self.assertIn("overwrites 1 commits on origin/main", result.stderr)
+                self.assert_allowed(self.invoke(command + " # confirm-overwrite=1"))
+
+    def test_force_push_without_tracking_ref_requires_new(self):
+        self.init_repo()
+        self.git("branch", "feat/x")
+        command = "git push --force origin feat/x"
+        result = self.invoke(command)
+        self.assert_count(result, "overwrite", "new")
+        self.assertIn("git fetch origin", result.stderr)
+        self.assert_allowed(self.invoke(command + " # confirm-overwrite=new"))
+        self.assert_count(self.invoke("git push --force"), "overwrite", "new")
+        self.assert_allowed(self.invoke("git push --force --delete origin feat/x"))
+
+    def test_multiple_kinds_require_independent_tokens(self):
+        self.init_repo()
+        self.files()
+        (self.base / "tracked.txt").write_text("modified", encoding="utf-8")
+        command = "rm -rf build; git reset --hard"
+        result = self.invoke(command)
+        self.assert_count(result, "delete", 3)
+        self.assert_count(result, "discard", 1)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=3 confirm-discard=1"))
+
+    def test_leading_words_and_executable_names(self):
+        self.files()
+        for prefix in (
+            "sudo", "time", "env", "command", "nohup", "exec", "then", "do", "else", "elif",
+            "{", "(", "!", "NAME=value", "sudo -n env NAME=value",
+        ):
+            with self.subTest(prefix=prefix):
+                suffix = " }" if prefix == "{" else " )" if prefix == "(" else ""
+                self.assert_count(self.invoke(f"{prefix} rm -rf build{suffix}"), "delete", 3)
+        self.assert_count(self.invoke("/usr/bin/rm -rf build"), "delete", 3)
+        self.init_repo()
+        (self.base / "tracked.txt").write_text("modified", encoding="utf-8")
+        for executable in ("/usr/bin/git", "git.exe", '"C:\\Program Files\\Git\\cmd\\git.exe"'):
+            with self.subTest(executable=executable):
+                self.assert_count(self.invoke(f"{executable} reset --hard"), "discard", 1)
+
+    def test_local_nested_shells_and_remote_commands(self):
+        self.files()
+        for shell, flag, inner in (
+            ("bash", "-c", "rm -rf build"), ("bash", "-lc", "rm -rf build"),
+            ("sh", "-c", "rm -rf build"), ("zsh", "-c", "rm -rf build"),
+            ("powershell", "-Command", "Remove-Item -Recurse build"),
+            ("pwsh", "-c", "Remove-Item -Recurse build"), ("cmd", "/c", "rd /s /q build"),
+        ):
+            with self.subTest(shell=shell, flag=flag):
+                command = f'{shell} {flag} "{inner}"'
+                self.assert_count(self.invoke(command), "delete", 3)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=3"))
+        self.assert_count(self.invoke("bash -c 'sh -c \"rm -rf build\"'"), "delete", 3)
+        self.assert_count(self.invoke("cmd /c rd /s /q build"), "delete", 3)
+        for command, kind in (
+            ("ssh acme 'rm -rf build'", "delete"), ("ssh -p 22 acme rm -rf build", "delete"),
+            ("wsl -e rm -rf build", "delete"), ("wsl -- rm -rf build", "delete"),
+            ("wsl rm -rf build", "delete"), ("ssh acme 'git reset --hard'", "discard"),
+            ('ssh acme bash -c "rm -rf build"', "delete"), ('wsl -e bash -c "rm -rf build"', "delete"),
+            ("wsl -- git branch -D feat/x", "drop"), ("ssh acme 'git push --force origin main'", "overwrite"),
+        ):
+            with self.subTest(command=command):
+                with mock.patch("destructive_guard.git_run", side_effect=AssertionError()):
+                    with mock.patch("destructive_guard.measure_delete", side_effect=AssertionError()):
+                        code, stderr = self.in_process(command)
+                        self.assertEqual(code, 2, stderr)
+                        self.assertIn(f"confirm-{kind}=unmeasured", stderr)
+                        self.assertIn("target is remote", stderr)
+                        self.assertEqual(self.in_process(command + f" # confirm-{kind}=unmeasured"), (0, ""))
+
+    def test_git_global_options_are_measured_in_context(self):
+        from destructive_guard import git_run
+
+        self.init_repo()
+        (self.base / "tracked.txt").write_text("modified", encoding="utf-8")
+        command = f'git --no-pager -c core.quotepath=false -p --paginate --no-replace-objects --literal-pathspecs -C "{self.base.as_posix()}" reset --hard'
+        self.assert_count(self.invoke(command, cwd=self.home), "discard", 1)
+        git_dir = (self.base / ".git").as_posix()
+        work_tree = self.base.as_posix()
+        for options in (
+            f'--git-dir="{git_dir}" --work-tree="{work_tree}" --namespace=',
+            f'--git-dir "{git_dir}" --work-tree "{work_tree}" --namespace ""',
+        ):
+            with self.subTest(options=options):
+                self.assert_count(self.invoke(f"git {options} reset --hard", cwd=self.home), "discard", 1)
+        command = f'git --git-dir="{git_dir}" --work-tree="{work_tree}" reset --hard HEAD'
+        with mock.patch("destructive_guard.git_run", wraps=git_run) as calls:
+            code, stderr = self.in_process(command)
+        self.assertEqual(code, 2, stderr)
+        for call in calls.call_args_list:
+            self.assertIn(f"--git-dir={git_dir}", call.args[2])
+            self.assertIn(f"--work-tree={work_tree}", call.args[2])
+        self.assert_count(self.invoke(f'git --bare --git-dir="{git_dir}" reset --hard'), "discard", "unmeasured")
+
+    def test_shell_specific_commas_and_brace_expansion(self):
+        self.files("a", 1)
+        self.files("b", 2)
+        self.files("a,b", 4)
+        self.files("preapost", 1)
+        self.files("prebpost", 2)
+        self.assert_count(self.invoke('Remove-Item -Recurse "a","b"', tool="PowerShell"), "delete", 3)
+        self.assert_count(self.invoke('Remove-Item -Recurse "a,b"', tool="PowerShell"), "delete", 4)
+        self.assert_count(self.invoke("rm -rf a,b"), "delete", 4)
+        for target in ("{a,b}", "pre{a,b}post"):
+            with self.subTest(target=target):
+                self.assert_count(self.invoke(f"rm -rf {target}"), "delete", 3)
+        for target in ("{a,{b,c}}", "{a,b", "a,b}"):
+            with self.subTest(target=target):
+                self.assert_count(self.invoke(f"rm -rf {target}"), "delete", "unmeasured")
+
+    def test_directory_changes_update_measurement_cwd(self):
+        self.files("one/build", 4)
+        self.files("one/inner/build", 2)
+        for command, tool, count in (
+            ("cd one && rm -rf build", "Bash", 4), ("pushd one; rm -rf build", "Bash", 4),
+            ("cd one; pushd inner; rm -rf build", "Bash", 2),
+            ("Set-Location -Path one; Remove-Item -Recurse build", "PowerShell", 4),
+            ("sl -LiteralPath one; Remove-Item -Recurse build", "PowerShell", 4),
+            ("chdir one; rm -r build", "PowerShell", 4),
+        ):
+            with self.subTest(command=command):
+                self.assert_count(self.invoke(command, tool=tool), "delete", count)
+                self.assert_allowed(self.invoke(command + f" # confirm-delete={count}", tool=tool))
+        self.assert_count(self.invoke("cd $VAR; rm -rf build"), "delete", "unmeasured")
+        self.assert_count(self.invoke("cd $VAR; cd one; rm -rf build"), "delete", "unmeasured")
+
+    def test_background_ampersand_separates_bash_commands(self):
+        from destructive_guard import segments
+
+        self.files("one", 1)
+        self.files("two", 2)
+        command = "rm -rf one & rm -rf two"
+        self.assert_count(self.invoke(command), "delete", 3)
+        self.assert_allowed(self.invoke(command + " # confirm-delete=3"))
+        self.assertEqual(list(segments(command, "PowerShell")), [command])
+        for redirect in ("2>&1", ">&1", "&>output", "<&0"):
+            with self.subTest(redirect=redirect):
+                command = f"echo ready {redirect} rm -rf one"
+                self.assertEqual(list(segments(command)), [command])
+                self.assert_allowed(self.invoke(command))
+
+    def test_powershell_switches_pipeline_and_dry_runs(self):
+        self.files()
+        for command in (
+            "rm -Force build", "rm -rf build", "rd /s /q build",
+            "Remove-Item -Recurse -WhatIf build", "Remove-Item -Recurse -wH build",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(self.invoke(command, tool="PowerShell"))
+        command = "Get-ChildItem build | Remove-Item -Recurse"
+        self.assert_count(self.invoke(command, tool="PowerShell"), "delete", "unmeasured")
+        self.assert_allowed(self.invoke(command + " # confirm-delete=unmeasured", tool="PowerShell"))
+        with mock.patch("destructive_guard.git_run", side_effect=AssertionError()):
+            for command in (
+                "git push --force -n origin main", "git push --force --dry-run origin main",
+                "git clean -fd -n", "git clean -fd --dry-run",
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(self.in_process(command), (0, ""))
+
+    def test_comment_tokens_and_defensive_measurement_limits(self):
+        self.files()
+        for command in (
+            "rm -rf build confirm-delete=3", 'rm -rf build "confirm-delete=3"',
+            'echo "# confirm-delete=3"; rm -rf build',
+        ):
+            with self.subTest(command=command):
+                self.assert_count(self.invoke(command), "delete", 3)
+        self.assert_allowed(self.invoke("rm -rf build # confirm-delete=3"))
+        for value in ("invalid", "0", "-1"):
+            with self.subTest(cap=value), mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_CAP": value}):
+                self.assert_count(self.invoke("rm -rf build"), "delete", 3)
+        with mock.patch("time.monotonic", side_effect=[0.0, 2.0]):
+            code, stderr = self.in_process("rm -rf build")
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("confirm-delete=unmeasured", stderr)
+        self.assertNotIn("20000+", stderr)
+
+    def test_branch_deletion_counts_selected_branches_together(self):
+        self.init_repo()
+        self.git("checkout", "-qb", "feat/a")
+        self.commit("one")
+        self.commit("two")
+        self.git("branch", "feat/b")
+        self.git("checkout", "-q", "main")
+        command = "git branch -D feat/a feat/b missing"
+        self.assert_count(self.invoke(command), "drop", 2)
+        self.assert_allowed(self.invoke(command + " # confirm-drop=2"))
+        self.assertIn("feat/a", self.git("branch", "--list"))
+        self.assertIn("feat/b", self.git("branch", "--list"))
+
+    def test_mixed_push_counts_keep_measured_commits(self):
+        self.force_push_fixture()
+        self.git("branch", "feat/x")
+        self.git("branch", "feat/y")
+        command = "git push --force origin main feat/x"
+        self.assert_count(self.invoke(command), "overwrite", "1+new")
+        self.assert_count(self.invoke(command + " # confirm-overwrite=new"), "overwrite", "1+new")
+        self.assert_allowed(self.invoke(command + " # confirm-overwrite=1+new"))
+        self.assert_count(self.invoke("git push --force origin feat/x feat/y"), "overwrite", "new")
+        self.git("update-ref", "refs/remotes/origin/safe", "HEAD")
+        self.assert_count(self.invoke("git push --force origin main:safe feat/x"), "overwrite", "0+new")
+
+    def test_broad_force_pushes_and_option_values(self):
+        self.force_push_fixture()
+        for flag in ("--all", "--mirror", "--tags"):
+            with self.subTest(flag=flag):
+                command = f"git push --force {flag} origin"
+                result = self.invoke(command)
+                self.assert_count(result, "overwrite", "unmeasured")
+                self.assertIn("every branch or tag on the remote can be rewritten", result.stderr)
+                self.assert_allowed(self.invoke(command + " # confirm-overwrite=unmeasured"))
+        self.assert_count(self.invoke("git push --mirror origin"), "overwrite", "unmeasured")
+        for option in ("--repo", "--receive-pack", "--exec", "-o", "--push-option"):
+            with self.subTest(option=option):
+                command = f"git push --force {option} value origin main"
+                self.assert_count(self.invoke(command), "overwrite", 1)
+                self.assert_allowed(self.invoke(command + " # confirm-overwrite=1"))
+
+    def test_indirect_deletes_require_unmeasured(self):
+        for command, form in (
+            ("find build -delete", "find -delete"),
+            (r"find build -exec rm {} \;", "find -exec rm"),
+            ("find build -execdir /bin/rm {} +", "find -execdir rm"),
+            ("printf build | xargs -0 -n 1 rm -rf", "xargs recursive rm"),
+            ("xargs --max-args 2 -- rm --recursive", "xargs recursive rm"),
+            ('echo "$(rm -rf build)"', "$(...) substitution"),
+            ("echo $(true; rm -rf build)", "$(...) substitution"),
+            ("echo $(echo $(rm -rf build))", "$(...) substitution"),
+            ('echo "`rm -rf build`"', "backtick substitution"),
+        ):
+            with self.subTest(command=command):
+                result = self.invoke(command)
+                self.assert_count(result, "delete", "unmeasured")
+                self.assertIn(form, result.stderr)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=unmeasured"))
+        self.assert_allowed(self.invoke("find build -print"))
+        self.assert_allowed(self.invoke("xargs -n 1 rm"))
+        self.assert_allowed(self.invoke("echo ready # $(rm -rf build)"))
+
+    def test_whatif_false_still_requires_measurement(self):
+        self.files()
+        for switch in ("-WhatIf:$false", "-wH:false", "-WHATIF:FALSE"):
+            with self.subTest(switch=switch):
+                command = f"Remove-Item -Recurse {switch} build"
+                self.assert_count(self.invoke(command, tool="PowerShell"), "delete", 3)
+                self.assert_allowed(self.invoke(command + " # confirm-delete=3", tool="PowerShell"))
+        for switch in ("-WhatIf", "-wh:$true", "-WHATIF:TRUE"):
+            with self.subTest(switch=switch):
+                self.assert_allowed(self.invoke(f"Remove-Item -Recurse {switch} build", tool="PowerShell"))
+
+    def test_cmd_recursive_deletes_measure_directories_and_patterns(self):
+        self.files("build", 2)
+        self.files("build/nested", 1)
+        (self.base / "build" / "keep.log").write_text("fixture", encoding="utf-8")
+        for command in ("cmd /c del /s /q /f build", "cmd /c ERASE /S build", 'cmd /c "del /s build/*.txt"'):
+            with self.subTest(command=command):
+                count = 3 if "*.txt" in command else 4
+                self.assert_count(self.invoke(command), "delete", count)
+                self.assert_allowed(self.invoke(command + f" # confirm-delete={count}"))
+        self.assert_count(self.invoke("cmd /c del /s *.txt"), "delete", 3)
+        self.assert_count(self.invoke("cmd /c del /s build*/*.txt"), "delete", "unmeasured")
+        self.assertEqual(len(list((self.base / "build").rglob("*.txt"))), 3)
+
+    def test_temp_roots_and_scratchpad_parent_are_measured(self):
+        from destructive_guard import is_temp
+
+        root = self.files("temp", 1)
+        self.files("temp/claude", 2)
+        session = self.files("temp/claude/session", 1)
+        other = self.files("temp/other", 1)
+        local_root = self.files("local/Temp", 1)
+        temp_roots = os.pathsep.join((str(root), str(local_root)))
+        with mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_TEMP_ROOTS": temp_roots}):
+            for target in (root, root / "claude", local_root, local_root / "claude"):
+                with self.subTest(target=target):
+                    self.assertFalse(is_temp(str(target)))
+            for target in (session, other, local_root / "other"):
+                with self.subTest(target=target):
+                    self.assertTrue(is_temp(str(target)))
+            self.assertFalse(is_temp(str(self.base / "temp-other")))
+            self.assertFalse(is_temp(str(Path(tempfile.gettempdir()) / "unlisted")))
+        for target, count in ((root, 5), (root / "claude", 3)):
+            with self.subTest(target=target):
+                command = f'rm -rf "{target.as_posix()}"'
+                self.assert_count(self.invoke(command, temp_roots=temp_roots), "delete", count)
+        command = f'rm -rf "{session.as_posix()}"'
+        self.assert_allowed(self.invoke(command, temp_roots=temp_roots))
+        self.assertEqual(self.in_process(command, temp_roots=temp_roots), (0, ""))
+
+    def test_every_count_pair_combines_without_exception(self):
+        from destructive_guard import add_counts
+
+        values = (0, 2, 20000, "3+", "new", "4+new", "5+,new", "unmeasured")
+        for left in values:
+            for right in values:
+                with self.subTest(left=left, right=right):
+                    self.assertEqual(add_counts(left, right), add_counts(right, left))
+                    if "unmeasured" in (left, right):
+                        self.assertEqual(add_counts(left, right), "unmeasured")
+        for left, right, expected in (
+            ("20000+", "new", "20000+,new"), ("20000+", "3+new", "20003+,new"),
+            ("20000+,new", "4+", "20004+,new"), ("3+", 2, "5+"),
+            ("new", "new", "new"), (0, "new", "0+new"), ("4+new", 2, "6+new"),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(add_counts(left, right), expected)
+        records = [("overwrite", "20000+", "capped"), ("overwrite", "new", "unknown")]
+        with mock.patch("destructive_guard.measure_command", return_value=(records, [("overwrite", "20000+,new")])):
+            self.assertEqual(self.in_process("git push --force"), (0, ""))
+        with mock.patch("destructive_guard.measure_command", return_value=(records, [("overwrite", "20000++new")])):
+            code, stderr = self.in_process("git push --force")
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("confirm-overwrite=20000+,new", stderr)
+
+    def test_empty_delete_targets_never_resolve_to_cwd(self):
+        from destructive_guard import measure_delete
+
+        self.files()
+        for command in ("rm -rf ''", 'rm -rf ""', "rm -rf {,}"):
+            with self.subTest(command=command):
+                self.assert_allowed(self.invoke(command))
+        for command in ("rm -rf '' build", "rm -rf {,build}"):
+            with self.subTest(command=command):
+                self.assert_count(self.invoke(command), "delete", 3)
+        self.assert_allowed(self.invoke("Remove-Item -Recurse ''", tool="PowerShell"))
+        with mock.patch("destructive_guard.resolve_target", side_effect=AssertionError()):
+            self.assertEqual(measure_delete([""], str(self.base)), (0, ""))
+
+    def test_git_outside_repository_passes(self):
+        from destructive_guard import NotRepository, git_run
+
+        with mock.patch("destructive_guard.git_run", side_effect=NotRepository()):
+            self.assertEqual(self.in_process("git reset --hard"), (0, ""))
+        result = subprocess.CompletedProcess([], 128, "", "fatal: not a git repository")
+        with mock.patch("subprocess.run", return_value=result), self.assertRaises(NotRepository):
+            git_run(self.base, ["diff", "--name-only", "HEAD"])
+
+    def in_process(self, command, temp_roots=""):
+        from destructive_guard import main
+
+        stderr = io.StringIO()
+        with mock.patch("destructive_guard.read_payload", return_value=self.payload(command)):
+            with mock.patch.dict(os.environ, {"DESTRUCTIVE_GUARD_TEMP_ROOTS": temp_roots}), contextlib.redirect_stderr(stderr):
+                code = main()
+        return code, stderr.getvalue()
+
+    def test_git_timeout_and_other_failures_are_unmeasured(self):
+        for failure in (subprocess.TimeoutExpired("git", 1.5), OSError("unavailable")):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch("subprocess.run", side_effect=failure):
+                    code, stderr = self.in_process("git reset --hard HEAD~1")
+                    self.assertEqual(code, 2)
+                    self.assertIn("confirm-discard=unmeasured", stderr)
+                    self.assertIn("confirm-drop=unmeasured", stderr)
+                    self.assertEqual(self.in_process(
+                        "git reset --hard HEAD~1 # confirm-discard=unmeasured confirm-drop=unmeasured"
+                    ), (0, ""))
+                    self.assertEqual(self.in_process(
+                        "git reset --hard # confirm-discard=unmeasured"
+                    ), (0, ""))
+        result = subprocess.CompletedProcess([], 128, "", "fatal: invalid reference")
+        with mock.patch("subprocess.run", return_value=result):
+            code, stderr = self.in_process("git reset --hard missing")
+            self.assertEqual(code, 2)
+            self.assertIn("confirm-discard=unmeasured", stderr)
+
+    def test_fast_path_does_not_inspect_or_spawn(self):
+        with mock.patch("destructive_guard.inspect_command", side_effect=AssertionError()):
+            with mock.patch("subprocess.run", side_effect=AssertionError()):
+                with mock.patch("os.walk", side_effect=AssertionError()), mock.patch("os.path.realpath", side_effect=AssertionError()):
+                    self.assertEqual(self.in_process("echo ready"), (0, ""))
+
+    def test_exception_fails_open(self):
+        with mock.patch("destructive_guard.inspect_command", side_effect=RuntimeError("fixture")):
+            self.assertEqual(self.in_process("rm -rf build"), (0, "destructive_guard: internal error RuntimeError\n"))
+
+
 class SecretGuardTests(HookCase):
     def invoke(self, tool_name, tool_input):
         return self.run_hook(
@@ -5065,6 +5828,11 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("draft_wrap_guard.py", commands[-1])
         machine = read_json_test(copied / "machines" / f"{TEST_MACHINE}.json")
         self.assertEqual(len(commands), 3 if machine.get("codex_first", True) else 2)
+        shell_entries = [entry for entry in settings["hooks"]["PreToolUse"] if entry.get("matcher") == "Bash|PowerShell"]
+        self.assertEqual(len(shell_entries), 1)
+        self.assertEqual(len(shell_entries[0]["hooks"]), 2)
+        self.assertIn("secret_guard.py", shell_entries[0]["hooks"][0]["command"])
+        self.assertIn("destructive_guard.py", shell_entries[0]["hooks"][1]["command"])
 
     def test_codex_first_hook_merge_respects_flag_and_removes_old_entries(self):
         spec = importlib.util.spec_from_file_location("install", REPO / "install.py")
@@ -5075,7 +5843,7 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(machine=machine):
                 stale = [{"hooks": [{"command": name}]} for name in (
                     "codex-first-guard.ps1", "codex_first_guard.py", "secret-guard.ps1",
-                    "secret_guard.py", "draft_wrap_guard.py",
+                    "secret_guard.py", "draft_wrap_guard.py", "destructive_guard.py",
                 )]
                 unrelated = {"matcher": "Read", "hooks": [{"command": "custom-pre"}]}
                 settings = {"hooks": {"PreToolUse": stale + [unrelated]}}
@@ -5089,6 +5857,10 @@ class InstallerTests(unittest.TestCase):
                     self.assertEqual(len(entries), 3)
                     self.assertEqual(entries[0], unrelated)
                     self.assertEqual(entries[1], {"matcher": "Edit|MultiEdit|Write|NotebookEdit", "hooks": expected})
+                    self.assertEqual(entries[2], {"matcher": "Bash|PowerShell", "hooks": [
+                        installer.command_hook(Path(sys.executable), home / ".claude" / "hooks" / name)
+                        for name in ("secret_guard.py", "destructive_guard.py")
+                    ]})
                     if machine.get("codex_first") is False:
                         self.assertNotIn("codex_first_guard", json.dumps(settings))
 
@@ -7047,7 +7819,7 @@ class InstallerTests(unittest.TestCase):
         for output in (self.base / "manifest-publish.zip", self.base / "manifest-publish-directory"):
             result = self.run_bundle(copied, output)
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-            self.assertIn("(85 files)", result.stdout)
+            self.assertIn("(90 files)", result.stdout)
             if output.suffix == ".zip":
                 with zipfile.ZipFile(output) as archive:
                     self.assertNotIn("MANIFEST.txt", archive.namelist())
